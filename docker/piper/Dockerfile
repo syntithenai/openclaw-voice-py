@@ -11,4 +11,5 @@ COPY app.py ./app.py
 RUN mkdir -p /root/.local/share/piper
 
 EXPOSE 10001
+ENTRYPOINT ["python", "-m"]
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10001"]

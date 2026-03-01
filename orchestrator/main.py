@@ -251,17 +251,19 @@ async def run_orchestrator() -> None:
             frame_samples=frame_samples,
             input_device=config.audio_capture_device,
             output_device=config.audio_playback_device,
+            input_gain=config.audio_input_gain,
         )
         capture = duplex
         playback = duplex
-        logger.info("Audio duplex initialized (input=%s, output=%s)", config.audio_capture_device, config.audio_playback_device)
+        logger.info("Audio duplex initialized (input=%s, output=%s, gain=%.1fx)", config.audio_capture_device, config.audio_playback_device, config.audio_input_gain)
     else:
         capture = AudioCapture(
             sample_rate=config.audio_sample_rate,
             frame_samples=frame_samples,
             device=config.audio_capture_device,
+            input_gain=config.audio_input_gain,
         )
-        logger.info("Audio capture initialized on device: %s", config.audio_capture_device)
+        logger.info("Audio capture initialized on device: %s (gain=%.1fx)", config.audio_capture_device, config.audio_input_gain)
 
     # VAD initialization
     print("→ Loading VAD model...", flush=True)

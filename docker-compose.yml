@@ -37,6 +37,7 @@ services:
     build:
       context: ./docker/whisper
       dockerfile: Dockerfile
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10000"]
     ports:
       - "10000:10000"
     environment:
@@ -62,6 +63,7 @@ services:
   # requires one of the Linux audio profile services below.
   orchestrator:
     <<: *orchestrator-common
+    profiles: ["orchestrator"]
 
   # Linux ALSA hardware pass-through profile (direct /dev/snd access)
   orchestrator-linux-alsa:

@@ -2,7 +2,7 @@ import logging
 import queue
 import threading
 import time
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, Union
 
 import numpy as np
 import sounddevice as sd
@@ -19,11 +19,13 @@ class DuplexAudioIO:
         frame_samples: int,
         input_device: str = "default",
         output_device: str = "default",
+        input_gain: float = 1.0,
     ) -> None:
         self.sample_rate = sample_rate
         self.frame_samples = frame_samples
         self.input_device = input_device
         self.output_device = output_device
+        self.input_gain = input_gain
 
         self._queue: queue.Queue[bytes] = queue.Queue(maxsize=200)
         self._stream: Optional[sd.Stream] = None
@@ -42,8 +44,21 @@ class DuplexAudioIO:
     def set_playback_callback(self, callback: Callable[[bytes], None]) -> None:
         self._on_playback_frame = callback
 
-    def _device_tuple(self) -> Tuple[Optional[str], Optional[str]]:
-        in_dev = None if self.input_device == "default" else self.input_device
+    def _device_tuple(self) -> Tuple[Optional[Union[int, str]], Optional[str]]:
+        # Convert ALSA device names to numeric indices for sounddevice
+        in_dev = None
+        if self.input_device != "default":
+            if isinstance(self.input_device, str) and self.input_device.startswith(("hw:", "plughw:")):
+                try:
+                    card = int(self.input_device.split(":")[1].split(",")[0])
+                    in_dev = card
+                    logger.debug("Converted input ALSA device %s to numeric index %d", self.input_device, card)
+                except (ValueError, IndexError):
+                    logger.warning("Could not parse ALSA input device format: %s", self.input_device)
+                    in_dev = None
+            else:
+                in_dev = self.input_device
+        
         out_dev = None if self.output_device == "default" else self.output_device
         return (in_dev, out_dev)
 
@@ -52,8 +67,9 @@ class DuplexAudioIO:
             logger.warning("Audio duplex status: %s", status)
             self._warned_status = True
 
-        # Input capture
-        pcm = (indata[:, 0] * 32767).astype(np.int16).tobytes()
+        # Input capture with gain
+        pcm = np.clip(indata[:, 0] * self.input_gain, -1.0, 1.0)
+        pcm = (pcm * 32767).astype(np.int16).tobytes()
         try:
             self._queue.put_nowait(pcm)
         except queue.Full:

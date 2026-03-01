@@ -16,6 +16,7 @@ class VoiceConfig(BaseSettings):
     audio_capture_device: str = Field("default")
     audio_playback_device: str = Field("default")
     audio_backend: str = Field("portaudio")
+    audio_input_gain: float = Field(1.0)  # Software gain multiplier for input audio
 
     # VAD
     vad_type: str = Field("webrtc")
@@ -58,8 +59,8 @@ class VoiceConfig(BaseSettings):
     cut_in_pre_roll_ms: int = Field(100)
 
     # Services
-    whisper_url: str = Field("http://10.0.1.249:10000")
-    piper_url: str = Field("http://10.0.1.249:10001")
+    whisper_url: str = Field("http://10.1.1.249:10000")
+    piper_url: str = Field("http://10.1.1.249:10001")
     piper_voice_id: str = Field("en_US-amy-medium")
     piper_speed: float = Field(1.0)
     gateway_ws_url: str = Field("", validation_alias=AliasChoices("GATEWAY_WS_URL"))

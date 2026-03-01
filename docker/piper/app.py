@@ -66,7 +66,7 @@ def synthesize(payload: dict):
     if not text:
         return Response(content=b"", media_type="audio/wav")
 
-    wav_result = current_voice.synthesize(text, length_scale=length_scale)
+    wav_result = current_voice.synthesize(text)
     if isinstance(wav_result, (bytes, bytearray)):
         wav_bytes = bytes(wav_result)
     else:
