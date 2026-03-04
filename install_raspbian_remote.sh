@@ -110,15 +110,51 @@ y
 EOF
 " || echo -e "${YELLOW}Note: Install script completed (some prompts may have timed out)${NC}"
 
-# Step 4: Configure .env on Pi
+# Step 4: Detect and configure audio devices
 echo ""
-echo -e "${YELLOW}Step 4: Configuring .env for remote services...${NC}"
+echo -e "${YELLOW}Step 4: Detecting audio devices...${NC}"
+PI_ARCH=$(ssh "$PI_SSH_ALIAS" "uname -m" 2>/dev/null || echo "unknown")
+USB_MIC=$(ssh "$PI_SSH_ALIAS" "arecord -l | grep -E 'USB Camera|USB Audio' | grep -m1 'card' | sed -E 's/.*card ([0-9]+).*device ([0-9]+).*/hw:\1,\2/'" || echo "default")
+USB_SPEAKER=$(ssh "$PI_SSH_ALIAS" "aplay -l | grep -E 'CD002|USB Audio' | grep -m1 'card' | sed -E 's/.*card ([0-9]+).*device ([0-9]+).*/hw:\1,\2/'" || echo "default")
+USB_MIC_NAME=$(ssh "$PI_SSH_ALIAS" "arecord -l | grep -E 'USB Camera|USB Audio' | grep -m1 'card' | sed -E 's/.*\[(.*)\].*/\1/'" || echo "default")
+USB_SPEAKER_NAME=$(ssh "$PI_SSH_ALIAS" "aplay -l | grep -E 'CD002|USB Audio' | grep -m1 'card' | sed -E 's/.*\[(.*)\].*/\1/'" || echo "default")
+
+if [[ "$PI_ARCH" == "armv7l" || "$PI_ARCH" == "armv6l" ]]; then
+    WAKE_WORD_ENGINE_DEFAULT="precise"
+    WAKE_WORD_MODEL_DEFAULT="docker/wakeword-models/hey-mycroft.pb"
+    WAKE_WORD_CONF_DEFAULT="0.5"
+else
+    WAKE_WORD_ENGINE_DEFAULT="openwakeword"
+    WAKE_WORD_MODEL_DEFAULT="hey_mycroft"
+    WAKE_WORD_CONF_DEFAULT="0.95"
+fi
+echo -e "${GREEN}  ✓ Wakeword defaults for $PI_ARCH: engine=$WAKE_WORD_ENGINE_DEFAULT, model=$WAKE_WORD_MODEL_DEFAULT${NC}"
+
+if [ "$USB_MIC" != "default" ]; then
+    echo -e "${GREEN}  ✓ USB Microphone detected: $USB_MIC_NAME ($USB_MIC)${NC}"
+else
+    echo -e "${YELLOW}  ⚠ USB Microphone not detected, using default${NC}"
+fi
+
+if [ "$USB_SPEAKER" != "default" ]; then
+    echo -e "${GREEN}  ✓ USB Speaker detected: $USB_SPEAKER_NAME ($USB_SPEAKER)${NC}"
+    # Set speaker volume to 50% to prevent acoustic feedback
+    SPEAKER_CARD=$(echo "$USB_SPEAKER" | cut -d: -f2 | cut -d, -f1)
+    ssh "$PI_SSH_ALIAS" "amixer -c $SPEAKER_CARD sset PCM 50% 2>/dev/null || true"
+    echo -e "${GREEN}  ✓ Speaker volume set to 50%${NC}"
+else
+    echo -e "${YELLOW}  ⚠ USB Speaker not detected, using default${NC}"
+fi
+
+# Step 5: Configure .env on Pi
+echo ""
+echo -e "${YELLOW}Step 5: Configuring .env for remote services...${NC}"
 ssh "$PI_SSH_ALIAS" "cd ~/openclaw-voice && cat > .env << 'ENVEOF'
 # Core
 AUDIO_SAMPLE_RATE=16000
 AUDIO_FRAME_MS=20
-AUDIO_CAPTURE_DEVICE=1
-AUDIO_PLAYBACK_DEVICE=CD002: USB Audio (hw:3,0)
+AUDIO_CAPTURE_DEVICE=$USB_MIC_NAME: Audio ($USB_MIC)
+AUDIO_PLAYBACK_DEVICE=$USB_SPEAKER_NAME: USB Audio ($USB_SPEAKER)
 AUDIO_BACKEND=portaudio
 AUDIO_INPUT_GAIN=50.0
 
@@ -129,7 +165,7 @@ VAD_MIN_SPEECH_MS=100
 VAD_MIN_SILENCE_MS=800
 VAD_MIN_RMS=0.002
 VAD_CUT_IN_RMS=0.008
-VAD_CUT_IN_MIN_MS=100
+VAD_CUT_IN_MIN_MS=1200
 VAD_CUT_IN_FRAMES=2
 VAD_CUT_IN_USE_SILERO=false
 VAD_CUT_IN_SILERO_CONFIDENCE=0.01
@@ -146,12 +182,12 @@ EMOTION_AUTO_DOWNLOAD=true
 MODELSCOPE_CACHE=/home/stever/.cache/modelscope
 EMOTION_MODELS_DIR=docker/emotion-models
 
-# Wake word detection
-WAKE_WORD_ENABLED=false
-WAKE_WORD_ENGINE=openwakeword
+# Wake word detection (disabled - openwakeword not compatible with ARMv7)
+WAKE_WORD_ENABLED=true
+WAKE_WORD_ENGINE=$WAKE_WORD_ENGINE_DEFAULT
 WAKE_WORD_TIMEOUT_MS=10000
-WAKE_WORD_CONFIDENCE=0.95
-OPENWAKEWORD_MODEL_PATH=hey_mycroft
+WAKE_WORD_CONFIDENCE=$WAKE_WORD_CONF_DEFAULT
+OPENWAKEWORD_MODEL_PATH=$WAKE_WORD_MODEL_DEFAULT
 OPENWAKEWORD_AUTO_DOWNLOAD=true
 OPENWAKEWORD_MODELS_DIR=docker/wakeword-models
 
@@ -176,17 +212,22 @@ OPENCLAW_GATEWAY_URL=http://$LOCAL_HOST_IP:18789
 ENVEOF
 echo '  ✓ .env configured with host IP: $LOCAL_HOST_IP'"
 
-# Step 5: Clear Python cache and restart
+# Ensure wakeword resources are available for all engines
 echo ""
-echo -e "${YELLOW}Step 5: Clearing Python cache...${NC}"
+echo -e "${YELLOW}Step 5b: Ensuring wakeword resources...${NC}"
+ssh "$PI_SSH_ALIAS" "cd ~/openclaw-voice && bash ./ensure_wakeword_resources.sh all || true"
+
+# Step 6: Clear Python cache and restart
+echo ""
+echo -e "${YELLOW}Step 6: Clearing Python cache...${NC}"
 ssh "$PI_SSH_ALIAS" "cd ~/openclaw-voice && \
 find orchestrator -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true; \
 find orchestrator -name '*.pyc' -delete 2>/dev/null || true; \
 echo '  ✓ Cache cleared'"
 
-# Step 6: Test orchestrator startup
+# Step 7: Test orchestrator startup
 echo ""
-echo -e "${YELLOW}Step 6: Testing orchestrator startup...${NC}"
+echo -e "${YELLOW}Step 7: Testing orchestrator startup...${NC}"
 ssh "$PI_SSH_ALIAS" "pkill -f orchestrator.main || true; \
 sleep 2; \
 cd ~/openclaw-voice && \
@@ -204,9 +245,9 @@ else
     echo "    ssh $PI_SSH_ALIAS 'tail -50 ~/openclaw-voice/orchestrator_output.log'"
 fi
 
-# Step 7: Optional - Setup systemd service
+# Step 8: Optional - Setup systemd service
 echo ""
-echo -e "${YELLOW}Step 7: Setting up systemd service for auto-start...${NC}"
+echo -e "${YELLOW}Step 8: Setting up systemd service for auto-start...${NC}"
 ssh "$PI_SSH_ALIAS" "cat > /tmp/openclaw-voice.service << 'SVCEOF'
 [Unit]
 Description=OpenClaw Voice Orchestrator

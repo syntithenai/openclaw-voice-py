@@ -36,18 +36,32 @@ class AudioCapture:
         # Handle device name conversion for sounddevice
         device_param = None
         if self.device != "default":
-            # Try to parse ALSA device names like "hw:2,0" or "card:device"
+            # Try numeric index first (e.g. "8" from .env)
             device_param = self.device
-            if isinstance(self.device, str) and self.device.startswith(("hw:", "plughw:")):
-                # Extract card number from hw:2,0 format
+            if isinstance(self.device, str) and self.device.isdigit():
+                device_param = int(self.device)
+            # Try to parse ALSA device names like "hw:2,0" or "card:device"
+            elif isinstance(self.device, str) and self.device.startswith(("hw:", "plughw:")):
                 try:
-                    card = int(self.device.split(":")[1].split(",")[0])
-                    device_param = card
-                    logger.debug("Converted ALSA device %s to numeric index %d", self.device, card)
-                except (ValueError, IndexError):
-                    logger.warning("Could not parse ALSA device format: %s", self.device)
-                    device_param = None
-        
+                    hw = self.device.split(":", 1)[1]
+                    devices = sd.query_devices()
+                    match = next(
+                        (
+                            i
+                            for i, d in enumerate(devices)
+                            if f"(hw:{hw})" in d.get("name", "") and d.get("max_input_channels", 0) > 0
+                        ),
+                        None,
+                    )
+                    if match is not None:
+                        device_param = int(match)
+                        logger.debug("Resolved ALSA input device %s to numeric index %d", self.device, device_param)
+                    else:
+                        device_param = self.device
+                except Exception:
+                    logger.warning("Could not resolve ALSA device format: %s", self.device)
+                    device_param = self.device
+
         self._stream = sd.InputStream(
             samplerate=self.sample_rate,
             channels=1,

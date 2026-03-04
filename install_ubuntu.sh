@@ -312,8 +312,11 @@ PIPER_SPEED=${config[PIPER_SPEED]}
 # Wake Word Configuration (OpenWakeWord)
 OPENWAKEWORD_MODEL_PATH=${config[OPENWAKEWORD_MODEL_PATH]}
 WAKE_WORD_ENABLED=true
+WAKE_WORD_ENGINE=openwakeword
 WAKE_WORD_CONFIDENCE=${config[WAKE_WORD_CONFIDENCE]}
 WAKE_WORD_PREBUFFER_MS=80
+OPENWAKEWORD_AUTO_DOWNLOAD=true
+OPENWAKEWORD_MODELS_DIR=docker/wakeword-models
 
 # VAD Configuration
 VAD_BACKEND=${config[VAD_BACKEND]}
@@ -335,6 +338,10 @@ OPENWAKEWORD_PRELOAD_MODELS=true
 EOF
 
 echo -e "${GREEN}✓ Configuration saved to: $ENV_FILE${NC}"
+
+echo ""
+echo -e "${BLUE}Ensuring wakeword resources...${NC}"
+bash "$SCRIPT_DIR/ensure_wakeword_resources.sh" all || true
 echo ""
 echo "Configuration values:"
 for key in "${!config[@]}"; do

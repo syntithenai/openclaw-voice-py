@@ -1,7 +1,8 @@
-from pydantic import Field, ConfigDict, AliasChoices
+from pydantic import Field, ConfigDict, AliasChoices, field_validator, model_validator
 from pydantic_settings import BaseSettings
 from pathlib import Path
 from dotenv import load_dotenv
+import logging
 
 # Load .env file, overriding any existing environment variables
 load_dotenv(str(Path(__file__).resolve().parent.parent / ".env"), override=True)
@@ -10,11 +11,25 @@ load_dotenv(str(Path(__file__).resolve().parent.parent / ".env"), override=True)
 class VoiceConfig(BaseSettings):
     model_config = ConfigDict(env_file=".env", case_sensitive=False, extra="ignore")
 
+    @field_validator("audio_capture_device", "audio_playback_device", mode="before")
+    @classmethod
+    def _normalize_audio_device(cls, value):
+        if value is None:
+            return "default"
+        s = str(value).strip()
+        if not s:
+            return "default"
+        if s.lower() == "default":
+            return "default"
+        if s.isdigit():
+            return int(s)
+        return s
+
     # Audio
     audio_sample_rate: int = Field(16000)
     audio_frame_ms: int = Field(20)
-    audio_capture_device: str = Field("default")
-    audio_playback_device: str = Field("default")
+    audio_capture_device: int | str = Field("default")
+    audio_playback_device: int | str = Field("default")
     audio_backend: str = Field("portaudio")
     audio_input_gain: float = Field(1.0)  # Software gain multiplier for input audio
 
@@ -46,12 +61,29 @@ class VoiceConfig(BaseSettings):
     echo_cancel: bool = Field(True)
     echo_cancel_strength: str = Field("strong")
 
-    # Wake word
+    # Wake word - Global settings
     wake_word_enabled: bool = Field(False)
-    wake_word_engine: str = Field("openwakeword")
     wake_word_timeout_ms: int = Field(120000)
-    wake_word_confidence: float = Field(0.5)
-    openwakeword_model_path: str = Field("")
+
+    # Wake word - Precise Engine (Mycroft Precise v0.3.0)
+    precise_enabled: bool = Field(False)
+    precise_wake_word: str = Field("")  # Descriptive name of what wake word is in the model
+    precise_model_path: str = Field("")  # Path to .pb file
+    precise_confidence: float = Field(0.15)  # Detection threshold
+
+    # Wake word - OpenWakeWord Engine (TFLite-based)
+    openwakeword_enabled: bool = Field(False)
+    openwakeword_wake_word: str = Field("")  # Model name (e.g., "hey_mycroft")
+    openwakeword_model_path: str = Field("")  # Model name or path to .tflite file
+    openwakeword_confidence: float = Field(0.5)  # Detection threshold
+    openwakeword_models_dir: str = Field("docker/wakeword-models")
+    openwakeword_auto_download: bool = Field(True)
+
+    # Wake word - Picovoice Engine (Proprietary)
+    picovoice_enabled: bool = Field(False)
+    picovoice_wake_word: str = Field("")  # Model name
+    picovoice_key: str = Field("")  # API key
+    picovoice_confidence: float = Field(0.5)  # Detection threshold
 
     # Chunking
     chunk_max_ms: int = Field(10000)
@@ -112,3 +144,85 @@ class VoiceConfig(BaseSettings):
     emotion_model: str = Field("sensevoice-small")
     emotion_timeout_ms: int = Field(300)
     sensevoice_model_path: str = Field("")
+
+    @model_validator(mode='after')
+    def validate_critical_config(self):
+        """Validate that configuration is sensible and log errors for bad settings."""
+        logger = logging.getLogger("orchestrator.config")
+        errors = []
+
+        # Validate wake word configuration
+        if self.wake_word_enabled:
+            # Check that exactly one engine is enabled
+            enabled_engines = sum([
+                self.precise_enabled,
+                self.openwakeword_enabled,
+                self.picovoice_enabled
+            ])
+            
+            if enabled_engines == 0:
+                errors.append("WAKE_WORD_ENABLED=true but no engine enabled (set one of: PRECISE_ENABLED, OPENWAKEWORD_ENABLED, PICOVOICE_ENABLED)")
+            elif enabled_engines > 1:
+                errors.append("Multiple wake word engines enabled - set only one of: PRECISE_ENABLED, OPENWAKEWORD_ENABLED, PICOVOICE_ENABLED")
+            
+            # Validate Precise engine
+            if self.precise_enabled:
+                if not self.precise_model_path:
+                    errors.append("PRECISE_ENABLED=true but PRECISE_MODEL_PATH is empty")
+                if not (0.0 <= self.precise_confidence <= 1.0):
+                    errors.append(f"PRECISE_CONFIDENCE={self.precise_confidence} must be between 0.0 and 1.0")
+            
+            # Validate OpenWakeWord engine
+            if self.openwakeword_enabled:
+                if not self.openwakeword_model_path:
+                    errors.append("OPENWAKEWORD_ENABLED=true but OPENWAKEWORD_MODEL_PATH is empty")
+                if not (0.0 <= self.openwakeword_confidence <= 1.0):
+                    errors.append(f"OPENWAKEWORD_CONFIDENCE={self.openwakeword_confidence} must be between 0.0 and 1.0")
+            
+            # Validate Picovoice engine
+            if self.picovoice_enabled:
+                if not self.picovoice_key:
+                    errors.append("PICOVOICE_ENABLED=true but PICOVOICE_KEY is empty")
+                if not (0.0 <= self.picovoice_confidence <= 1.0):
+                    errors.append(f"PICOVOICE_CONFIDENCE={self.picovoice_confidence} must be between 0.0 and 1.0")
+
+
+        # Validate audio settings
+        if self.audio_sample_rate <= 0:
+            errors.append(f"Invalid AUDIO_SAMPLE_RATE={self.audio_sample_rate} (must be > 0)")
+        if self.audio_frame_ms <= 0:
+            errors.append(f"Invalid AUDIO_FRAME_MS={self.audio_frame_ms} (must be > 0)")
+        if self.audio_input_gain < 0.1 or self.audio_input_gain > 10.0:
+            errors.append(f"AUDIO_INPUT_GAIN={self.audio_input_gain} is unusual (typical range: 0.1-10.0)")
+
+        # Validate VAD settings
+        if not (0.0 <= self.vad_confidence <= 1.0):
+            errors.append(f"VAD_CONFIDENCE={self.vad_confidence} must be between 0.0 and 1.0")
+        if self.vad_min_speech_ms < 0:
+            errors.append(f"VAD_MIN_SPEECH_MS={self.vad_min_speech_ms} must be >= 0")
+        if self.vad_min_silence_ms < 0:
+            errors.append(f"VAD_MIN_SILENCE_MS={self.vad_min_silence_ms} must be >= 0")
+        # Service URL validation
+        # Validate service URLs (if they contain text, they should look like URLs)
+
+        if self.whisper_url and not (self.whisper_url.startswith("http://") or self.whisper_url.startswith("https://")) and ":" not in self.whisper_url:
+            errors.append(f"Invalid WHISPER_URL format: {self.whisper_url}")
+        if self.piper_url and not (self.piper_url.startswith("http://") or self.piper_url.startswith("https://")) and ":" not in self.piper_url:
+            errors.append(f"Invalid PIPER_URL format: {self.piper_url}")
+
+        # Validate TTS speed
+        if self.piper_speed < 0.5 or self.piper_speed > 5.0:
+            errors.append(f"PIPER_SPEED={self.piper_speed} is unusual (typical range: 0.5-5.0)")
+
+        # Log and exit if critical errors found
+        if errors:
+            logger.error("=" * 70)
+            logger.error("CONFIGURATION VALIDATION FAILED - Cannot start orchestrator")
+            logger.error("=" * 70)
+            for error in errors:
+                logger.error("  ❌ %s", error)
+            logger.error("=" * 70)
+            logger.error("Please fix the errors in your .env file and try again.")
+            raise ValueError(f"Configuration validation failed with {len(errors)} error(s). See logs above.")
+
+        return self

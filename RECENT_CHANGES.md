@@ -1,6 +1,66 @@
 # Recent Changes Summary
 
-## 1. ✅ Fixed Hotword Prebuffer Capture Issue
+## 0. ✅ Fixed "Exec Format Error" in Precise Engine Subprocess Invocation
+
+**Problem**: When the orchestrator tried to invoke `precise-engine` via Python's `subprocess.Popen`, it failed with "Exec format error: 8". The bash launcher script worked fine when called manually via SSH, but failed when invoked from Python's subprocess module.
+
+**Root Cause**: Python's `subprocess.Popen` without `shell=True` has difficulties with bash launcher scripts that export environment variables and then use `exec` to replace the process. The environment variables weren't being properly passed through the subprocess call.
+
+**Solution**: Replaced the bash launcher script with a **Python wrapper script** that directly uses `os.execvp()` to invoke the binary with proper environment variables. This is more reliable because:
+1. Python directly sets environment variables via `os.environ.copy()` and `os.execvp()`
+2. No shell escaping or interpretation issues
+3. Process replacement happens at the Python level, compatible with subprocess calls
+
+**Implementation**:
+- Created `/tmp/precise_launcher.py`: Python wrapper that sets `LD_LIBRARY_PATH` and `PYTHONPATH`, then calls `os.execvp()`
+- Deployed via `scp` to `~/.venv_orchestrator/bin/precise-engine`
+- Made executable with `chmod +x`
+
+**File Changes**:
+- [deploy_precise_engine_to_pi.sh](deploy_precise_engine_to_pi.sh): Updated step [2/4] to create Python launcher instead of bash script
+
+**Impact**: 
+- ✅ Precise engine now initializes successfully when called from orchestrator
+- ✅ `subprocess.Popen` can properly invoke the launcher without "Exec format error"
+- ✅ Full wake word detection pipeline operational
+
+**Testing**: Orchestrator running with 2 processes active, continuously processing audio and handling Cut-in triggers.
+
+---
+
+## 1. ✅ Fixed TensorFlow Import Error in Precise-Engine Bundle
+
+**Problem**: PyInstaller bundle of precise-engine was failing with `ModuleNotFoundError: No module named 'xml.dom'`. This occurred when the XML standard library module was needed by TensorFlow (via absl.flags._flagvalues).
+
+**Root Cause**: PyInstaller bundles Python standard library modules in `base_library.zip`, but for some modules like `xml`, the bundled version wasn't being found. The xml module needs to be accessible when the PyInstaller-bundled Python runs.
+
+**Solution**: Updated `PYTHONPATH` in the launcher script to include the system's Python stdlib directory:
+
+**In launcher scripts**:
+```python
+env['PYTHONPATH'] = bundle + ':/usr/lib/python3.11:' + env.get('PYTHONPATH', '')
+```
+
+**Also updated in `build_precise_engine_armv7.sh`** (launcher script):
+```bash
+export PYTHONPATH="$BUNDLE:/usr/lib/python3.11:${PYTHONPATH:-}"
+```
+
+**Impact**: 
+- ✅ Orchestrator now initializes without import errors
+- ✅ TensorFlow 1.13.1 loads successfully in the bundled engine
+- ✅ Full voice pipeline operational (STT, TTS, VAD, gateway)
+- Precise wake word detection configured
+
+**Technical Details**:
+- TensorFlow 1.13.1 has complex lazy-loaded nested modules with optional dependencies
+- absl library (required by TensorFlow) imports xml.dom.minidom at initialization
+- PyInstaller's hidden_imports list helped catch most dependencies but missed standard library module resolution
+- Solution: Chain system stdlib after bundle in PYTHONPATH so Python falls back to system libs when not found in bundle
+
+---
+
+## 2. ✅ Fixed Hotword Prebuffer Capture Issue
 
 **Problem**: After hotword detection, the system was capturing too much pre-roll audio (200ms), which included the spoken hotword itself ("Hey, my craft") being transcribed.
 
@@ -24,7 +84,7 @@ WAKE_WORD_PREBUFFER_MS=50  # Reduce further if needed
 
 ---
 
-## 2. ✅ Created Raspbian Installation Suite
+## 3. ✅ Created Raspbian Installation Suite
 
 ### Files Created:
 

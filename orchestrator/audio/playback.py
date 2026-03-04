@@ -35,10 +35,19 @@ class AudioPlayback:
                 # Accept ALSA card syntax and map to PortAudio device index heuristically
                 elif isinstance(self.device, str) and self.device.startswith(("hw:", "plughw:")):
                     try:
-                        card = self.device.split(":", 1)[1].split(",", 1)[0]
+                        hw = self.device.split(":", 1)[1]
+                        card = hw.split(",", 1)[0]
                         devices = sd.query_devices()
                         match = next(
-                            (i for i, d in enumerate(devices) if f"(hw:{card}," in d.get("name", "") and d.get("max_output_channels", 0) > 0),
+                            (
+                                i
+                                for i, d in enumerate(devices)
+                                if (
+                                    f"(hw:{hw})" in d.get("name", "")
+                                    or f"(hw:{card}," in d.get("name", "")
+                                )
+                                and d.get("max_output_channels", 0) > 0
+                            ),
                             None,
                         )
                         device_param = match if match is not None else self.device

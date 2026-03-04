@@ -36,6 +36,8 @@ from orchestrator.audio.buffer import RingBuffer
 from orchestrator.vad.silero import SileroVAD
 from orchestrator.vad.webrtc_vad import WebRTCVAD
 from orchestrator.wakeword.openwakeword import OpenWakeWordDetector
+from orchestrator.wakeword.precise import MycoftPreciseDetector
+from orchestrator.wakeword.picovoice import PicovoiceDetector
 from orchestrator.stt.whisper_client import WhisperClient
 from orchestrator.emotion.sensevoice import SenseVoice
 from orchestrator.gateway import build_gateway
@@ -224,6 +226,252 @@ def extract_text_from_gateway_message(message: str) -> str:
     return ""
 
 
+def validate_runtime_config(config: VoiceConfig) -> None:
+    """
+    Validate orchestrator runtime configuration at startup.
+    
+    Checks:
+    - Wake word configuration if enabled
+    - Architecture-specific wake word engine requirements
+    - Audio device availability
+    - Numeric constant ranges
+    - Wake word model files and resources
+    """
+    import platform
+    import struct
+    
+    logger = logging.getLogger("orchestrator.validation")
+    errors = []
+    warnings_list = []
+    
+    # Detect system architecture
+    arch_bits = struct.calcsize("P") * 8  # 32 or 64 bits
+    machine = platform.machine().lower()  # armv7l, aarch64, i686, x86_64, etc.
+    
+    # Categorize architecture
+    is_armv7 = "armv7" in machine or (arch_bits == 32 and "arm" in machine)
+    is_arm64 = "aarch64" in machine or "arm64" in machine
+    is_i386 = "i686" in machine or (arch_bits == 32 and "i" in machine)
+    is_x86_64 = "x86_64" in machine
+    
+    logger.info("System architecture detected: %s (%d-bit)", machine, arch_bits)
+    
+    # =========================================================================
+    # 1. WAKE WORD CONFIGURATION VALIDATION
+    # =========================================================================
+    if config.wake_word_enabled:
+        logger.info("→ Validating wake word configuration...")
+        
+        # Architecture-specific wake word engine requirements
+        if is_armv7:
+            logger.info("  System: ARMv7 (Raspberry Pi) - Requires Precise or Picovoice")
+            if not (config.precise_enabled or config.picovoice_enabled):
+                errors.append(
+                    "ARMv7 system detected but wake word engine not compatible. "
+                    "Set PRECISE_ENABLED=true or PICOVOICE_ENABLED=true. "
+                    "(OpenWakeWord is not recommended for ARMv7)"
+                )
+        elif is_arm64 or is_i386 or is_x86_64:
+            logger.info("  System: %s - Requires OpenWakeWord or Picovoice", machine.upper())
+            if not (config.openwakeword_enabled or config.picovoice_enabled):
+                errors.append(
+                    f"{machine.upper()} system detected but wake word engine not compatible. "
+                    "Set OPENWAKEWORD_ENABLED=true or PICOVOICE_ENABLED=true. "
+                    "(Precise is not recommended for this architecture)"
+                )
+        
+        # Validate Precise engine if enabled
+        if config.precise_enabled:
+            logger.info("  Precise engine: validating model files...")
+            if not config.precise_model_path:
+                errors.append("PRECISE_ENABLED=true but PRECISE_MODEL_PATH is empty")
+            else:
+                model_path = Path(config.precise_model_path)
+                if not model_path.exists():
+                    errors.append(f"Precise model file not found: {model_path}")
+                else:
+                    model_size = model_path.stat().st_size
+                    if model_size == 0:
+                        errors.append(f"Precise model file is empty: {model_path}")
+                    elif model_size < 10000:
+                        warnings_list.append(f"Precise model file very small ({model_size} bytes): {model_path}")
+                    else:
+                        logger.info("    ✓ Model file exists (%d bytes)", model_size)
+                
+                # Check for .params file
+                params_path = Path(str(model_path) + ".params")
+                if not params_path.exists():
+                    warnings_list.append(f"Precise model params file not found: {params_path}")
+                else:
+                    logger.info("    ✓ Params file exists")
+        
+        # Validate OpenWakeWord engine if enabled
+        if config.openwakeword_enabled:
+            logger.info("  OpenWakeWord engine: validating model...")
+            if not config.openwakeword_model_path:
+                errors.append("OPENWAKEWORD_ENABLED=true but OPENWAKEWORD_MODEL_PATH is empty")
+            else:
+                logger.info("    Model: %s", config.openwakeword_model_path)
+                # Try to validate that model is available (built-in)
+                try:
+                    from openwakeword.model import Model
+                    # Built-in models: hey_mycroft, alexa, americano, downstairs, grapefruit, 
+                    # grasshopper, jarvis, ok_google, timer, weather
+                    known_builtin = [
+                        "hey_mycroft", "alexa", "americano", "downstairs", "grapefruit",
+                        "grasshopper", "jarvis", "ok_google", "timer", "weather"
+                    ]
+                    model_name = config.openwakeword_model_path.lower().split('/')[-1].replace('.tflite', '')
+                    if model_name not in known_builtin:
+                        warnings_list.append(
+                            f"OpenWakeWord model '{model_name}' may not be built-in. "
+                            f"Available: {', '.join(known_builtin)}"
+                        )
+                    else:
+                        logger.info("    ✓ Built-in model available")
+                except ImportError:
+                    warnings_list.append("openwakeword library not available for validation")
+        
+        # Validate Picovoice engine if enabled
+        if config.picovoice_enabled:
+            logger.info("  Picovoice engine: validating API key...")
+            if not config.picovoice_key:
+                errors.append("PICOVOICE_ENABLED=true but PICOVOICE_KEY is empty")
+            else:
+                logger.info("    ✓ API key is configured")
+    
+    # =========================================================================
+    # 2. AUDIO DEVICE VALIDATION
+    # =========================================================================
+    logger.info("→ Validating audio devices...")
+    try:
+        import sounddevice as sd
+        devices = sd.query_devices()
+        device_names = [str(d['name']).lower() for d in devices]
+        
+        # Check capture device
+        if config.audio_capture_device != "default" and config.audio_capture_device:
+            capture_dev_str = str(config.audio_capture_device).lower()
+            device_found = any(
+                capture_dev_str in name or name in capture_dev_str 
+                for name in device_names
+            )
+            if not device_found:
+                # Try parsing as numeric device ID
+                try:
+                    dev_id = int(config.audio_capture_device)
+                    if 0 <= dev_id < len(devices):
+                        logger.info("  ✓ Capture device %d found: %s", dev_id, devices[dev_id]['name'])
+                    else:
+                        errors.append(f"Capture device ID out of range: {dev_id} (available: 0-{len(devices)-1})")
+                except (ValueError, TypeError):
+                    warnings_list.append(f"Capture device not found: {config.audio_capture_device}")
+            else:
+                logger.info("  ✓ Capture device found: %s", config.audio_capture_device)
+        else:
+            logger.info("  ✓ Capture device: default")
+        
+        # Check playback device
+        if config.audio_playback_device != "default" and config.audio_playback_device:
+            playback_dev_str = str(config.audio_playback_device).lower()
+            device_found = any(
+                playback_dev_str in name or name in playback_dev_str 
+                for name in device_names
+            )
+            if not device_found:
+                try:
+                    dev_id = int(config.audio_playback_device)
+                    if 0 <= dev_id < len(devices):
+                        logger.info("  ✓ Playback device %d found: %s", dev_id, devices[dev_id]['name'])
+                    else:
+                        errors.append(f"Playback device ID out of range: {dev_id} (available: 0-{len(devices)-1})")
+                except (ValueError, TypeError):
+                    warnings_list.append(f"Playback device not found: {config.audio_playback_device}")
+            else:
+                logger.info("  ✓ Playback device found: %s", config.audio_playback_device)
+        else:
+            logger.info("  ✓ Playback device: default")
+    except ImportError:
+        warnings_list.append("sounddevice library not available for device validation")
+    except Exception as e:
+        warnings_list.append(f"Could not validate audio devices: {e}")
+    
+    # =========================================================================
+    # 3. NUMERIC CONSTANT RANGES
+    # =========================================================================
+    logger.info("→ Validating numeric constants...")
+    
+    # Audio sample rate
+    if config.audio_sample_rate not in [8000, 16000, 44100, 48000]:
+        warnings_list.append(
+            f"Unusual AUDIO_SAMPLE_RATE={config.audio_sample_rate} (typical: 8000, 16000, 44100, 48000)"
+        )
+    else:
+        logger.info("  ✓ Audio sample rate: %d Hz", config.audio_sample_rate)
+    
+    # Audio frame size
+    if not (5 <= config.audio_frame_ms <= 100):
+        errors.append(
+            f"AUDIO_FRAME_MS={config.audio_frame_ms} out of range (must be 5-100 ms)"
+        )
+    else:
+        logger.info("  ✓ Audio frame: %d ms", config.audio_frame_ms)
+    
+    # VAD timeout
+    if not (100 <= config.vad_min_silence_ms <= 10000):
+        errors.append(
+            f"VAD_MIN_SILENCE_MS={config.vad_min_silence_ms} out of range (must be 100-10000 ms)"
+        )
+    else:
+        logger.info("  ✓ VAD min silence: %d ms", config.vad_min_silence_ms)
+    
+    # Wake word timeout
+    if config.wake_word_enabled and not (1000 <= config.wake_word_timeout_ms <= 600000):
+        errors.append(
+            f"WAKE_WORD_TIMEOUT_MS={config.wake_word_timeout_ms} out of range (must be 1000-600000 ms)"
+        )
+    elif config.wake_word_enabled:
+        logger.info("  ✓ Wake word timeout: %d ms", config.wake_word_timeout_ms)
+    
+    # Audio gains
+    if not (0.1 <= config.audio_input_gain <= 10.0):
+        errors.append(
+            f"AUDIO_INPUT_GAIN={config.audio_input_gain} out of range (must be 0.1-10.0)"
+        )
+    else:
+        logger.info("  ✓ Audio input gain: %.2fx", config.audio_input_gain)
+    
+    # TTS speed
+    if not (0.5 <= config.piper_speed <= 5.0):
+        warnings_list.append(
+            f"PIPER_SPEED={config.piper_speed} unusual (typical: 0.5-5.0)"
+        )
+    else:
+        logger.info("  ✓ TTS speed: %.2fx", config.piper_speed)
+    
+    # =========================================================================
+    # REPORT RESULTS
+    # =========================================================================
+    if warnings_list:
+        logger.warning("=" * 70)
+        logger.warning("RUNTIME CONFIGURATION WARNINGS")
+        logger.warning("=" * 70)
+        for warning in warnings_list:
+            logger.warning("  ⚠ %s", warning)
+        logger.warning("=" * 70)
+    
+    if errors:
+        logger.error("=" * 70)
+        logger.error("RUNTIME CONFIGURATION ERRORS - Cannot start orchestrator")
+        logger.error("=" * 70)
+        for error in errors:
+            logger.error("  ❌ %s", error)
+        logger.error("=" * 70)
+        raise RuntimeError(f"Runtime configuration validation failed with {len(errors)} error(s). See logs above.")
+    
+    logger.info("✓ All runtime configuration checks passed!")
+
+
 async def run_orchestrator() -> None:
     config = VoiceConfig()
     
@@ -233,6 +481,10 @@ async def run_orchestrator() -> None:
     print("="*51 + "\n", flush=True)
     
     logger.info("Starting Python voice orchestrator (scaffold)")
+    
+    # Validate runtime configuration before proceeding with initialization
+    print("→ Validating runtime configuration...", flush=True)
+    validate_runtime_config(config)
 
     frame_samples = int(config.audio_sample_rate * (config.audio_frame_ms / 1000))
     logger.info("═══════════════════════════════════════════════════")
@@ -319,23 +571,70 @@ async def run_orchestrator() -> None:
     tts_dedupe_window_ms = 800
     current_request_id = 0  # Incremented on each user message
     current_tts_request_id = 0  # Tracks which request is currently playing
-    latest_tts_request_id = 0  # Request ID of the text waiting to be played
     warned_wake_resample = False
     warned_aec_stub = False
     wake_sleep_ts: float | None = None
     wake_sleep_cooldown_ms = 1000
     last_wake_detected_ts: float | None = None
+    last_wake_conf_log_ts = 0.0
 
     wake_detector = None
+    active_wake_engine = None
     if config.wake_word_enabled:
-        logger.info("→ Loading Wake Word detector...")
         wake_start = time.monotonic()
-        wake_detector = OpenWakeWordDetector(
-            model_path=config.openwakeword_model_path,
-            confidence=config.wake_word_confidence,
-        )
+        
+        # Select wake word engine based on enabled flags
+        if config.openwakeword_enabled:
+            active_wake_engine = "openwakeword"
+            logger.info("→ Loading Wake Word detector (OpenWakeWord: %s)...", config.openwakeword_wake_word)
+            wake_detector = OpenWakeWordDetector(
+                model_path=config.openwakeword_model_path,
+                confidence=config.openwakeword_confidence,
+            )
+        elif config.precise_enabled:
+            active_wake_engine = "precise"
+            logger.info("→ Loading Wake Word detector (Precise: %s)...", config.precise_wake_word)
+            wake_detector = MycoftPreciseDetector(
+                model_path=config.precise_model_path,
+                confidence=config.precise_confidence,
+            )
+        elif config.picovoice_enabled:
+            active_wake_engine = "picovoice"
+            logger.info("→ Loading Wake Word detector (Picovoice: %s)...", config.picovoice_wake_word)
+            wake_detector = PicovoiceDetector(
+                model_path=config.picovoice_wake_word,
+                access_key=config.picovoice_key,
+                confidence=config.picovoice_confidence,
+            )
+        
         wake_elapsed = int((time.monotonic() - wake_start) * 1000)
-        logger.info("✓ Wake Word loaded in %dms", wake_elapsed)
+        if wake_detector:
+            logger.info("✓ Wake Word detector loaded in %dms", wake_elapsed)
+            # Warm up Precise detector to trigger TensorFlow loading (so it doesn't delay first real detection)
+            # OpenWakeWord uses TFLite and doesn't need warm-up
+            if active_wake_engine == "precise":
+                logger.info("→ Warming up wake detector (loading TensorFlow models)...")
+                warmup_start = time.monotonic()
+                dummy_audio = np.zeros(2048, dtype=np.int16).tobytes()
+                try:
+                    wake_detector.detect(dummy_audio)
+                    # Reset detector state after warm-up to clear the dummy audio from internal buffer
+                    if hasattr(wake_detector, 'reset_state'):
+                        wake_detector.reset_state()
+                    warmup_elapsed = int((time.monotonic() - warmup_start) * 1000)
+                    logger.info("✓ Wake detector ready (TensorFlow loaded in %dms)", warmup_elapsed)
+                except Exception as e:
+                    logger.warning("Wake detector warm-up failed: %s", e)
+        else:
+            logger.error("⚠ Wake word detector failed to initialize; staying ASLEEP to avoid always-on transcription")
+            if config.openwakeword_enabled:
+                logger.error("   Check OPENWAKEWORD_MODEL_PATH=%s", config.openwakeword_model_path)
+            elif config.precise_enabled:
+                logger.error("   Check PRECISE_MODEL_PATH=%s", config.precise_model_path)
+            elif config.picovoice_enabled:
+                logger.error("   Check PICOVOICE_KEY configuration")
+            wake_state = WakeState.ASLEEP
+            last_wake_detected_ts = None
 
     # STT client
     print("→ Initializing Whisper STT client...", flush=True)
@@ -410,8 +709,7 @@ async def run_orchestrator() -> None:
     )
     logger.info("✓ AEC: enabled=%s backend=%s available=%s", aec_status.enabled, aec_status.backend, aec_status.available)
 
-    latest_tts_text = ""
-    tts_update_event = asyncio.Event()
+    tts_queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
     tts_stop_event = threading.Event()
     tts_playback_start_ts: float | None = None
     current_tts_text = ""
@@ -475,7 +773,7 @@ async def run_orchestrator() -> None:
         return text
 
     async def submit_tts(text: str, request_id: int = 0) -> None:
-        nonlocal last_tts_text, last_tts_ts, latest_tts_text, latest_tts_request_id
+        nonlocal last_tts_text, last_tts_ts
         nonlocal current_tts_text, current_tts_duration_s, tts_playback_start_ts
         nonlocal tts_playing, current_tts_request_id
         
@@ -511,9 +809,8 @@ async def run_orchestrator() -> None:
 
         last_tts_text = text
         last_tts_ts = now
-        latest_tts_text = text
-        latest_tts_request_id = request_id if request_id else current_request_id
-        tts_update_event.set()
+        effective_request_id = request_id if request_id else current_request_id
+        await tts_queue.put((text, effective_request_id))
 
     async def send_debounced_transcripts() -> None:
         """Send accumulated transcripts after debounce period."""
@@ -667,15 +964,10 @@ async def run_orchestrator() -> None:
 
     async def tts_loop() -> None:
         nonlocal tts_playing, tts_gain, last_playback_frame, tts_playback_start_ts
-        nonlocal latest_tts_text, latest_tts_request_id, current_tts_text, current_tts_duration_s
+        nonlocal current_tts_text, current_tts_duration_s
         nonlocal current_tts_request_id, last_activity_ts
         while True:
-            await tts_update_event.wait()
-            text = latest_tts_text
-            request_id = latest_tts_request_id
-            latest_tts_text = ""  # Clear after consuming
-            latest_tts_request_id = 0
-            tts_update_event.clear()
+            text, request_id = await tts_queue.get()
             if not text:
                 continue
             tts_playing = True
@@ -868,6 +1160,7 @@ async def run_orchestrator() -> None:
     capture.start()
     print("🎧 Listening for audio input...\n", flush=True)
     logger.info("🎧 Listening for audio input...")
+    
     asyncio.create_task(tts_loop())
     if getattr(gateway, "supports_listen", False):
         asyncio.create_task(gateway_listener())
@@ -877,6 +1170,8 @@ async def run_orchestrator() -> None:
     heartbeat_interval = 10.0  # Log heartbeat every 10 seconds
     last_meter_ts = time.monotonic()
     meter_interval = 1.0
+    mic_level_count = 0
+    swoosh_played = False
     last_nonzero_mic_ts = time.monotonic()
     mic_silence_restart_s = 0.0
     mic_level_threshold = 0.001
@@ -916,6 +1211,22 @@ async def run_orchestrator() -> None:
                         rms = float(np.sqrt(np.mean(samples ** 2)) / 32768.0)
                         dbfs = 20.0 * math.log10(max(rms, 1e-6))
                         logger.info("🎚️ Mic level: %.4f (%.1f dBFS)", rms, dbfs)
+                        mic_level_count += 1
+                        
+                        # Swoosh sound disabled
+                        # (Was: Play swoosh after second mic level log, but disabled per user request)
+                        if False:  # DISABLED
+                            try:
+                                swoosh_sound = generate_swoosh_sound(sample_rate=config.audio_sample_rate)
+                                playback.play_pcm(swoosh_sound, gain=2.5, stop_event=threading.Event())
+                                logger.info("✓ Readiness chime (swoosh) played")
+                                swoosh_played = True
+                            except Exception as e:
+                                logger.debug("Failed to play readiness chime: %s", e)
+                                swoosh_played = True
+                        else:
+                            swoosh_played = True  # Mark as played so we don't keep trying
+                        
                         if rms > mic_level_threshold:
                             last_nonzero_mic_ts = now
                 except Exception as exc:  # pragma: no cover
@@ -975,7 +1286,7 @@ async def run_orchestrator() -> None:
 
             if config.wake_word_enabled and wake_state == WakeState.ASLEEP:
                 # Keep awake while TTS is playing or queued so cut-in can work
-                if tts_playing or latest_tts_text:
+                if tts_playing or not tts_queue.empty():
                     wake_state = WakeState.AWAKE
                     last_activity_ts = now
                 else:
@@ -984,12 +1295,45 @@ async def run_orchestrator() -> None:
                         continue
                     if wake_detector:
                         wake_frame = processed_frame
+                        # DEBUG: Check frame properties
+                        frame_len = len(wake_frame) if wake_frame else 0
+                        frame_rms = 0.0
+                        if frame_len > 0:
+                            samples = np.frombuffer(wake_frame, dtype=np.int16)
+                            # Avoid RuntimeWarning by ensuring positive values
+                            mean_sq = np.mean(samples.astype(np.float64) ** 2)
+                            frame_rms = float(np.sqrt(max(mean_sq, 0.0)) / 32768.0)
+                        
                         if config.audio_sample_rate != 16000:
                             if not warned_wake_resample:
                                 logger.warning("Wake word expects 16kHz audio; resampling from %s Hz.", config.audio_sample_rate)
                                 warned_wake_resample = True
                             wake_frame = resample_pcm(processed_frame, config.audio_sample_rate, 16000)
-                        wake_result = wake_detector.detect(wake_frame)
+                        
+                        try:
+                            wake_result = wake_detector.detect(wake_frame)
+                        except Exception as e:
+                            logger.error("Wake detector error: %s", e)
+                            wake_result = WakeWordResult(detected=False, confidence=0.0)
+
+                        # Get active confidence threshold for logging
+                        if active_wake_engine == "openwakeword":
+                            active_confidence = config.openwakeword_confidence
+                        elif active_wake_engine == "precise":
+                            active_confidence = config.precise_confidence
+                        elif active_wake_engine == "picovoice":
+                            active_confidence = config.picovoice_confidence
+                        else:
+                            active_confidence = 0.5
+                        
+                        # Log only meaningful confidence spikes and rate-limit to avoid log spam.
+                        wake_conf_log_threshold = max(0.15, active_confidence * 0.5)
+                        if wake_result.confidence >= wake_conf_log_threshold and (now - last_wake_conf_log_ts) >= 0.75:
+                            logger.info("Wake confidence spike: %.4f (frame_rms=%.6f, frame_len=%d)", wake_result.confidence, frame_rms, frame_len)
+                            last_wake_conf_log_ts = now
+                        elif frame_rms > 0.05 and (now - last_wake_conf_log_ts) >= 1.0:  # Also log when there's significant audio
+                            logger.info("Audio detected but no spike: conf=%.4f, frame_rms=%.6f", wake_result.confidence, frame_rms)
+
                         if wake_result.detected:
                             wake_state = WakeState.AWAKE
                             wake_sleep_ts = None
@@ -1215,7 +1559,7 @@ async def run_orchestrator() -> None:
                     if (
                         state in (VoiceState.IDLE, VoiceState.LISTENING)
                         and not tts_playing
-                        and not latest_tts_text
+                        and tts_queue.empty()
                         and not debounce_pending
                         and not has_pending_transcripts
                         and active_transcriptions == 0
@@ -1227,8 +1571,9 @@ async def run_orchestrator() -> None:
                         if wake_detector and hasattr(wake_detector, 'reset_state'):
                             wake_detector.reset_state()
                         logger.info("Wake timeout reached → asleep")
-                        # Play timeout swoosh sound
-                        if timeout_swoosh_sound:
+                        # Timeout swoosh sound disabled
+                        # (Was: play_pcm on timeout, but disabled per user request)
+                        if False and timeout_swoosh_sound:  # DISABLED
                             try:
                                 pcm_swoosh = wav_bytes_to_pcm(timeout_swoosh_sound)
                                 asyncio.create_task(asyncio.to_thread(playback.play_pcm, pcm_swoosh, 1.0, threading.Event()))

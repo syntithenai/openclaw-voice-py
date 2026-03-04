@@ -1,0 +1,90 @@
+name: Release Precise Engine Artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g., v0.3.0-precise.1)"
+        required: true
+        type: string
+  release:
+    types: [published]
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: armv7
+            experimental: false
+          - arch: arm64
+            experimental: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build precise artifact
+        env:
+          TF113_AARCH64_WHL_URL: ${{ vars.TF113_AARCH64_WHL_URL }}
+        run: |
+          if [ "${{ matrix.arch }}" = "armv7" ]; then
+            ./build_precise_engine_armv7.sh
+            cp artifacts/precise-engine-armv7/precise-engine.tar.gz artifacts/precise-engine-armv7/precise-engine-armv7.tar.gz
+          else
+            ./build_precise_engine_arm64.sh
+            cp artifacts/precise-engine-arm64/precise-engine.tar.gz artifacts/precise-engine-arm64/precise-engine-arm64.tar.gz
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: precise-${{ matrix.arch }}
+          path: |
+            artifacts/precise-engine-${{ matrix.arch }}/precise-engine*.tar.gz
+            artifacts/precise-engine-${{ matrix.arch }}/precise-engine*.md5
+
+  publish:
+    name: Publish release assets
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: List release assets
+        run: find release-assets -type f -maxdepth 4 | sort
+
+      - name: Publish to existing GitHub Release (release event)
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/**/*.tar.gz
+            release-assets/**/*.md5
+
+      - name: Create and publish GitHub Release (manual dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          name: ${{ github.event.inputs.tag }}
+          generate_release_notes: true
+          files: |
+            release-assets/**/*.tar.gz
+            release-assets/**/*.md5

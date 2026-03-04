@@ -9,3 +9,16 @@ __pycache__/
 *.pyc
 *.pyo
 orchestrator_output.log
+picovoice-models-pi/Mycroft_en_raspberry-pi_v4_0_0.ppn
+build_tensorflow_fix.log
+build_tensorflow_fix2.log
+build_tensorflow_fix3.log
+build_tensorflow_fix4.log
+build_with_absl_installed.log
+build_with_absl_v2.log
+build_with_absl.log
+build_with_google_protobuf.log
+build_with_wrapt.log
+artifacts/prebuilt-test/precise-engine_0.3.0_armv7l.tar.gz
+artifacts/precise-engine-armv7/precise-engine.tar.gz
+artifacts/precise-engine-armv7/precise-engine.tar.gz.md5

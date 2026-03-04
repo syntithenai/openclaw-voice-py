@@ -33,6 +33,7 @@ x-orchestrator-common: &orchestrator-common
 
 services:
   whisper:
+    profiles: ["stt"]
     restart: unless-stopped
     build:
       context: ./docker/whisper
@@ -46,6 +47,7 @@ services:
       - ./docker/whisper-models:/root/.cache/whisper
 
   piper:
+    profiles: ["tts"]
     restart: unless-stopped
     build:
       context: ./docker/piper

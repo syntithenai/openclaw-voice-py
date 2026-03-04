@@ -44,22 +44,56 @@ class DuplexAudioIO:
     def set_playback_callback(self, callback: Callable[[bytes], None]) -> None:
         self._on_playback_frame = callback
 
-    def _device_tuple(self) -> Tuple[Optional[Union[int, str]], Optional[str]]:
-        # Convert ALSA device names to numeric indices for sounddevice
+    def _device_tuple(self) -> Tuple[Optional[Union[int, str]], Optional[Union[int, str]]]:
+        # Convert numeric or ALSA device names to concrete indices for sounddevice
         in_dev = None
         if self.input_device != "default":
-            if isinstance(self.input_device, str) and self.input_device.startswith(("hw:", "plughw:")):
+            if isinstance(self.input_device, str) and self.input_device.isdigit():
+                in_dev = int(self.input_device)
+            elif isinstance(self.input_device, str) and self.input_device.startswith(("hw:", "plughw:")):
                 try:
-                    card = int(self.input_device.split(":")[1].split(",")[0])
-                    in_dev = card
-                    logger.debug("Converted input ALSA device %s to numeric index %d", self.input_device, card)
-                except (ValueError, IndexError):
-                    logger.warning("Could not parse ALSA input device format: %s", self.input_device)
-                    in_dev = None
+                    hw = self.input_device.split(":", 1)[1]
+                    devices = sd.query_devices()
+                    match = next(
+                        (
+                            i
+                            for i, d in enumerate(devices)
+                            if f"(hw:{hw})" in d.get("name", "") and d.get("max_input_channels", 0) > 0
+                        ),
+                        None,
+                    )
+                    if match is not None:
+                        in_dev = int(match)
+                        logger.debug("Resolved input ALSA device %s to index %d", self.input_device, in_dev)
+                    else:
+                        in_dev = self.input_device
+                except Exception:
+                    logger.warning("Could not resolve ALSA input device format: %s", self.input_device)
+                    in_dev = self.input_device
             else:
                 in_dev = self.input_device
-        
-        out_dev = None if self.output_device == "default" else self.output_device
+
+        if self.output_device == "default":
+            out_dev: Optional[Union[int, str]] = None
+        elif isinstance(self.output_device, str) and self.output_device.isdigit():
+            out_dev = int(self.output_device)
+        elif isinstance(self.output_device, str) and self.output_device.startswith(("hw:", "plughw:")):
+            try:
+                hw = self.output_device.split(":", 1)[1]
+                devices = sd.query_devices()
+                match = next(
+                    (
+                        i
+                        for i, d in enumerate(devices)
+                        if f"(hw:{hw})" in d.get("name", "") and d.get("max_output_channels", 0) > 0
+                    ),
+                    None,
+                )
+                out_dev = int(match) if match is not None else self.output_device
+            except Exception:
+                out_dev = self.output_device
+        else:
+            out_dev = self.output_device
         return (in_dev, out_dev)
 
     def _callback(self, indata: np.ndarray, outdata: np.ndarray, frames: int, time_info, status) -> None:

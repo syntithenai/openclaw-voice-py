@@ -36,10 +36,9 @@ class OpenWakeWordDetector(WakeWordBase):
                     self._model = Model(wakeword_models=[model_path])
                     logger.info("OpenWakeWord loaded model from: %s", model_path)
                 else:
-                    # Treat it as a model name - load all defaults and filter later
-                    self._model = Model()
-                    logger.info("OpenWakeWord loaded default models (filtering for '%s'): %s", 
-                               model_path, list(self._model.models.keys()))
+                    # Treat it as a model name - load only that specific model
+                    self._model = Model(wakeword_models=[model_path])
+                    logger.info("OpenWakeWord loaded model: %s", model_path)
             else:
                 # Load default pre-trained models (alexa, hey_mycroft, hey_jarvis, timer, weather)
                 self._model = Model()

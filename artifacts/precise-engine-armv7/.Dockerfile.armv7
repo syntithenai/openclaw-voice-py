@@ -1,0 +1,7 @@
+FROM arm32v7/python:3.7-buster
+
+ENV DEBIAN_FRONTEND=noninteractive
+# Buster is archived; point apt to archive mirrors.
+RUN printf 'deb http://archive.debian.org/debian buster main\n' > /etc/apt/sources.list     && printf 'deb http://archive.debian.org/debian-security buster/updates main\n' >> /etc/apt/sources.list     && printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99archive     && apt-get -o Acquire::Check-Valid-Until=false update     && apt-get install -y --no-install-recommends         git         curl         zip         unzip         python3-scipy         cython         libhdf5-dev         python3-h5py         portaudio19-dev         swig         libpulse-dev         libatlas-base-dev         libopenblas-dev     && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt

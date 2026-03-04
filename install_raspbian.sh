@@ -241,11 +241,22 @@ config[PIPER_SPEED]="${config[PIPER_SPEED]:-1.0}"
 # Wake word configuration
 echo ""
 echo -e "${YELLOW}Wake Word Configuration:${NC}"
-read -p "Wake word confidence threshold (0.0-1.0, default: '0.95'): " -r -e config[WAKE_WORD_CONFIDENCE]
-config[WAKE_WORD_CONFIDENCE]="${config[WAKE_WORD_CONFIDENCE]:-0.95}"
+if [[ "$ARCH" == "armv7l" || "$ARCH" == "armv6l" ]]; then
+    DEFAULT_WAKE_ENGINE="precise"
+    DEFAULT_WAKE_CONF="0.5"
+    DEFAULT_WAKE_MODEL="docker/wakeword-models/hey-mycroft.pb"
+else
+    DEFAULT_WAKE_ENGINE="openwakeword"
+    DEFAULT_WAKE_CONF="0.95"
+    DEFAULT_WAKE_MODEL="hey_mycroft"
+fi
 
-read -p "Wake word model (default: 'hey_mycroft'): " -r -e config[OPENWAKEWORD_MODEL_PATH]
-config[OPENWAKEWORD_MODEL_PATH]="${config[OPENWAKEWORD_MODEL_PATH]:-hey_mycroft}"
+echo "  Suggested defaults for $ARCH_NAME: engine=$DEFAULT_WAKE_ENGINE, model=$DEFAULT_WAKE_MODEL"
+read -p "Wake word confidence threshold (0.0-1.0, default: '$DEFAULT_WAKE_CONF'): " -r -e config[WAKE_WORD_CONFIDENCE]
+config[WAKE_WORD_CONFIDENCE]="${config[WAKE_WORD_CONFIDENCE]:-$DEFAULT_WAKE_CONF}"
+
+read -p "Wake word model (default: '$DEFAULT_WAKE_MODEL'): " -r -e config[OPENWAKEWORD_MODEL_PATH]
+config[OPENWAKEWORD_MODEL_PATH]="${config[OPENWAKEWORD_MODEL_PATH]:-$DEFAULT_WAKE_MODEL}"
 
 # VAD configuration
 echo ""
@@ -298,8 +309,11 @@ PIPER_SPEED=${config[PIPER_SPEED]}
 # Wake Word Configuration (OpenWakeWord)
 OPENWAKEWORD_MODEL_PATH=${config[OPENWAKEWORD_MODEL_PATH]}
 WAKE_WORD_ENABLED=true
+WAKE_WORD_ENGINE=$DEFAULT_WAKE_ENGINE
 WAKE_WORD_CONFIDENCE=${config[WAKE_WORD_CONFIDENCE]}
 WAKE_WORD_PREBUFFER_MS=80
+OPENWAKEWORD_AUTO_DOWNLOAD=true
+OPENWAKEWORD_MODELS_DIR=docker/wakeword-models
 
 # VAD Configuration
 VAD_BACKEND=${config[VAD_BACKEND]}
@@ -321,6 +335,10 @@ OPENWAKEWORD_PRELOAD_MODELS=true
 EOF
 
 echo -e "${GREEN}✓ Configuration saved to: $ENV_FILE${NC}"
+
+echo ""
+echo -e "${BLUE}Ensuring wakeword resources...${NC}"
+bash "$SCRIPT_DIR/ensure_wakeword_resources.sh" all || true
 echo ""
 echo "Configuration values:"
 for key in "${!config[@]}"; do
