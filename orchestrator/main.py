@@ -715,6 +715,9 @@ async def run_orchestrator() -> None:
                 raise RuntimeError(f"Configured capture device failed validation ({config.audio_capture_device}): {cap_err}")
 
             # Validate configured playback device/rate.
+            pb_info = sd.query_devices(pb_idx, "output")
+            if pb_info.get("max_output_channels", 0) == 0:
+                raise RuntimeError(f"Configured playback device has no output channels ({config.audio_playback_device})")
             selected_playback_rate = _pick_working_playback_rate(pb_idx, selected_playback_rate)
             sd.check_output_settings(device=pb_idx, samplerate=selected_playback_rate, channels=1)
 
