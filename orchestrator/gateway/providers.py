@@ -531,21 +531,23 @@ class OpenClawGateway(BaseGateway):
                             # Extract delta: only new text not seen in previous stream updates
                             full_text = text.strip()
                             if full_text.startswith(self._last_streamed_text):
-                                delta = full_text[len(self._last_streamed_text):].strip()
+                                # Only strip trailing whitespace to preserve leading spaces (word boundaries)
+                                delta = full_text[len(self._last_streamed_text):].rstrip()
                                 if delta:
                                     # Clean delta for TTS: remove markdown formatting and filter special markers
                                     cleaned = delta
                                     # Remove markdown bold/italic
                                     cleaned = cleaned.replace("**", "").replace("*", "")
                                     # Filter out NO_REPLY markers
-                                    if cleaned.startswith("NO_RE"):
+                                    if cleaned.lstrip().startswith("NO_RE"):
                                         logger.debug("Filtered NO_REPLY marker from delta")
                                         self._last_streamed_text = full_text
                                         continue
                                     
                                     if cleaned.strip():
-                                        await self._incoming_texts.put(cleaned.strip())
-                                        logger.info("← OpenClaw event[%s] delta: %s", event_name, cleaned.strip()[:80])
+                                        # Preserve leading space but strip trailing
+                                        await self._incoming_texts.put(cleaned.rstrip())
+                                        logger.info("← OpenClaw event[%s] delta: %s", event_name, cleaned.rstrip()[:80])
                                 self._last_streamed_text = full_text
                             else:
                                 # New message or reset - queue full text with cleaning

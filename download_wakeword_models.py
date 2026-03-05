@@ -18,20 +18,20 @@ logger = logging.getLogger(__name__)
 
 # Public Precise models from Mycroft community
 PRECISE_MODELS = {
-    "hey_mycroft": "https://github.com/MycroftAI/precise-data/raw/master/models/hey-mycroft.pb",
-    "alexa": "https://github.com/MycroftAI/precise-data/raw/master/models/alexa.pb",
-    "jarvis": "https://github.com/MycroftAI/precise-data/raw/master/models/jarvis.pb",
-    "ok_google": "https://github.com/MycroftAI/precise-data/raw/master/models/ok-google.pb",
-    "hey_siri": "https://github.com/MycroftAI/precise-data/raw/master/models/siri.pb",
+    "hey_mycroft": "https://raw.githubusercontent.com/MycroftAI/precise-data/models/hey-mycroft.pb",
+    "alexa": "https://raw.githubusercontent.com/MycroftAI/precise-data/models/alexa.pb",
+    "jarvis": "https://raw.githubusercontent.com/MycroftAI/precise-data/models/jarvis.pb",
+    "ok_google": "https://raw.githubusercontent.com/MycroftAI/precise-data/models/ok-google.pb",
+    "hey_siri": "https://raw.githubusercontent.com/MycroftAI/precise-data/models/siri.pb",
 }
 
 # Precise model params files (required metadata)
 PRECISE_PARAMS = {
-    "hey_mycroft": "https://github.com/MycroftAI/precise-data/raw/master/models/hey-mycroft.pb.params",
-    "alexa": "https://github.com/MycroftAI/precise-data/raw/master/models/alexa.pb.params",
-    "jarvis": "https://github.com/MycroftAI/precise-data/raw/master/models/jarvis.pb.params",
-    "ok_google": "https://github.com/MycroftAI/precise-data/raw/master/models/ok-google.pb.params",
-    "hey_siri": "https://github.com/MycroftAI/precise-data/raw/master/models/siri.pb.params",
+    "hey_mycroft": "https://raw.githubusercontent.com/MycroftAI/precise-data/models/hey-mycroft.pb.params",
+    "alexa": "https://raw.githubusercontent.com/MycroftAI/precise-data/models/alexa.pb.params",
+    "jarvis": "https://raw.githubusercontent.com/MycroftAI/precise-data/models/jarvis.pb.params",
+    "ok_google": "https://raw.githubusercontent.com/MycroftAI/precise-data/models/ok-google.pb.params",
+    "hey_siri": "https://raw.githubusercontent.com/MycroftAI/precise-data/models/siri.pb.params",
 }
 
 # OpenWakeWord models (built-in, but can be cached as .tflite files)
@@ -73,7 +73,7 @@ def setup_precise_models(models_dir: str) -> None:
         try:
             # Model file
             model_file = models_path / f"{model_name}.pb"
-            if not model_file.exists():
+            if (not model_file.exists()) or model_file.stat().st_size == 0:
                 if download_file(url, str(model_file)):
                     logger.info(f"  Model: {model_name}")
                 else:
@@ -85,7 +85,7 @@ def setup_precise_models(models_dir: str) -> None:
             params_url = PRECISE_PARAMS.get(model_name)
             if params_url:
                 params_file = models_path / f"{model_name}.pb.params"
-                if not params_file.exists():
+                if (not params_file.exists()) or params_file.stat().st_size == 0:
                     if download_file(params_url, str(params_file)):
                         logger.info(f"  Params: {model_name}.pb.params")
                     else:

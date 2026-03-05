@@ -27,11 +27,16 @@ class VoiceConfig(BaseSettings):
 
     # Audio
     audio_sample_rate: int = Field(16000)
+    audio_playback_sample_rate: int = Field(0)  # 0 = use audio_sample_rate; set to 48000 for USB devices
+    audio_playback_lead_in_ms: int = Field(0)  # 0 = auto; set higher (e.g. 400-800) for devices clipping sentence starts
+    audio_playback_keepalive_enabled: bool = Field(False)  # Keep output stream primed during idle (Pi-only)
+    audio_playback_keepalive_interval_ms: int = Field(250)  # Idle gap before sending a silence keepalive frame
     audio_frame_ms: int = Field(20)
     audio_capture_device: int | str = Field("default")
     audio_playback_device: int | str = Field("default")
     audio_backend: str = Field("portaudio")
     audio_input_gain: float = Field(1.0)  # Software gain multiplier for input audio
+    audio_output_gain: float = Field(1.0)  # Software gain multiplier for TTS/output audio
 
     # VAD
     vad_type: str = Field("webrtc")
@@ -64,6 +69,9 @@ class VoiceConfig(BaseSettings):
     # Wake word - Global settings
     wake_word_enabled: bool = Field(False)
     wake_word_timeout_ms: int = Field(120000)
+    wake_sleep_cooldown_ms: int = Field(2500)  # Ignore wake detections briefly after going to sleep
+    wake_min_detect_rms: float = Field(0.0015)  # Reject wake detections on near-silence frames
+    wake_clear_ring_buffer: bool = Field(False)  # Clear ring buffer on wake to avoid ghost transcripts (ARM/Pi only)
 
     # Wake word - Precise Engine (Mycroft Precise v0.3.0)
     precise_enabled: bool = Field(False)
@@ -190,10 +198,16 @@ class VoiceConfig(BaseSettings):
         # Validate audio settings
         if self.audio_sample_rate <= 0:
             errors.append(f"Invalid AUDIO_SAMPLE_RATE={self.audio_sample_rate} (must be > 0)")
+        if self.audio_playback_keepalive_interval_ms <= 0:
+            errors.append(
+                f"AUDIO_PLAYBACK_KEEPALIVE_INTERVAL_MS={self.audio_playback_keepalive_interval_ms} must be > 0"
+            )
         if self.audio_frame_ms <= 0:
             errors.append(f"Invalid AUDIO_FRAME_MS={self.audio_frame_ms} (must be > 0)")
         if self.audio_input_gain < 0.1 or self.audio_input_gain > 10.0:
             errors.append(f"AUDIO_INPUT_GAIN={self.audio_input_gain} is unusual (typical range: 0.1-10.0)")
+        if self.audio_output_gain < 0.1 or self.audio_output_gain > 5.0:
+            errors.append(f"AUDIO_OUTPUT_GAIN={self.audio_output_gain} is unusual (typical range: 0.1-5.0)")
 
         # Validate VAD settings
         if not (0.0 <= self.vad_confidence <= 1.0):
@@ -202,6 +216,13 @@ class VoiceConfig(BaseSettings):
             errors.append(f"VAD_MIN_SPEECH_MS={self.vad_min_speech_ms} must be >= 0")
         if self.vad_min_silence_ms < 0:
             errors.append(f"VAD_MIN_SILENCE_MS={self.vad_min_silence_ms} must be >= 0")
+
+        # Validate wake sleep/detection guardrails
+        if self.wake_sleep_cooldown_ms < 0:
+            errors.append(f"WAKE_SLEEP_COOLDOWN_MS={self.wake_sleep_cooldown_ms} must be >= 0")
+        if not (0.0 <= self.wake_min_detect_rms <= 1.0):
+            errors.append(f"WAKE_MIN_DETECT_RMS={self.wake_min_detect_rms} must be between 0.0 and 1.0")
+
         # Service URL validation
         # Validate service URLs (if they contain text, they should look like URLs)
 

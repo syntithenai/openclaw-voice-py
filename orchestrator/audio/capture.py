@@ -62,15 +62,31 @@ class AudioCapture:
                     logger.warning("Could not resolve ALSA device format: %s", self.device)
                     device_param = self.device
 
-        self._stream = sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=1,
-            dtype="float32",
-            blocksize=self.frame_samples,
-            device=device_param,
-            callback=self._callback,
-        )
-        self._stream.start()
+        # Try to open stream with channels: mono (1), stereo (2), then the device's default
+        channels_to_try = [1, 2]  # Try mono first, then stereo
+        last_error = None
+        
+        for num_channels in channels_to_try:
+            try:
+                self._stream = sd.InputStream(
+                    samplerate=self.sample_rate,
+                    channels=num_channels,
+                    dtype="float32",
+                    blocksize=self.frame_samples,
+                    device=device_param,
+                    callback=self._callback,
+                )
+                self._stream.start()
+                if num_channels != 1:
+                    logger.info("Device does not support mono input; using %d channels", num_channels)
+                return
+            except Exception as e:
+                last_error = e
+                logger.debug("Failed to open stream with %d channels: %s", num_channels, str(e))
+        
+        # If all channel counts failed, raise the last error
+        if last_error:
+            raise last_error
 
     def stop(self) -> None:
         if self._stream:

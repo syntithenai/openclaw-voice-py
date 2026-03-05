@@ -47,20 +47,34 @@ if [[ -z "$PLAYBACK_SAMPLE_RATE" ]]; then
   PLAYBACK_SAMPLE_RATE="$(grep -E '^AUDIO_SAMPLE_RATE=' "$ENV_FILE" | tail -n1 | cut -d'=' -f2- || true)"
 fi
 PLAYBACK_SAMPLE_RATE="${PLAYBACK_SAMPLE_RATE:-16000}"
+AUDIO_OUTPUT_GAIN="$(grep -E '^AUDIO_OUTPUT_GAIN=' "$ENV_FILE" | tail -n1 | cut -d'=' -f2- || true)"
+AUDIO_OUTPUT_GAIN="${AUDIO_OUTPUT_GAIN:-1.0}"
+PIPER_URL="$(grep -E '^PIPER_URL=' "$ENV_FILE" | tail -n1 | cut -d'=' -f2- || true)"
+PIPER_URL="${PIPER_URL:-http://localhost:10001}"
+PIPER_VOICE_ID="$(grep -E '^PIPER_VOICE_ID=' "$ENV_FILE" | tail -n1 | cut -d'=' -f2- || true)"
+PIPER_VOICE_ID="${PIPER_VOICE_ID:-en_US-amy-medium}"
 
 echo "Running speaker test"
 echo "  Device: $PLAYBACK_DEVICE"
 echo "  Sample rate: $PLAYBACK_SAMPLE_RATE"
+echo "  Output gain: ${AUDIO_OUTPUT_GAIN}x"
+echo "  Piper URL: $PIPER_URL"
 
 "$PYTHON_BIN" - <<PY
+import json
 import math
 import time
+import urllib.request
+import urllib.error
 
 import numpy as np
 import sounddevice as sd
 
 device = ${PLAYBACK_DEVICE@Q}
 sample_rate = int(${PLAYBACK_SAMPLE_RATE@Q})
+output_gain = float(${AUDIO_OUTPUT_GAIN@Q})
+piper_url = ${PIPER_URL@Q}
+piper_voice_id = ${PIPER_VOICE_ID@Q}
 
 if device.isdigit():
     device = int(device)
@@ -97,9 +111,15 @@ sample_rate = working_rate
 
 
 def tone(freq: float, duration: float, volume: float = 0.25):
+    """Generate test tone with output gain applied"""
     t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
     env = np.minimum(1.0, np.minimum(t * 80.0, (duration - t) * 80.0))
-    return (volume * env * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+    audio = (volume * env * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+    # Apply output gain to match orchestrator playback
+    audio = (audio * output_gain).astype(np.float32)
+    # Clip to prevent distortion
+    audio = np.clip(audio, -1.0, 1.0)
+    return audio
 
 # Left-right alternating tone sequence helps verify channel/output routing.
 sequence = [
@@ -108,7 +128,7 @@ sequence = [
     (880.0, 0.25),
 ]
 
-print("Playing startup tones...")
+print(f"Playing startup tones with {output_gain:.2f}x gain...")
 for freq, dur in sequence:
     data = tone(freq, dur)
     sd.play(data, samplerate=sample_rate, device=device)
@@ -123,8 +143,57 @@ end_f = 1200.0
 freq = start_f + (end_f - start_f) * (t / duration)
 phase = 2 * np.pi * np.cumsum(freq) / sample_rate
 sweep = (0.2 * np.sin(phase)).astype(np.float32)
+# Apply output gain
+sweep = (sweep * output_gain).astype(np.float32)
+sweep = np.clip(sweep, -1.0, 1.0)
 sd.play(sweep, samplerate=sample_rate, device=device)
 sd.wait()
 
-print("Done. If you heard tones + sweep, output device is working.")
+# Test TTS generation and playback
+print(f"\\nGenerating TTS test from {piper_url}...")
+test_text = "This is a speaker test. You should hear this at the configured volume with output gain applied."
+
+try:
+    # Generate TTS audio from Piper
+    req = urllib.request.Request(
+        f"{piper_url}/tts",
+        data=json.dumps({
+            "text": test_text,
+            "voice_id": piper_voice_id
+        }).encode('utf-8'),
+        headers={'Content-Type': 'application/json'}
+    )
+    
+    with urllib.request.urlopen(req, timeout=10) as response:
+        if response.status != 200:
+            print(f"TTS generation failed: HTTP {response.status}")
+        else:
+            # Read PCM audio from response
+            pcm_data = response.read()
+            
+            # Convert bytes to numpy array (16-bit PCM)
+            audio_int16 = np.frombuffer(pcm_data, dtype=np.int16)
+            
+            # Convert to float32 [-1.0, 1.0]
+            audio_float = audio_int16.astype(np.float32) / 32768.0
+            
+            # Apply output gain (same as orchestrator does)
+            audio_float = (audio_float * output_gain).astype(np.float32)
+            audio_float = np.clip(audio_float, -1.0, 1.0)
+            
+            print(f"Playing TTS audio ({len(audio_float)} samples, {len(audio_float)/sample_rate:.2f}s) with {output_gain:.2f}x gain...")
+            sd.play(audio_float, samplerate=sample_rate, device=device)
+            sd.wait()
+            
+            print("\\n✓ TTS test complete!")
+
+except urllib.error.URLError as e:
+    print(f"Could not connect to Piper at {piper_url}: {e}")
+    print("Skipping TTS test. Make sure Piper is running.")
+except Exception as e:
+    print(f"TTS test failed: {e}")
+    print("Skipping TTS test.")
+
+print("\\nDone. If you heard tones + sweep + TTS, output device is working correctly.")
+print(f"TTS volume matches what you'll hear from the orchestrator (gain: {output_gain:.2f}x).")
 PY

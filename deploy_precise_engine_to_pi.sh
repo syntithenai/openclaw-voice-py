@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # Deploy a precise-engine tarball to Raspberry Pi and install into orchestrator venv.
-# Usage: ./deploy_precise_engine_to_pi.sh <ssh-target> <path-to-precise-engine.tar.gz>
+# Usage: ./deploy_precise_engine_to_pi.sh [ssh-target] [path-to-precise-engine.tar.gz]
 
 set -euo pipefail
 
-if [ "$#" -ne 2 ]; then
-  echo "Usage: $0 <ssh-target> <path-to-precise-engine.tar.gz>"
-  echo "Example: $0 pi ./artifacts/precise-engine-armv7/precise-engine.tar.gz"
-  exit 1
-fi
+# Default to Pi at 10.1.1.210 and standard artifact path
+SSH_TARGET="${1:-stever@10.1.1.210}"
+TAR_PATH="${2:-./artifacts/precise-engine-armv7/precise-engine.tar.gz}"
 
-SSH_TARGET="$1"
-TAR_PATH="$2"
+if [ "$#" -eq 0 ]; then
+  echo "Using default SSH target: $SSH_TARGET"
+  echo "Using default tarball: $TAR_PATH"
+fi
 
 if [ ! -f "$TAR_PATH" ]; then
   echo "ERROR: tarball not found: $TAR_PATH"
@@ -21,39 +21,30 @@ fi
 echo "[1/4] Uploading tarball to $SSH_TARGET..."
 scp "$TAR_PATH" "$SSH_TARGET:~/openclaw-voice/precise-engine.tar.gz"
 
-echo "[2/4] Extracting runtime bundle and installing launcher..."
+echo "[2/4] Extracting runtime bundle and creating symlink..."
 ssh "$SSH_TARGET" << 'DEPLOY_CMD'
 set -euo pipefail
 cd ~/openclaw-voice
 VENV_BIN="$PWD/.venv_orchestrator/bin"
-rm -rf /tmp/precise-engine-install
-mkdir -p /tmp/precise-engine-install
-tar -xzf precise-engine.tar.gz -C /tmp/precise-engine-install
-BUNDLE_DIR=$(find /tmp/precise-engine-install -type d -name precise-engine | head -n1)
-if [ -z "$BUNDLE_DIR" ]; then echo "ERROR: precise-engine bundle not found"; exit 1; fi
-rm -rf "$VENV_BIN/precise-engine.dist"
-cp -a "$BUNDLE_DIR" "$VENV_BIN/precise-engine.dist"
 
-if [ ! -x "$VENV_BIN/precise-engine.dist/precise-engine" ]; then
-  echo "ERROR: precise-engine binary missing from installed bundle"
-  ls -la "$VENV_BIN/precise-engine.dist" || true
+# Extract to ~/openclaw-voice/precise-engine
+rm -rf precise-engine
+tar -xzf precise-engine.tar.gz
+
+if [ ! -x "precise-engine/precise-engine" ]; then
+  echo "ERROR: precise-engine binary missing from bundle"
+  ls -la precise-engine/ || true
   exit 1
 fi
 
-# Create launcher script
-cat > "$VENV_BIN/precise-engine" << 'LAUNCHER'
-#!/usr/bin/env bash
-set -euo pipefail
-DIR="$(cd "$(dirname "$0")" && pwd)"
-BUNDLE="$DIR/precise-engine.dist"
-export LD_LIBRARY_PATH="$BUNDLE:${LD_LIBRARY_PATH:-}"
-export PYTHONPATH="$BUNDLE:/usr/lib/python3.11:${PYTHONPATH:-}"
-exec "$BUNDLE/precise-engine" "$@"
-LAUNCHER
+# Remove old symlink/directory if it exists
+rm -rf "$VENV_BIN/precise-engine"
 
-chmod +x "$VENV_BIN/precise-engine"
-echo "Installed bundle at $VENV_BIN/precise-engine.dist"
-echo "Installed launcher at $VENV_BIN/precise-engine"
+# Create symlink to the executable
+ln -s "$PWD/precise-engine/precise-engine" "$VENV_BIN/precise-engine"
+
+echo "Installed bundle at $PWD/precise-engine"
+echo "Created symlink at $VENV_BIN/precise-engine"
 DEPLOY_CMD
 
 echo "[2b/5] Applying platform wakeword defaults and ensuring resources..."
@@ -65,94 +56,33 @@ ARCH=$(uname -m)
 if [[ "$ARCH" == "armv7l" || "$ARCH" == "armv6l" ]]; then
   # ARMv7 default: Precise + hey-mycroft model file
   if [ ! -f .env ]; then
-    touch .env
-  fi
-
-  python3 - << 'PY'
-from pathlib import Path
-
-env_path = Path('.env')
-lines = env_path.read_text(encoding='utf-8').splitlines()
-kv = {}
-order = []
-for line in lines:
-    if '=' in line and not line.strip().startswith('#'):
-        k, v = line.split('=', 1)
-        k = k.strip()
-        kv[k] = v
-        if k not in order:
-            order.append(k)
-
-defaults = {
-    'WAKE_WORD_ENABLED': 'true',
-    'WAKE_WORD_ENGINE': 'precise',
-    'WAKE_WORD_CONFIDENCE': '0.5',
-    'OPENWAKEWORD_MODEL_PATH': 'docker/wakeword-models/hey-mycroft.pb',
-}
-
-for k, v in defaults.items():
-    if k not in kv:
-        order.append(k)
-    kv[k] = v
-
-out = []
-for k in order:
-    out.append(f"{k}={kv[k]}")
-env_path.write_text("\n".join(out) + "\n", encoding='utf-8')
-print('Updated .env wakeword defaults for ARMv7')
-PY
-
-  bash ./ensure_wakeword_resources.sh all || true
-else
-  # ARM64/Raspbian64 default: OpenWakeWord + hey_mycroft
-  if [ ! -f .env ]; then
-    touch .env
-  fi
-  python3 - << 'PY'
-from pathlib import Path
-
-env_path = Path('.env')
-lines = env_path.read_text(encoding='utf-8').splitlines()
-kv = {}
-order = []
-for line in lines:
-    if '=' in line and not line.strip().startswith('#'):
-        k, v = line.split('=', 1)
-        k = k.strip()
-        kv[k] = v
-        if k not in order:
-            order.append(k)
-
-defaults = {
-    'WAKE_WORD_ENABLED': 'true',
-    'WAKE_WORD_ENGINE': 'openwakeword',
-    'WAKE_WORD_CONFIDENCE': '0.95',
-    'OPENWAKEWORD_MODEL_PATH': 'hey_mycroft',
-}
-
-for k, v in defaults.items():
-    if k not in kv:
-        order.append(k)
-    kv[k] = v
-
-out = []
-for k in order:
-    out.append(f"{k}={kv[k]}")
-env_path.write_text("\n".join(out) + "\n", encoding='utf-8')
-print('Updated .env wakeword defaults for ARM64')
-PY
-
-  bash ./ensure_wakeword_resources.sh all || true
-fi
-WAKE_DEFAULTS_CMD
-
-
-echo "[3/5] Verifying executable..."
-ssh "$SSH_TARGET" "set -e; cd ~/openclaw-voice; source .venv_orchestrator/bin/activate; precise-engine --version >/tmp/precise_version.txt 2>&1 || true; cat /tmp/precise_version.txt"
-
-echo "[4/5] Running precise-engine runtime smoke test (imports + model load)..."
-ssh "$SSH_TARGET" << 'SMOKE_CMD'
+    touch .enPreserving existing settings and ensuring resources..."
+ssh "$SSH_TARGET" << 'WAKE_DEFAULTS_CMD'
 set -euo pipefail
+cd ~/openclaw-voice
+
+# Use .env.pi if it exists, otherwise .env
+ENV_FILE=".env.pi"
+if [ ! -f "$ENV_FILE" ]; then
+  ENV_FILE=".env"
+  if [ ! -f "$ENV_FILE" ]; then
+    echo "No .env or .env.pi found. Settings will be preserved from existing config."
+  fi
+fi
+
+# Only set defaults if no existing wake word config
+if [ -f "$ENV_FILE" ]; then
+  if grep -q "PRECISE_ENABLED=true" "$ENV_FILE" 2>/dev/null; then
+    echo "Using existing Precise configuration from $ENV_FILE"
+  else
+    echo "No Precise config found, will use defaults"
+  fi
+else
+  echo "No env file found - settings will be initialized on first run"
+fi
+
+# Ensure wake word model files exist
+bash ./setup_wakeword.sh --non-interactive precise 2>/dev/null || truet -euo pipefail
 cd ~/openclaw-voice
 source .venv_orchestrator/bin/activate
 

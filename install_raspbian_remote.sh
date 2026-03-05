@@ -243,12 +243,7 @@ ssh "$PI_SSH_ALIAS" "cd ~/openclaw-voice && cat > .env << 'ENVEOF'
 AUDIO_SAMPLE_RATE=16000
 AUDIO_PLAYBACK_SAMPLE_RATE=48000
 AUDIO_FRAME_MS=20
-AUDIO_CAPTURE_DEVICE=$USB_MIC
-AUDIO_PLAYBACK_DEVICE=$USB_SPEAKER
-AUDIO_BACKEND=portaudio
-
-# ==============================================================================
-# VOICE ACTIVITY DETECTION (VAD)
+AUDIO_OUTPUT_GAIN=2.0
 # ==============================================================================
 VAD_TYPE=webrtc
 VAD_CONFIDENCE=0.6

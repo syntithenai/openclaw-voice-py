@@ -2,6 +2,7 @@
 docker/whisper-models/
 docker/piper-data/
 docker/emotion-models/
+.venv_orchestrator/
 .venv311/
 
 # Python cache files

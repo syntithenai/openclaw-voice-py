@@ -19,6 +19,7 @@ import io
 import json
 import logging
 import math
+import platform
 import re
 import threading
 import time
@@ -199,29 +200,41 @@ def extract_text_from_gateway_message(message: str) -> str:
     try:
         payload = json.loads(message)
     except json.JSONDecodeError:
-        return message.strip()
+        # Preserve leading spaces from streaming deltas (word boundaries), drop trailing noise.
+        return message.rstrip()
 
     # If JSON parsed to a primitive (string, number, bool), return it as string
     if isinstance(payload, (str, int, float, bool)):
+        if isinstance(payload, str):
+            return payload.rstrip()
         return str(payload).strip()
     
     # Handle dict payloads
     if isinstance(payload, dict):
         if "text" in payload:
-            return str(payload["text"]).strip()
+            value = payload["text"]
+            if isinstance(value, str):
+                return value.rstrip()
+            return str(value).strip()
         if "content" in payload:
             content = payload["content"]
             if isinstance(content, str):
-                return content.strip()
+                return content.rstrip()
             if isinstance(content, list):
                 parts = []
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "text":
-                        parts.append(str(block.get("text", "")).strip())
+                        part = block.get("text", "")
+                        if isinstance(part, str):
+                            parts.append(part.rstrip())
+                        else:
+                            parts.append(str(part).strip())
                 return "\n".join([p for p in parts if p])
         if "data" in payload and isinstance(payload["data"], dict):
             text = payload["data"].get("text")
             if text:
+                if isinstance(text, str):
+                    return text.rstrip()
                 return str(text).strip()
     return ""
 
@@ -440,6 +453,13 @@ def validate_runtime_config(config: VoiceConfig) -> None:
         )
     else:
         logger.info("  ✓ Audio input gain: %.2fx", config.audio_input_gain)
+
+    if not (0.1 <= config.audio_output_gain <= 5.0):
+        errors.append(
+            f"AUDIO_OUTPUT_GAIN={config.audio_output_gain} out of range (must be 0.1-5.0)"
+        )
+    else:
+        logger.info("  ✓ Audio output gain: %.2fx", config.audio_output_gain)
     
     # TTS speed
     if not (0.5 <= config.piper_speed <= 5.0):
@@ -472,8 +492,27 @@ def validate_runtime_config(config: VoiceConfig) -> None:
     logger.info("✓ All runtime configuration checks passed!")
 
 
+def is_raspberry_pi() -> bool:
+    """Best-effort Raspberry Pi detection for Pi-specific audio workarounds."""
+    try:
+        model_path = Path("/proc/device-tree/model")
+        if model_path.exists():
+            model = model_path.read_text(encoding="utf-8", errors="ignore").lower()
+            if "raspberry pi" in model:
+                return True
+    except Exception:
+        pass
+    machine = platform.machine().lower()
+    return machine.startswith("arm") or machine.startswith("aarch64")
+
+
 async def run_orchestrator() -> None:
     config = VoiceConfig()
+    
+    # Smart defaults: enable ring buffer clearing on ARM systems to prevent ghost transcripts
+    if is_raspberry_pi() and config.wake_clear_ring_buffer is False:
+        config.wake_clear_ring_buffer = True
+        logger.info("Auto-enabling wake_clear_ring_buffer on ARM architecture")
     
     # Print immediately so user sees something
     print("\n" + "="*51, flush=True)
@@ -564,7 +603,8 @@ async def run_orchestrator() -> None:
     cut_in_triggered_ts: float | None = None
     active_transcriptions = 0
     tts_playing = False
-    tts_gain = 1.0
+    tts_base_gain = config.audio_output_gain
+    tts_gain = tts_base_gain
     last_playback_frame: bytes | None = None
     last_tts_text = ""
     last_tts_ts = 0.0
@@ -574,7 +614,7 @@ async def run_orchestrator() -> None:
     warned_wake_resample = False
     warned_aec_stub = False
     wake_sleep_ts: float | None = None
-    wake_sleep_cooldown_ms = 1000
+    wake_sleep_cooldown_ms = max(0, config.wake_sleep_cooldown_ms)
     last_wake_detected_ts: float | None = None
     last_wake_conf_log_ts = 0.0
 
@@ -690,7 +730,22 @@ async def run_orchestrator() -> None:
     logger.info("✓ Piper client ready in %dms", piper_elapsed)
     print(f"✓ Piper client ready in {piper_elapsed}ms", flush=True)
     if config.audio_backend != "portaudio-duplex":
-        playback = AudioPlayback(sample_rate=config.audio_sample_rate, device=config.audio_playback_device)
+        playback_rate = config.audio_playback_sample_rate if config.audio_playback_sample_rate > 0 else config.audio_sample_rate
+        pi_keepalive = bool(config.audio_playback_keepalive_enabled and is_raspberry_pi())
+        if config.audio_playback_keepalive_enabled and not pi_keepalive:
+            logger.info("Playback keepalive requested but disabled (non-Pi system)")
+        elif pi_keepalive:
+            logger.info(
+                "Playback keepalive enabled for Pi (interval=%dms)",
+                config.audio_playback_keepalive_interval_ms,
+            )
+        playback = AudioPlayback(
+            sample_rate=playback_rate,
+            device=config.audio_playback_device,
+            lead_in_ms=config.audio_playback_lead_in_ms,
+            keepalive_enabled=pi_keepalive,
+            keepalive_interval_ms=config.audio_playback_keepalive_interval_ms,
+        )
     
     # Generate audio feedback sounds
     logger.info("→ Generating audio feedback sounds...")
@@ -994,10 +1049,12 @@ async def run_orchestrator() -> None:
                     tts_playback_start_ts = time.monotonic()
                     play_start = time.monotonic()
                     pcm, wav_rate = wav_bytes_to_pcm_with_rate(wav_bytes)
-                    if wav_rate != config.audio_sample_rate:
-                        pcm = resample_pcm(pcm, wav_rate, config.audio_sample_rate)
+                    # Resample to playback rate (which may differ from capture rate for USB devices)
+                    target_rate = playback.sample_rate
+                    if wav_rate != target_rate:
+                        pcm = resample_pcm(pcm, wav_rate, target_rate)
                     sample_count = len(pcm) / 2.0
-                    current_tts_duration_s = sample_count / float(config.audio_sample_rate) if sample_count > 0 else 0.0
+                    current_tts_duration_s = sample_count / float(target_rate) if sample_count > 0 else 0.0
                     tts_stop_event.clear()
                     await asyncio.to_thread(playback.play_pcm, pcm, tts_gain, tts_stop_event)
                     play_elapsed = int((time.monotonic() - play_start) * 1000)
@@ -1022,7 +1079,7 @@ async def run_orchestrator() -> None:
                     logger.error("Piper TTS failed: %s", exc)
             finally:
                 tts_playing = False
-                tts_gain = 1.0
+                tts_gain = tts_base_gain
                 current_tts_text = ""
                 current_tts_duration_s = 0.0
 
@@ -1035,6 +1092,25 @@ async def run_orchestrator() -> None:
         kickoff_sent_request_id = 0
         reconnect_delay_s = 1.0
         reconnect_delay_max_s = 8.0
+
+        def should_emit_fast_start_chunk(text: str) -> bool:
+            """Avoid early TTS kickoff at awkward clause boundaries (e.g., ending with 'so')."""
+            s = text.strip()
+            if not s:
+                return False
+            if s[-1] in ".!?":
+                return True
+            # Avoid kickoff on connector words that usually imply continuation.
+            tokens = re.findall(r"[A-Za-z']+", s.lower())
+            if not tokens:
+                return False
+            trailing_connectors = {
+                "and", "or", "but", "so", "because", "if", "then", "than", "though", "although",
+                "however", "therefore", "thus", "while", "when", "where", "which", "that", "who",
+                "whom", "whose", "to", "of", "in", "on", "at", "for", "with", "from", "by",
+                "a", "an", "the",
+            }
+            return tokens[-1] not in trailing_connectors
 
         def split_first_n_words(text: str, n: int) -> tuple[str, str]:
             """Split text into first n tokens and remainder, preserving punctuation in tokens."""
@@ -1084,26 +1160,36 @@ async def run_orchestrator() -> None:
                     # Smart concatenation: determine if space is needed
                     needs_space = False
                     if buffer:
-                        last_char = buffer[-1]
-                        first_char = text[0]
-                        
-                        # No space before punctuation or closing brackets
-                        if first_char in ",.!?;:)]}":
-                            needs_space = False
-                        # No space for ordinal suffix after digit (1st, 2nd, etc.)
-                        elif last_char.isdigit() and len(text) >= 2 and text[:2] in ["st", "nd", "rd", "th"]:
-                            needs_space = False
-                        # No space between consecutive digits (for numbers like 2026)
-                        elif last_char.isdigit() and first_char.isdigit():
-                            needs_space = False
-                        # No space after opening brackets
-                        elif last_char in "([{":
-                            needs_space = False
-                        # No space before/after colons in times (1:28)
-                        elif last_char == ":" or first_char == ":":
+                        # Respect explicit leading whitespace from streamed deltas.
+                        if text[0].isspace():
                             needs_space = False
                         else:
-                            needs_space = True
+                            last_char = buffer[-1]
+                            first_char = text[0]
+                        
+                            # No space before punctuation or closing brackets
+                            if first_char in ",.!?;:)]}":
+                                needs_space = False
+                            # No space for apostrophe-led contraction chunks (e.g., '’t', ''s')
+                            elif first_char in "'’":
+                                needs_space = False
+                            # No space for ordinal suffix after digit (1st, 2nd, etc.)
+                            elif last_char.isdigit() and len(text) >= 2 and text[:2] in ["st", "nd", "rd", "th"]:
+                                needs_space = False
+                            # No space between consecutive digits (for numbers like 2026)
+                            elif last_char.isdigit() and first_char.isdigit():
+                                needs_space = False
+                            # No space after opening brackets
+                            elif last_char in "([{":
+                                needs_space = False
+                            # No space before/after colons in times (1:28)
+                            elif last_char == ":" or first_char == ":":
+                                needs_space = False
+                            # No space for same-word token continuation (e.g., 'Austr' + 'ia').
+                            elif last_char.isalpha() and first_char.isalpha() and not text[0].isspace():
+                                needs_space = False
+                            else:
+                                needs_space = True
                     
                     buffer += (" " if needs_space else "") + text
                     logger.info("📝 Buffer: '%s'", buffer[:100])
@@ -1111,7 +1197,7 @@ async def run_orchestrator() -> None:
                     # Fast-start policy: emit first chunk once threshold words are available for this request.
                     if first_chunk_word_threshold > 0 and kickoff_sent_request_id != current_request_id:
                         kickoff_text, remainder = split_first_n_words(buffer, first_chunk_word_threshold)
-                        if kickoff_text:
+                        if kickoff_text and should_emit_fast_start_chunk(kickoff_text):
                             buffer = remainder
                             kickoff_sent_request_id = current_request_id
                             logger.info("🚀 Fast-start chunk [req#%d]: '%s'", current_request_id, kickoff_text)
@@ -1335,20 +1421,38 @@ async def run_orchestrator() -> None:
                             logger.info("Audio detected but no spike: conf=%.4f, frame_rms=%.6f", wake_result.confidence, frame_rms)
 
                         if wake_result.detected:
+                            # Guard against false detections on silence right after timeout/sleep.
+                            if frame_rms < config.wake_min_detect_rms:
+                                logger.info(
+                                    "Ignoring wake detection on low RMS frame (conf=%.4f, rms=%.6f < %.6f)",
+                                    wake_result.confidence,
+                                    frame_rms,
+                                    config.wake_min_detect_rms,
+                                )
+                                if wake_detector and hasattr(wake_detector, 'reset_state'):
+                                    wake_detector.reset_state()
+                                await asyncio.sleep(0)
+                                continue
                             wake_state = WakeState.AWAKE
                             wake_sleep_ts = None
                             last_wake_detected_ts = now
                             last_activity_ts = now
                             state = VoiceState.LISTENING
                             chunk_start_ts = now
-                            # Reduced prebuffer from 200ms to 80ms to avoid capturing the hotword itself being spoken
-                            wake_pre_roll_ms = min(80, config.pre_roll_ms)
-                            wake_pre_roll_frames = max(0, int(wake_pre_roll_ms / config.audio_frame_ms))
-                            prebuffer = ring_buffer.get_frames()
-                            if wake_pre_roll_frames > 0 and len(prebuffer) > wake_pre_roll_frames:
-                                prebuffer = prebuffer[-wake_pre_roll_frames:]
-                            chunk_frames = prebuffer
-                            chunk_frames.append(frame)
+                            # Clear ring buffer if configured to avoid stale pre-wake audio (prevents ghost transcripts)
+                            # Recommended for ARM systems where ring buffer latency is high
+                            if config.wake_clear_ring_buffer:
+                                ring_buffer.clear()
+                                chunk_frames = [frame]
+                            else:
+                                # Reduced prebuffer from 200ms to 80ms to avoid capturing the hotword itself being spoken
+                                wake_pre_roll_ms = min(80, config.pre_roll_ms)
+                                wake_pre_roll_frames = max(0, int(wake_pre_roll_ms / config.audio_frame_ms))
+                                prebuffer = ring_buffer.get_frames()
+                                if wake_pre_roll_frames > 0 and len(prebuffer) > wake_pre_roll_frames:
+                                    prebuffer = prebuffer[-wake_pre_roll_frames:]
+                                chunk_frames = prebuffer
+                                chunk_frames.append(frame)
                             last_speech_ts = now
                             logger.info("Wake word detected → awake")
                             # Play wake word click sound - DISABLED to prevent feedback loop
@@ -1518,8 +1622,8 @@ async def run_orchestrator() -> None:
                     tts_stop_event.set()
             if tts_playing and last_speech_ts:
                 silence_ms = int(((now - last_speech_ts) * 1000))
-                if silence_ms >= config.vad_min_silence_ms and tts_gain != 1.0:
-                    tts_gain = 1.0
+                if silence_ms >= config.vad_min_silence_ms and tts_gain != tts_base_gain:
+                    tts_gain = tts_base_gain
                     logger.info("Mic speech ended → restoring TTS volume")
 
             if chunk_frames and chunk_start_ts is not None:

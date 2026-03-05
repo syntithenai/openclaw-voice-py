@@ -55,12 +55,13 @@ class MycoftPreciseDetector(WakeWordBase):
             # Find the precise-engine binary
             engine_exe = shutil.which('precise-engine')
             if not engine_exe:
-                # Try in the same venv
-                venv_bin = os.path.join(os.path.dirname(os.path.dirname(__file__)), '..', '..', '.venv_orchestrator', 'bin', 'precise-engine')
+                # Try in the venv - orchestrator/wakeword/precise.py -> orchestrator -> project root
+                project_root = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+                venv_bin = os.path.join(project_root, '.venv_orchestrator', 'bin', 'precise-engine')
                 if os.path.exists(venv_bin):
                     engine_exe = venv_bin
                 else:
-                    logger.error("precise-engine binary not found in PATH or venv")
+                    logger.error("precise-engine binary not found in PATH or venv (tried: %s)", venv_bin)
                     return
 
             self._engine = PreciseEngine(engine_exe, model_path, chunk_size=self._chunk_size_bytes)

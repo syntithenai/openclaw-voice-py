@@ -1,5 +1,9 @@
 # Optional dependencies for emotion detection, wake word detection, PyTorch, and improved VAD
 
+# Wake word detection with Precise (Mycroft)
+# Required for ARMv7 (Raspberry Pi 32-bit) wake word detection
+precise-runner
+
 # Wake word detection with OpenWakeWord
 # Requires onnxruntime which is not available for Python 3.11 on ARMv7 (Raspberry Pi 32-bit)
 # Only tested on x86_64 systems

@@ -85,14 +85,13 @@ case "$engine_choice" in
         MODEL_PATH="docker/wakeword-models/${MODEL_NAME}"
         
         # Try to download model, but don't fail if it can't
-        if [ ! -f "$MODEL_PATH" ]; then
+        if [ ! -s "$MODEL_PATH" ]; then
             echo "Attempting to download $MODEL_NAME..."
             
             # Try multiple sources
             MODEL_URLS=(
-                "https://github.com/MycroftAI/precise-data/raw/models/${MODEL_NAME}"
                 "https://raw.githubusercontent.com/MycroftAI/precise-data/models/${MODEL_NAME}"
-                "https://github.com/MycroftAI/precise-data/raw/master/models/${MODEL_NAME}"
+                "https://raw.githubusercontent.com/MycroftAI/precise-data/master/models/${MODEL_NAME}"
             )
             
             DOWNLOAD_SUCCESS=0
@@ -103,9 +102,10 @@ case "$engine_choice" in
                 fi
             done
             
-            if [ $DOWNLOAD_SUCCESS -eq 1 ]; then
+            if [ $DOWNLOAD_SUCCESS -eq 1 ] && [ -s "$MODEL_PATH" ]; then
                 echo -e "${GREEN}✓ Model downloaded to $MODEL_PATH${NC}"
             else
+                rm -f "$MODEL_PATH"
                 echo -e "${YELLOW}⚠ Could not auto-download model. Model file must be provided manually.${NC}"
                 echo ""
                 echo "To get a model:"
