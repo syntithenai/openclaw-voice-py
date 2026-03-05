@@ -506,6 +506,144 @@ def is_raspberry_pi() -> bool:
     return machine.startswith("arm") or machine.startswith("aarch64")
 
 
+def _resolve_device_index(device: int | str | None, want_input: bool) -> int | None:
+    """Resolve configured device value to a PortAudio device index.
+
+    Returns None for "default" or if not resolvable.
+    """
+    if device is None:
+        return None
+
+    dev_str = str(device).strip()
+    if not dev_str or dev_str.lower() == "default":
+        return None
+
+    try:
+        import sounddevice as sd
+
+        devices = sd.query_devices()
+        channel_key = "max_input_channels" if want_input else "max_output_channels"
+
+        # Numeric index
+        if dev_str.isdigit():
+            idx = int(dev_str)
+            if 0 <= idx < len(devices) and int(devices[idx].get(channel_key, 0) or 0) > 0:
+                return idx
+            return None
+
+        # ALSA style hw:X,Y / plughw:X,Y
+        if dev_str.startswith(("hw:", "plughw:")):
+            hw = dev_str.split(":", 1)[1]
+            card = hw.split(",", 1)[0]
+            match = next(
+                (
+                    i
+                    for i, d in enumerate(devices)
+                    if (
+                        f"(hw:{hw})" in d.get("name", "")
+                        or f"(hw:{card}," in d.get("name", "")
+                    )
+                    and int(d.get(channel_key, 0) or 0) > 0
+                ),
+                None,
+            )
+            return match
+
+        # Fuzzy name match
+        needle = dev_str.lower()
+        match = next(
+            (
+                i
+                for i, d in enumerate(devices)
+                if needle in str(d.get("name", "")).lower()
+                and int(d.get(channel_key, 0) or 0) > 0
+            ),
+            None,
+        )
+        return match
+    except Exception:
+        return None
+
+
+def _rank_device_priority(name: str, hostapi_name: str) -> int:
+    txt = f"{name} {hostapi_name}".lower()
+    if "pipewire" in txt:
+        return 0
+    if "pulseaudio" in txt or "pulse" in txt:
+        return 1
+    if "usb" in txt:
+        return 2
+    return 3
+
+
+def _auto_select_audio_device(want_input: bool) -> int | None:
+    """Select best available device using configure_audio_devices-style priorities.
+
+    Priority: PipeWire -> PulseAudio -> USB -> first available.
+    """
+    try:
+        import sounddevice as sd
+
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+        channel_key = "max_input_channels" if want_input else "max_output_channels"
+
+        candidates: list[tuple[int, int]] = []
+        for i, dev in enumerate(devices):
+            if int(dev.get(channel_key, 0) or 0) <= 0:
+                continue
+            hostapi_idx = int(dev.get("hostapi", -1) or -1)
+            hostapi_name = ""
+            if 0 <= hostapi_idx < len(hostapis):
+                hostapi_name = str(hostapis[hostapi_idx].get("name", ""))
+            rank = _rank_device_priority(str(dev.get("name", "")), hostapi_name)
+            candidates.append((rank, i))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        return candidates[0][1]
+    except Exception:
+        return None
+
+
+def _pick_working_playback_rate(device_idx: int | None, desired_rate: int) -> int:
+    """Pick a working playback sample rate for device.
+
+    Tries desired first, then common rates (highest preferred), then device default.
+    """
+    try:
+        import sounddevice as sd
+
+        rates_desc = [192000, 176400, 96000, 88200, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000]
+        ordered = [desired_rate] + [r for r in rates_desc if r != desired_rate]
+        for rate in ordered:
+            try:
+                sd.check_output_settings(device=device_idx, samplerate=rate, channels=1)
+                return int(rate)
+            except Exception:
+                continue
+
+        info = sd.query_devices(device_idx, "output")
+        fallback = int(round(float(info.get("default_samplerate", desired_rate) or desired_rate)))
+        return fallback
+    except Exception:
+        return int(desired_rate)
+
+
+def _describe_device(device_idx: int | None) -> str:
+    if device_idx is None:
+        return "default"
+    try:
+        import sounddevice as sd
+
+        dev = sd.query_devices(device_idx)
+        return f"#{device_idx} {dev.get('name', 'unknown')}"
+    except Exception:
+        return str(device_idx)
+
+
 async def run_orchestrator() -> None:
     config = VoiceConfig()
     
@@ -548,13 +686,78 @@ async def run_orchestrator() -> None:
         playback = duplex
         logger.info("Audio duplex initialized (input=%s, output=%s, gain=%.1fx)", config.audio_capture_device, config.audio_playback_device, config.audio_input_gain)
     else:
+        # Runtime audio selection policy:
+        # 1) Try configured .env devices first
+        # 2) On fatal init/start errors, auto-select based on available hardware
+        # 3) Do NOT modify .env (next restart retries configured values first)
+        selected_capture_device: int | str = config.audio_capture_device
+        selected_playback_device: int | str = config.audio_playback_device
+        selected_playback_rate = config.audio_playback_sample_rate if config.audio_playback_sample_rate > 0 else config.audio_sample_rate
+
+        try:
+            cap_idx = _resolve_device_index(config.audio_capture_device, want_input=True)
+            pb_idx = _resolve_device_index(config.audio_playback_device, want_input=False)
+
+            # Validate configured capture device by opening check settings.
+            import sounddevice as sd
+
+            cap_ok = False
+            cap_err = None
+            for ch in (1, 2):
+                try:
+                    sd.check_input_settings(device=cap_idx, samplerate=config.audio_sample_rate, channels=ch)
+                    cap_ok = True
+                    break
+                except Exception as exc:
+                    cap_err = exc
+
+            if not cap_ok:
+                raise RuntimeError(f"Configured capture device failed validation ({config.audio_capture_device}): {cap_err}")
+
+            # Validate configured playback device/rate.
+            selected_playback_rate = _pick_working_playback_rate(pb_idx, selected_playback_rate)
+            sd.check_output_settings(device=pb_idx, samplerate=selected_playback_rate, channels=1)
+
+            # Keep configured values for this run.
+            selected_capture_device = config.audio_capture_device
+            selected_playback_device = config.audio_playback_device
+            logger.info(
+                "Audio device validation passed using configured devices (capture=%s, playback=%s, rate=%s)",
+                _describe_device(cap_idx),
+                _describe_device(pb_idx),
+                selected_playback_rate,
+            )
+        except Exception as audio_exc:
+            logger.error("Configured audio initialization failed: %s", audio_exc)
+            logger.warning("Attempting automatic audio device selection (without changing .env)")
+
+            auto_cap_idx = _auto_select_audio_device(want_input=True)
+            auto_pb_idx = _auto_select_audio_device(want_input=False)
+
+            if auto_cap_idx is None or auto_pb_idx is None:
+                raise RuntimeError(
+                    "No compatible audio devices found for automatic fallback; please reconnect audio hardware"
+                ) from audio_exc
+
+            selected_capture_device = auto_cap_idx
+            selected_playback_device = auto_pb_idx
+            selected_playback_rate = _pick_working_playback_rate(auto_pb_idx, selected_playback_rate)
+
+            logger.warning(
+                "Using auto-selected audio devices for this run: capture=%s playback=%s rate=%s Hz",
+                _describe_device(auto_cap_idx),
+                _describe_device(auto_pb_idx),
+                selected_playback_rate,
+            )
+            logger.warning(".env remains unchanged; next restart will retry configured devices first")
+
         capture = AudioCapture(
             sample_rate=config.audio_sample_rate,
             frame_samples=frame_samples,
-            device=config.audio_capture_device,
+            device=selected_capture_device,
             input_gain=config.audio_input_gain,
         )
-        logger.info("Audio capture initialized on device: %s (gain=%.1fx)", config.audio_capture_device, config.audio_input_gain)
+        logger.info("Audio capture initialized on device: %s (gain=%.1fx)", selected_capture_device, config.audio_input_gain)
 
     # VAD initialization
     print("→ Loading VAD model...", flush=True)
@@ -730,7 +933,7 @@ async def run_orchestrator() -> None:
     logger.info("✓ Piper client ready in %dms", piper_elapsed)
     print(f"✓ Piper client ready in {piper_elapsed}ms", flush=True)
     if config.audio_backend != "portaudio-duplex":
-        playback_rate = config.audio_playback_sample_rate if config.audio_playback_sample_rate > 0 else config.audio_sample_rate
+        playback_rate = selected_playback_rate
         pi_keepalive = bool(config.audio_playback_keepalive_enabled and is_raspberry_pi())
         if config.audio_playback_keepalive_enabled and not pi_keepalive:
             logger.info("Playback keepalive requested but disabled (non-Pi system)")
@@ -741,7 +944,7 @@ async def run_orchestrator() -> None:
             )
         playback = AudioPlayback(
             sample_rate=playback_rate,
-            device=config.audio_playback_device,
+            device=selected_playback_device,
             lead_in_ms=config.audio_playback_lead_in_ms,
             keepalive_enabled=pi_keepalive,
             keepalive_interval_ms=config.audio_playback_keepalive_interval_ms,
@@ -1243,7 +1446,28 @@ async def run_orchestrator() -> None:
 
     print("🎤 Audio capture starting. Press Ctrl+C to stop.", flush=True)
     logger.info("🎤 Audio capture starting. Press Ctrl+C to stop.")
-    capture.start()
+    try:
+        capture.start()
+    except Exception as exc:
+        logger.error("Audio capture failed to start with selected device (%s): %s", getattr(capture, "device", "unknown"), exc)
+        if config.audio_backend != "portaudio-duplex":
+            auto_cap_idx = _auto_select_audio_device(want_input=True)
+            if auto_cap_idx is None:
+                raise
+            logger.warning(
+                "Retrying capture start with auto-selected input device %s (without changing .env)",
+                _describe_device(auto_cap_idx),
+            )
+            capture = AudioCapture(
+                sample_rate=config.audio_sample_rate,
+                frame_samples=frame_samples,
+                device=auto_cap_idx,
+                input_gain=config.audio_input_gain,
+            )
+            capture.start()
+            logger.warning("Capture recovery succeeded using auto-selected input device for this run")
+        else:
+            raise
     print("🎧 Listening for audio input...\n", flush=True)
     logger.info("🎧 Listening for audio input...")
     
