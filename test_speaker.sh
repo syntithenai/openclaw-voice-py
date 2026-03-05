@@ -180,11 +180,26 @@ try:
                 n_frames = wav_file.getnframes()
                 audio_data = wav_file.readframes(n_frames)
             
-            # Convert bytes to numpy array (16-bit PCM, assume mono)
+            # Convert bytes to numpy array (16-bit PCM)
             audio_int16 = np.frombuffer(audio_data, dtype=np.int16)
             
             # Convert to float32 [-1.0, 1.0]
             audio_float = audio_int16.astype(np.float32) / 32768.0
+            
+            # Resample if needed to match device playback rate
+            playback_rate = working_rate
+            if wav_sample_rate != playback_rate:
+                print(f"Resampling TTS from {wav_sample_rate} Hz to {playback_rate} Hz...")
+                # Simple linear interpolation resampling
+                ratio = playback_rate / wav_sample_rate
+                new_length = int(len(audio_float) * ratio)
+                resampled = np.interp(
+                    np.linspace(0, len(audio_float) - 1, new_length),
+                    np.arange(len(audio_float)),
+                    audio_float
+                )
+                audio_float = resampled.astype(np.float32)
+                wav_sample_rate = playback_rate
             
             # Apply output gain (same as orchestrator does)
             audio_float = (audio_float * output_gain).astype(np.float32)
