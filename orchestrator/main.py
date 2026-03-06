@@ -1183,6 +1183,11 @@ async def run_orchestrator() -> None:
                         # Update activity timestamp to keep system awake during TTS synthesis
                         last_activity_ts = time.monotonic()
                         await submit_tts(response_text, request_id=current_request_id)
+                    else:
+                        # Agent executed command without returning text (e.g., "play jazz")
+                        logger.info("← GATEWAY: No text response (agent executed action without speech response)")
+                        # Update activity timestamp but don't queue TTS
+                        last_activity_ts = time.monotonic()
                 except Exception as exc:
                     logger.warning("Gateway send failed (%s); continuing", exc)
         finally:
