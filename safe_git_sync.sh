@@ -85,6 +85,7 @@ if [[ "$MODE" == "hard" ]]; then
   git reset --hard "${REMOTE}/${BRANCH}"
   git clean -fd \
     -e .env \
+    -e .env.docker \
     -e .env.pi \
     -e .venv_orchestrator/ \
     -e .venv311/ \

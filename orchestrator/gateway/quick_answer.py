@@ -14,7 +14,6 @@ THINKING_PHRASES = [
     "thinking",
     "just a sec",
     "onto it",
-    "ok",
     "let me think",
     "one moment",
     "hmm",
@@ -27,6 +26,19 @@ THINKING_PHRASES = [
 def get_random_thinking_phrase() -> str:
     """Get a random thinking phrase for gateway escalation."""
     return random.choice(THINKING_PHRASES)
+
+    def sanitize_quick_answer_text(text: str) -> str:
+        """Normalize quick-answer text for speech-friendly playback.
+
+        The quick-answer path can emit markdown emphasis markers (e.g. *italic*, **bold**),
+        which are sometimes spoken literally by TTS engines. Strip those markers while
+        preserving the underlying words.
+        """
+        if not isinstance(text, str):
+            return ""
+
+        cleaned = text.replace("**", "").replace("*", "")
+        return re.sub(r"\s+", " ", cleaned).strip()
 
 
 QUICK_ANSWER_BASE_SYSTEM_PROMPT = """You are a strict validation gatekeeper. Your sole objective is to provide immediate answers only when they are factual, indisputable, and concise.
@@ -81,14 +93,46 @@ UPSTREAM_ONLY_PATTERNS = [
     r"\b(you never told me|earlier you said|last time|before that|what about that)\b",
 ]
 
+# Time-sensitive or web-lookup intents should go upstream so model/tool routing
+# can fetch fresh information and provide provenance.
+WEB_LOOKUP_PATTERNS = [
+    r"\b(find|search|look up|lookup|google|browse)\b.*\b(web ?page|website|site|url|link|source)\b",
+    r"\b(web ?page|website|site|url|link|source)\b",
+]
+
+TIME_SENSITIVE_PATTERNS = [
+    r"\b(current|currently|latest|today|now|this week|this month|this year|as of)\b",
+    r"\b(who is the president|president of the (u\.?s\.?|united states))\b",
+]
+
+# Action/task intents should go upstream so tools/agents can execute the request.
+ACTION_INTENT_PATTERNS = [
+    r"\b(add|append|put|include)\b.*\b(shopping list|grocery list|todo list|to-do list|list)\b",
+    r"\b(shopping|grocery)\b.*\b(add|buy|get|pick up)\b",
+    r"^\s*(also\s+)?add\b",
+    r"\b(remind me|set up|create|book|schedule|order|send|message|email|call)\b",
+]
+
 
 def should_force_upstream(user_query: str) -> bool:
-    """Return True for context-dependent or personal-data queries that must bypass quick answer."""
+    """Return True for queries that should bypass quick answer and go upstream."""
     query = user_query.strip().lower()
     if not query:
         return True
 
-    return any(re.search(pattern, query) for pattern in UPSTREAM_ONLY_PATTERNS)
+    if any(re.search(pattern, query) for pattern in UPSTREAM_ONLY_PATTERNS):
+        return True
+
+    if any(re.search(pattern, query) for pattern in WEB_LOOKUP_PATTERNS):
+        return True
+
+    if any(re.search(pattern, query) for pattern in TIME_SENSITIVE_PATTERNS):
+        return True
+
+    if any(re.search(pattern, query) for pattern in ACTION_INTENT_PATTERNS):
+        return True
+
+    return False
 
 
 TIMER_TOOL_DEFINITIONS = [
@@ -562,7 +606,7 @@ class QuickAnswerClient:
                 return True, ""
             
             logger.info("← QUICK ANSWER: Got response (%d chars): %s", len(content), content[:100])
-            return False, content
+            return False, sanitize_quick_answer_text(content)
             
         except httpx.TimeoutException:
             logger.warning("Quick answer LLM request timed out after %.1fs", self.timeout_s)
@@ -596,14 +640,14 @@ class QuickAnswerClient:
             music_result = await self.music_router.handle_request(user_query, use_fast_path=True)
             if music_result is not None:
                 logger.info("← QUICK ANSWER: Music fast-path execution: %s", music_result[:100])
-                return False, music_result
+                return False, sanitize_quick_answer_text(music_result)
         
         # Try timer/alarm fast-path
         if self.timers_enabled and self.tool_router:
             fast_path_result = await self.tool_router.try_deterministic_parse(user_query)
             if fast_path_result is not None:
                 logger.info("← QUICK ANSWER: Fast-path tool execution: %s", fast_path_result[:100])
-                return False, fast_path_result
+                return False, sanitize_quick_answer_text(fast_path_result)
         
         # If neither system is enabled, fall back to regular quick answer
         if not self.has_tool_capabilities():
@@ -686,7 +730,7 @@ class QuickAnswerClient:
                 
                 # Return the tool execution result(s)
                 final_result = " ".join(results) if results else "Tool execution completed"
-                return False, final_result
+                return False, sanitize_quick_answer_text(final_result)
             
             # No tool calls, check for regular content response
             content = message.get("content", "").strip()
@@ -701,7 +745,7 @@ class QuickAnswerClient:
                 return True, ""
             
             logger.info("← QUICK ANSWER: Got response (%d chars): %s", len(content), content[:100])
-            return False, content
+            return False, sanitize_quick_answer_text(content)
             
         except httpx.TimeoutException:
             logger.warning("Quick answer LLM request timed out after %.1fs", self.timeout_s)

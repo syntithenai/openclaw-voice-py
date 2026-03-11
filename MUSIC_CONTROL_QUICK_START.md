@@ -230,4 +230,6 @@ test_music_system.py      # Test suite
 
 - [MPD Protocol Reference](https://mpd.readthedocs.io/en/latest/protocol.html)
 - [MUSIC_CONTROL_PLAN.md](MUSIC_CONTROL_PLAN.md) - Full implementation plan
-- [.env.comprehensive](.env.comprehensive) - All configuration options
+- [.env.example](.env.example) - All configuration options (baseline)
+- [.env.docker.example](.env.docker.example) - Docker profile template
+- [.env.pi.example](.env.pi.example) - Raspberry Pi profile template

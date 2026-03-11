@@ -8,7 +8,7 @@ x-orchestrator-common: &orchestrator-common
     - piper
     - mpd
   env_file:
-    - .env
+    - .env.docker
   environment:
     - PYTHONUNBUFFERED=1
     # Internal service DNS for compose network
@@ -31,6 +31,8 @@ x-orchestrator-common: &orchestrator-common
     - ./docker/whisper-models:/app/docker/whisper-models
     - ./docker/piper-data:/app/docker/piper-data
     - ./.env:/app/.env:ro
+    - ./.env.docker:/app/.env.docker:ro
+    - ./.env.pi:/app/.env.pi:ro
     # Persist OpenClaw device identity for websocket auth signatures
     - ${HOME}/.openclaw:/root/.openclaw
     # Music library for MPD skill
@@ -138,6 +140,8 @@ services:
       - ./docker/whisper-models:/app/docker/whisper-models
       - ./docker/piper-data:/app/docker/piper-data
       - ./.env:/app/.env:ro
+      - ./.env.docker:/app/.env.docker:ro
+      - ./.env.pi:/app/.env.pi:ro
       - ${HOME}/.openclaw:/root/.openclaw
       - ${XDG_RUNTIME_DIR}/pulse/native:/tmp/pulse/native
       - ${HOME}/.config/pulse/cookie:/root/.config/pulse/cookie:ro

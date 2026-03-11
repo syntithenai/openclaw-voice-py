@@ -1,4 +1,8 @@
 .env
+.env.*
+!.env.example
+!.env.docker.example
+!.env.pi.example
 docker/whisper-models/
 docker/piper-data/
 docker/emotion-models/
@@ -23,3 +27,4 @@ build_with_wrapt.log
 artifacts/prebuilt-test/precise-engine_0.3.0_armv7l.tar.gz
 artifacts/precise-engine-armv7/precise-engine.tar.gz
 artifacts/precise-engine-armv7/precise-engine.tar.gz.md5
+artifacts/sounds

@@ -94,6 +94,89 @@ class MediaKeyDetector:
         _code = getattr(ecodes, _key_name, None)
         if _code is not None:
             KEY_MAP[_code] = "phone"
+
+    # Hard safety gate: never treat full keyboard-like HID devices as media-key
+    # capture targets. Even if MEDIA_KEYS_DEVICE_FILTER is blank/misconfigured,
+    # this prevents accidental exclusive grabs of keyboard/mouse combo devices.
+    KEYBOARD_INDICATOR_KEYS = (
+        {
+            ecodes.KEY_A,
+            ecodes.KEY_B,
+            ecodes.KEY_C,
+            ecodes.KEY_D,
+            ecodes.KEY_E,
+            ecodes.KEY_F,
+            ecodes.KEY_G,
+            ecodes.KEY_H,
+            ecodes.KEY_I,
+            ecodes.KEY_J,
+            ecodes.KEY_K,
+            ecodes.KEY_L,
+            ecodes.KEY_M,
+            ecodes.KEY_N,
+            ecodes.KEY_O,
+            ecodes.KEY_P,
+            ecodes.KEY_Q,
+            ecodes.KEY_R,
+            ecodes.KEY_S,
+            ecodes.KEY_T,
+            ecodes.KEY_U,
+            ecodes.KEY_V,
+            ecodes.KEY_W,
+            ecodes.KEY_X,
+            ecodes.KEY_Y,
+            ecodes.KEY_Z,
+            ecodes.KEY_SPACE,
+            ecodes.KEY_ENTER,
+            ecodes.KEY_LEFTSHIFT,
+            ecodes.KEY_RIGHTSHIFT,
+            ecodes.KEY_LEFTCTRL,
+            ecodes.KEY_RIGHTCTRL,
+            ecodes.KEY_LEFTALT,
+            ecodes.KEY_RIGHTALT,
+        }
+        if EVDEV_AVAILABLE
+        else set()
+    )
+
+    BLOCKED_DEVICE_NAME_TOKENS = {
+        "keyboard",
+        "mouse",
+        "touchpad",
+        "trackpad",
+        "pointer",
+        "gpio-keys",
+    }
+
+    ALLOWED_SPEAKER_HINT_TOKENS = {
+        "speaker",
+        "conference",
+        "anker",
+        "powerconf",
+        "headset",
+        "burr-brown",
+        "usb audio",
+    }
+
+    def _is_blocked_device_name(self, device_name: str) -> bool:
+        """Explicit name blocklist for keyboard/mouse-like devices."""
+        normalized = (device_name or "").strip().lower()
+        if not normalized:
+            return False
+        if any(token in normalized for token in self.ALLOWED_SPEAKER_HINT_TOKENS):
+            return False
+        return any(token in normalized for token in self.BLOCKED_DEVICE_NAME_TOKENS)
+
+    def _looks_like_keyboard_device(self, key_codes: List[int]) -> bool:
+        """Heuristic guardrail to reject full keyboard-like input devices."""
+        if not key_codes:
+            return False
+
+        if len(key_codes) >= 30:
+            return True
+
+        indicator_count = sum(1 for code in self.KEYBOARD_INDICATOR_KEYS if code in key_codes)
+        return indicator_count >= 6
     
     @staticmethod
     def parse_scan_code_list(scan_codes: Optional[str]) -> Set[int]:
@@ -116,8 +199,9 @@ class MediaKeyDetector:
         self,
         device_filter: Optional[str] = None,
         long_press_threshold: float = 0.5,
-        play_scan_codes: Optional[str] = "0xc00b6",
+        play_scan_codes: Optional[str] = "0xc00b6,0xc00cd",
         command_debounce_ms: int = 400,
+        exclusive_grab: bool = False,
     ):
         """
         Args:
@@ -131,6 +215,7 @@ class MediaKeyDetector:
         self.long_press_threshold = long_press_threshold
         self.play_scan_codes = self.parse_scan_code_list(play_scan_codes)
         self.command_debounce_s = max(0.0, command_debounce_ms / 1000.0)
+        self.exclusive_grab = bool(exclusive_grab)
         self.callback: Optional[Callable[[MediaKeyEvent], None]] = None
         self.devices: List[Any] = []
         self.running = False
@@ -199,6 +284,24 @@ class MediaKeyDetector:
                     self.device_filter is not None
                     and self.device_filter.lower() in device.name.lower()
                 )
+
+                if self._is_blocked_device_name(device.name):
+                    logger.warning(
+                        "Skipping blocked input device name for media capture safety: %s (%s)",
+                        device.name,
+                        path,
+                    )
+                    device.close()
+                    continue
+
+                if self._looks_like_keyboard_device(key_codes):
+                    logger.warning(
+                        "Skipping keyboard-like input device for media capture safety: %s (%s)",
+                        device.name,
+                        path,
+                    )
+                    device.close()
+                    continue
                 
                 if has_media_keys or (filter_matches and (key_codes or has_misc_scan)):
                     # Apply optional filter
@@ -285,23 +388,24 @@ class MediaKeyDetector:
 
             self._device_paths.add(device.path)
 
-            try:
-                device.grab()
-                logger.debug(f"Grabbed exclusive access to {device.name}")
-            except Exception as e:
-                logger.error(
-                    "Could not grab exclusive access to %s (%s): %s. "
-                    "Skipping device so OS media handling remains explicit.",
-                    device.name,
-                    device.path,
-                    e,
-                )
+            if self.exclusive_grab:
                 try:
-                    device.close()
-                except Exception:
-                    pass
-                self._device_paths.discard(device.path)
-                continue
+                    device.grab()
+                    logger.debug(f"Grabbed exclusive access to {device.name}")
+                except Exception as e:
+                    logger.error(
+                        "Could not grab exclusive access to %s (%s): %s. "
+                        "Skipping device so OS media handling remains explicit.",
+                        device.name,
+                        device.path,
+                        e,
+                    )
+                    try:
+                        device.close()
+                    except Exception:
+                        pass
+                    self._device_paths.discard(device.path)
+                    continue
 
             self.devices.append(device)
             added += 1

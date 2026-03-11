@@ -13,7 +13,7 @@ Configuration extracted from working Pi **10.1.1.210** (ARMv7, Raspbian 12) has 
 | Component | Status | Details |
 |-----------|--------|---------|
 | Live Config → .env.pi | ✅ MATCH | All 16 critical parameters verified |
-| Live Config → .env.comprehensive | ✅ MATCH | All 11 critical parameters verified |
+| Live Config → .env.example | ✅ MATCH | Baseline template carries critical parameters |
 | Live Config → install_raspbian_remote.sh | ✅ MATCH | Script generates identical values |
 | Audio Equipment | ✅ VERIFIED | USB Camera-B4.09.24.1 (hw:2,0) |
 | Service Architecture | ✅ VERIFIED | Whisper, Piper, Gateway endpoints correct |
@@ -144,7 +144,7 @@ Current deployment script automatically selects correct wake word engine ✅
 | File | Status | Notes |
 |------|--------|-------|
 | .env.pi | ✅ UPDATED | Now contains all 16 critical parameters |
-| .env.comprehensive | ✅ VERIFIED | Already had complete configuration |
+| .env.example | ✅ VERIFIED | Baseline template covers complete configuration |
 | install_raspbian_remote.sh | ✅ VERIFIED | Generates matching .env values |
 
 ### Coverage Analysis
@@ -168,7 +168,7 @@ Current deployment script automatically selects correct wake word engine ✅
 - [x] Configuration extracted from live Pi 10.1.1.210
 - [x] All critical parameters identified (16 total)
 - [x] .env.pi updated with complete configuration
-- [x] .env.comprehensive verified against live config
+- [x] .env.example verified against live config
 - [x] install_raspbian_remote.sh verified to generate matching values
 - [x] Architecture detection (ARMv7 vs ARM64) verified
 - [x] Audio device detection logic validated
@@ -251,7 +251,7 @@ PIPER_SPEED=1.2
 The following are ready:
 1. Deploy script: `install_raspbian_remote.sh`
 2. Artifact sync script: `sync_artifacts_to_pi.sh`
-3. Configuration templates: `.env.pi`, `.env.comprehensive`
+3. Configuration templates: `.env.example`, `.env.pi.example`
 4. Quick deploy guide: `QUICK_DEPLOY.md`
 5. Deployment strategy: `DEPLOYMENT_STRATEGY.md`
 

@@ -52,9 +52,9 @@ Universal gateway adapter supporting:
 git clone https://github.com/yourusername/openclaw-voice.git
 cd openclaw-voice
 
-# Copy and configure environment
-cp .env.example .env
-nano .env  # Edit GATEWAY_HTTP_URL, GATEWAY_AUTH_TOKEN, etc.
+# Copy and configure Docker environment
+cp .env.docker.example .env.docker
+nano .env.docker  # Edit OPENCLAW_GATEWAY_URL, GATEWAY_AUTH_TOKEN, etc.
 
 # Start all services (Linux with ALSA audio)
 docker-compose --profile stt --profile tts --profile linux-audio up -d
@@ -111,8 +111,10 @@ source .venv/bin/activate
 pip install -r requirements.txt
 pip install -r requirements-optional.txt  # For wake word and emotion detection
 
-# Configure
+# Configure local or Pi profile
 cp .env.example .env
+# Optional Raspberry Pi profile:
+# cp .env.pi.example .env.pi
 nano .env
 
 # Run orchestrator (connects to remote or local STT/TTS services)
@@ -232,7 +234,20 @@ For target compatibility and release steps, see:
 
 ## ⚙️ Configuration
 
-Configuration via environment variables in `.env` file. All settings have sensible defaults.
+Configuration is environment-variable based and supports three profiles:
+
+- `.env` (local/native default)
+- `.env.docker` (auto-selected inside Docker)
+- `.env.pi` (auto-selected on ARM hosts)
+
+You can force a specific file with `OPENCLAW_ENV_FILE=/path/to/file`.
+All settings have sensible defaults.
+
+Profile helper templates:
+
+- `.env.example` → comprehensive baseline (local/default)
+- `.env.docker.example` → Docker-focused overrides
+- `.env.pi.example` → Raspberry Pi-focused overrides
 
 ### Audio Configuration
 ```bash
@@ -275,17 +290,24 @@ ECHO_CANCEL_STRENGTH=strong              # AEC strength: low, medium, strong
 ### Wake Word Detection
 ```bash
 WAKE_WORD_ENABLED=false                  # Enable hotword detection
-WAKE_WORD_ENGINE=openwakeword            # Engine: openwakeword, precise, picovoice
-WAKE_WORD_CONFIDENCE=0.95                # Detection threshold (0.0-1.0)
 WAKE_WORD_TIMEOUT_MS=120000              # Timeout after wake (ms)
-OPENWAKEWORD_MODEL_PATH=hey_mycroft      # Model: hey_mycroft, hey_jarvis, alexa
+
+# Enable exactly one engine (or leave all false for auto-select by platform)
+PRECISE_ENABLED=false
+OPENWAKEWORD_ENABLED=true
+PICOVOICE_ENABLED=false
+
+PRECISE_MODEL_PATH=docker/wakeword-models/hey-mycroft.pb
+PRECISE_CONFIDENCE=0.15
+OPENWAKEWORD_MODEL_PATH=hey_mycroft      # Model: hey_mycroft, alexa, jarvis, etc.
+OPENWAKEWORD_CONFIDENCE=0.5
 
 # OpenWakeWord
 OPENWAKEWORD_AUTO_DOWNLOAD=true
 OPENWAKEWORD_MODELS_DIR=docker/wakeword-models
 
 # Picovoice (requires API key)
-WAKE_WORD_PICOVOICE_KEY=your_key_here
+PICOVOICE_KEY=your_key_here
 ```
 
 See [WAKEWORD_ENGINES.md](WAKEWORD_ENGINES.md) for detailed wake word configuration.

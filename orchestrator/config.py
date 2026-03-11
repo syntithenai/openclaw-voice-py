@@ -3,13 +3,55 @@ from pydantic_settings import BaseSettings
 from pathlib import Path
 from dotenv import load_dotenv
 import logging
+import os
 
-# Load .env file, overriding any existing environment variables
-load_dotenv(str(Path(__file__).resolve().parent.parent / ".env"), override=True)
+
+def _detect_env_file() -> Path:
+    """Select the most appropriate env file for this runtime.
+
+    Priority:
+      1) OPENCLAW_ENV_FILE (explicit override)
+      2) .env.docker when running in container
+      3) .env.pi on ARM boards
+      4) .env (default)
+    """
+    root = Path(__file__).resolve().parent.parent
+
+    explicit = os.environ.get("OPENCLAW_ENV_FILE", "").strip()
+    if explicit:
+        explicit_path = Path(explicit).expanduser()
+        if not explicit_path.is_absolute():
+            explicit_path = (root / explicit_path).resolve()
+        return explicit_path
+
+    in_docker = Path("/.dockerenv").exists() or os.environ.get("OPENCLAW_IN_DOCKER", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    if in_docker and (root / ".env.docker").exists():
+        return root / ".env.docker"
+
+    arch = (os.uname().machine or "").lower()
+    if arch.startswith("arm") and (root / ".env.pi").exists():
+        return root / ".env.pi"
+
+    return root / ".env"
+
+
+_ROOT_DIR = Path(__file__).resolve().parent.parent
+_BASE_ENV_FILE = _ROOT_DIR / ".env"
+_SELECTED_ENV_FILE = _detect_env_file()
+
+# Load base .env first (if present), then selected env as override.
+if _BASE_ENV_FILE.exists():
+    load_dotenv(str(_BASE_ENV_FILE), override=False)
+if _SELECTED_ENV_FILE.exists():
+    load_dotenv(str(_SELECTED_ENV_FILE), override=True)
 
 
 class VoiceConfig(BaseSettings):
-    model_config = ConfigDict(env_file=".env", case_sensitive=False, extra="ignore")
+    model_config = ConfigDict(case_sensitive=False, extra="ignore")
 
     @field_validator("audio_capture_device", "audio_playback_device", mode="before")
     @classmethod
@@ -47,6 +89,7 @@ class VoiceConfig(BaseSettings):
     vad_cut_in_rms: float = Field(0.0025)
     vad_cut_in_min_ms: int = Field(150)
     vad_cut_in_frames: int = Field(3)
+    vad_cut_in_tts_hold_timeout_ms: int = Field(4500)  # Suppress further TTS after cut-in until transcript or timeout
     vad_cut_in_use_silero: bool = Field(False)
     vad_cut_in_silero_confidence: float = Field(0.3)
     silero_model_path: str = Field("")
@@ -159,6 +202,8 @@ class VoiceConfig(BaseSettings):
     quick_answer_model: str = Field("")  # Model name to use (e.g., "gpt-3.5-turbo" or specific loaded model in LM Studio)
     quick_answer_api_key: str = Field("")  # Optional API key for authentication
     quick_answer_timeout_ms: int = Field(5000)  # Timeout for quick answer requests
+    quick_answer_mirror_enabled: bool = Field(False)  # Mirror QA turns to the openclaw session so they appear in web chat
+    quick_answer_bypass_window_ms: int = Field(8000)  # After a transcript is sent to gateway, bypass quick answer for this many ms (0=disabled)
 
     # Tool System
     tools_enabled: bool = Field(True)  # Enable timer/alarm tool system
@@ -181,15 +226,51 @@ class VoiceConfig(BaseSettings):
     # Media Keys (Hardware button detection)
     media_keys_enabled: bool = Field(False)  # Enable hardware media key detection
     media_keys_device_filter: str = Field("")  # Optional device name filter (e.g., "Anker", "USB", "Conference")
+    media_keys_exclusive_grab: bool = Field(False)  # Grab input device exclusively (blocks OS media handling)
     media_keys_control_music: bool = Field(True)  # Allow media keys to control MPD playback
-    media_keys_play_scan_codes: str = Field("0xc00b6")  # Comma-separated MSC_SCAN values that should be treated as play button
+    media_keys_suppress_system_play: bool = Field(True)  # Pause desktop media players on wake/play-button events
+    media_keys_play_scan_codes: str = Field("0xc00b6,0xc00cd")  # Comma-separated MSC_SCAN values that should be treated as play button
     media_keys_command_debounce_ms: int = Field(400)  # Ignore duplicate logical button commands within this window
+
+    # Wake/sleep feedback sounds
+    wake_feedback_variant: str = Field("click")  # click|double|bright|soft|cluck|doublecluck|knock|knocklow|doubleknock
+    sleep_feedback_variant: str = Field("swoosh")  # swoosh|short|deep|sigh|sighshort|exhale|exhaleshort|exhalelong|none
+    wake_feedback_gain: float = Field(1.6)  # Playback gain multiplier for wake cue
+    sleep_feedback_gain: float = Field(1.3)  # Playback gain multiplier for sleep cue
 
     @model_validator(mode='after')
     def validate_critical_config(self):
         """Validate that configuration is sensible and log errors for bad settings."""
         logger = logging.getLogger("orchestrator.config")
         errors = []
+
+        # Auto-select a wake-word engine if wake word is enabled and none were explicitly enabled.
+        if self.wake_word_enabled:
+            enabled_engines = sum([
+                self.precise_enabled,
+                self.openwakeword_enabled,
+                self.picovoice_enabled,
+            ])
+            if enabled_engines == 0:
+                arch = (os.uname().machine or "").lower()
+                if arch.startswith("arm"):
+                    self.precise_enabled = True
+                    if not self.precise_model_path:
+                        self.precise_model_path = "docker/wakeword-models/hey-mycroft.pb"
+                    if not self.precise_wake_word:
+                        self.precise_wake_word = "hey-mycroft"
+                    logger.info(
+                        "Auto-selected wake-word engine: Precise (ARM detected; no explicit engine configured)"
+                    )
+                else:
+                    self.openwakeword_enabled = True
+                    if not self.openwakeword_model_path:
+                        self.openwakeword_model_path = "hey_mycroft"
+                    if not self.openwakeword_wake_word:
+                        self.openwakeword_wake_word = "hey_mycroft"
+                    logger.info(
+                        "Auto-selected wake-word engine: OpenWakeWord (non-ARM detected; no explicit engine configured)"
+                    )
 
         # Validate wake word configuration
         if self.wake_word_enabled:

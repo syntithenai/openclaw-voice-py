@@ -6,7 +6,8 @@
 - [x] Git repository with latest code
 - [x] `install_raspbian_remote.sh` script ready
 - [x] `sync_artifacts_to_pi.sh` script ready
-- [x] `.env.comprehensive` configuration template
+- [x] `.env.example` configuration template
+- [x] `.env.pi.example` Raspberry Pi profile template
 - [x] ARMv7 artifacts ready:
   - `artifacts/precise-engine-armv7/precise-engine.tar.gz` (162M)
   - `docker/wakeword-models/hey-mycroft.pb` (26K)

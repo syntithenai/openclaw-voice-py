@@ -520,12 +520,16 @@ class OpenClawGateway(BaseGateway):
                         text: Optional[str] = None
                         if isinstance(payload.get("text"), str):
                             text = payload.get("text")
+                        elif isinstance(payload.get("delta"), str):
+                            text = payload.get("delta")
                         elif isinstance(payload.get("message"), str):
                             text = payload.get("message")
                         elif isinstance(payload.get("data"), dict):
                             inner = payload.get("data")
                             if isinstance(inner.get("text"), str):
                                 text = inner.get("text")
+                            elif isinstance(inner.get("delta"), str):
+                                text = inner.get("delta")
 
                         if isinstance(text, str) and text.strip():
                             # Extract delta: only new text not seen in previous stream updates
@@ -611,6 +615,29 @@ class OpenClawGateway(BaseGateway):
         payload_obj = res.get("payload") if isinstance(res.get("payload"), dict) else {}
         immediate = payload_obj.get("text") or payload_obj.get("message")
         return immediate if isinstance(immediate, str) else None
+
+    async def inject_message(
+        self,
+        session_key: str,
+        message: str,
+        label: Optional[str] = None,
+    ) -> None:
+        """Inject a transcript message into an existing session without running the agent.
+
+        Uses the ``chat.inject`` RPC which appends an assistant-role message to the
+        session JSONL and broadcasts it to connected web-chat clients.  Suitable for
+        mirroring quick-answer turns so they appear in the web UI.
+
+        Raises on connection or RPC error — callers should wrap in try/except.
+        """
+        await self._ensure_connected()
+        params: dict = {"sessionKey": session_key, "message": message}
+        if label is not None:
+            params["label"] = label
+        res = await self._send_request("chat.inject", params, timeout_s=self.timeout_s)
+        if not bool(res.get("ok")):
+            err = (res.get("error") or {}).get("message") if isinstance(res.get("error"), dict) else "chat.inject failed"
+            raise RuntimeError(f"OpenClaw chat.inject failed: {err}")
 
     async def listen(self) -> AsyncIterator[str]:
         """Listen for agent responses via persistent WebSocket connection."""

@@ -7,6 +7,8 @@ warnings.filterwarnings(
 )
 
 import os
+import shutil
+import subprocess
 import sys
 
 # Suppress FunASR/tqdm progress bars BEFORE any imports
@@ -25,7 +27,9 @@ import threading
 import time
 import unicodedata
 import wave
+from collections import deque
 from contextlib import redirect_stderr
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.request import urlretrieve
 
@@ -46,9 +50,24 @@ from orchestrator.tts.piper_client import PiperClient
 from orchestrator.audio.playback import AudioPlayback
 from orchestrator.audio.webrtc_aec import WebRTCAEC
 from orchestrator.audio.resample import resample_pcm
-from orchestrator.audio.sounds import generate_click_sound, generate_swoosh_sound
+from orchestrator.audio.sounds import (
+    generate_click_sound,
+    generate_swoosh_sound,
+    generate_cluck_sound,
+    generate_sigh_sound,
+    generate_knock_sound,
+    generate_exhale_sound,
+)
 from orchestrator.metrics import AECStatus, WakeWordResult
 import numpy as np
+
+
+@dataclass
+class TTSQueueItem:
+    text: str
+    request_id: int
+    kind: str  # "reply" | "notification"
+    created_ts: float
 
 
 # Custom logging formatter with selective color highlighting for transcriptions
@@ -815,14 +834,21 @@ async def run_orchestrator() -> None:
     last_tts_text = ""
     last_tts_ts = 0.0
     tts_dedupe_window_ms = 800
+    cut_in_tts_hold_active = False
+    cut_in_tts_hold_started_ts: float | None = None
+    cut_in_tts_hold_request_id = 0
     current_request_id = 0  # Incremented on each user message
     current_tts_request_id = 0  # Tracks which request is currently playing
+    tts_last_played_request_id = 0  # Request ID of the last successfully completed TTS item
+    last_gateway_send_ts: float | None = None  # Monotonic time of the last transcript sent to gateway
+    last_thinking_phrase_ts: float | None = None  # Monotonic time of the last thinking phrase spoken
     warned_wake_resample = False
     warned_aec_stub = False
     wake_sleep_ts: float | None = None
     wake_sleep_cooldown_ms = max(0, config.wake_sleep_cooldown_ms)
     last_wake_detected_ts: float | None = None
     last_wake_conf_log_ts = 0.0
+    warned_missing_playerctl = False
 
     wake_detector = None
     active_wake_engine = None
@@ -924,7 +950,10 @@ async def run_orchestrator() -> None:
     logger.info("✓ Gateway ready in %dms", gateway_elapsed)
     print(f"✓ Gateway ready in {gateway_elapsed}ms", flush=True)
     
-    session_id = f"{config.gateway_session_prefix}-{int(time.time())}"
+    # Use the session prefix directly as a stable session name rather than appending a
+    # timestamp.  A stable name means all voice interactions accumulate in one persistent
+    # session (e.g. agent:voice:main) so the web chat UI always shows the full history.
+    session_id = config.gateway_session_prefix
     agent_id = config.gateway_agent_id or "assistant"
     
     # Tool System (timers/alarms)
@@ -1067,6 +1096,7 @@ async def run_orchestrator() -> None:
                 device_filter=device_filter,
                 play_scan_codes=config.media_keys_play_scan_codes,
                 command_debounce_ms=config.media_keys_command_debounce_ms,
+                exclusive_grab=config.media_keys_exclusive_grab,
             )
             
             # Set up callback to handle button presses
@@ -1076,6 +1106,8 @@ async def run_orchestrator() -> None:
                 nonlocal capture, tts_stop_event, music_paused_for_wake, music_auto_resume_timer, music_was_playing
                 nonlocal state, pending_transcripts, debounce_task, chunk_frames, chunk_start_ts, last_speech_ts
                 nonlocal cut_in_triggered_ts
+                nonlocal warned_missing_playerctl
+                nonlocal tts_base_gain, tts_gain
                 
                 logger.info("Media key pressed: %s from %s", event.key, event.device_name)
 
@@ -1098,6 +1130,30 @@ async def run_orchestrator() -> None:
 
                     return False
 
+                async def pause_system_media_if_needed(source_label: str):
+                    nonlocal warned_missing_playerctl
+                    if not config.media_keys_suppress_system_play:
+                        return
+                    if not shutil.which("playerctl"):
+                        if not warned_missing_playerctl:
+                            logger.warning(
+                                "MEDIA_KEYS_SUPPRESS_SYSTEM_PLAY=true but playerctl is not installed; "
+                                "set MEDIA_KEYS_EXCLUSIVE_GRAB=true to prevent VLC/OS playback toggles."
+                            )
+                            warned_missing_playerctl = True
+                        return
+                    try:
+                        await asyncio.to_thread(
+                            subprocess.run,
+                            ["playerctl", "-a", "pause"],
+                            check=False,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        logger.info("⏸️ Suppressed system media playback for %s", source_label)
+                    except Exception as e:
+                        logger.debug("Failed to suppress system media playback for %s: %s", source_label, e)
+
                 async def restore_music_if_needed(source_label: str):
                     nonlocal music_paused_for_wake, music_auto_resume_timer, music_was_playing
 
@@ -1112,6 +1168,34 @@ async def run_orchestrator() -> None:
                         music_was_playing = True
                     except Exception as e:
                         logger.debug("Error restoring music after %s: %s", source_label, e)
+
+                async def adjust_output_volume(direction: int):
+                    nonlocal tts_base_gain, tts_gain
+
+                    previous_tts_base_gain = tts_base_gain
+                    tts_base_gain = max(0.2, min(3.0, tts_base_gain + (0.12 * direction)))
+
+                    # Preserve cut-in ducking if active, otherwise keep live playback in sync.
+                    if abs(tts_gain - previous_tts_base_gain) < 1e-6:
+                        tts_gain = tts_base_gain
+                    else:
+                        tts_gain = min(tts_gain, tts_base_gain)
+
+                    logger.info(
+                        "🔊 TTS base gain %s to %.2f",
+                        "increased" if direction > 0 else "decreased",
+                        tts_base_gain,
+                    )
+
+                    if config.music_enabled and music_manager:
+                        try:
+                            if direction > 0:
+                                result = await music_manager.increase_volume(5)
+                            else:
+                                result = await music_manager.decrease_volume(5)
+                            logger.info("🎵 Music volume update: %s", result)
+                        except Exception as e:
+                            logger.debug("Failed to adjust music volume: %s", e)
 
                 async def trigger_wake(source_label: str):
                     nonlocal wake_state, wake_sleep_ts, last_wake_detected_ts, last_activity_ts
@@ -1136,7 +1220,12 @@ async def run_orchestrator() -> None:
                     if wake_click_sound:
                         try:
                             asyncio.create_task(
-                                asyncio.to_thread(playback.play_pcm, wake_click_sound, 1.0, threading.Event())
+                                asyncio.to_thread(
+                                    playback.play_pcm,
+                                    wake_click_sound,
+                                    float(max(0.1, config.wake_feedback_gain)),
+                                    threading.Event(),
+                                )
                             )
                         except Exception as e:
                             logger.debug("Failed to play wake click: %s", e)
@@ -1152,19 +1241,39 @@ async def run_orchestrator() -> None:
 
                     drained_tts = 0
                     while True:
-                        try:
-                            tts_queue.get_nowait()
-                            drained_tts += 1
-                        except asyncio.QueueEmpty:
+                        if not _tts_has_pending():
                             break
+                        tts_queue.popleft()
+                        drained_tts += 1
+
+                    if not _tts_has_pending():
+                        tts_queue_event.clear()
 
                     if drained_tts:
                         logger.info("🧹 Cleared %d queued TTS item(s) for sleep", drained_tts)
 
-                    pending_transcripts.clear()
-                    if debounce_task and not debounce_task.done():
-                        debounce_task.cancel()
-                    debounce_task = None
+                    buffered_pcm: bytes | None = None
+                    buffered_chunk_started_ts = chunk_start_ts
+                    buffered_cut_in_ts = cut_in_triggered_ts
+                    preserve_transcript_work = bool(pending_transcripts)
+
+                    if chunk_frames and chunk_start_ts is not None:
+                        buffered_pcm = b"".join(chunk_frames)
+                        preserve_transcript_work = True
+                        logger.info(
+                            "🎤 Preserving buffered speech on %s sleep (%d frames, %d bytes)",
+                            source_label,
+                            len(chunk_frames),
+                            len(buffered_pcm),
+                        )
+
+                    if preserve_transcript_work:
+                        logger.info("📝 Preserving pending transcript work while transitioning to sleep")
+                    else:
+                        pending_transcripts.clear()
+                        if debounce_task and not debounce_task.done():
+                            debounce_task.cancel()
+                        debounce_task = None
 
                     chunk_frames = []
                     chunk_start_ts = None
@@ -1184,17 +1293,47 @@ async def run_orchestrator() -> None:
                         except Exception as e:
                             logger.debug("Failed to reset wake detector on %s sleep: %s", source_label, e)
 
+                    if timeout_swoosh_sound:
+                        try:
+                            asyncio.create_task(
+                                asyncio.to_thread(
+                                    playback.play_pcm,
+                                    timeout_swoosh_sound,
+                                    float(max(0.1, config.sleep_feedback_gain)),
+                                    threading.Event(),
+                                )
+                            )
+                        except Exception as e:
+                            logger.debug("Failed to play sleep swoosh: %s", e)
+
+                    if buffered_pcm:
+                        asyncio.create_task(
+                            process_chunk(
+                                buffered_pcm,
+                                buffered_cut_in_ts,
+                                buffered_chunk_started_ts,
+                            )
+                        )
+
                     await restore_music_if_needed(source_label)
                     logger.info("😴 System put to sleep by %s", source_label)
                 
-                # Mute button → Toggle microphone mute
+                # Mute button -> force zero microphone input via capture mute.
                 if event.key == "mute":
-                    if capture and hasattr(capture, 'toggle_mute'):
+                    if capture and hasattr(capture, "toggle_mute"):
                         new_state = capture.toggle_mute()
-                        logger.info("🎤 Microphone %s via button press", "muted" if new_state else "unmuted")
+                        logger.info(
+                            "🎤 Microphone %s via hardware mute button on %s",
+                            "muted" if new_state else "unmuted",
+                            event.device_name,
+                        )
+                    else:
+                        logger.info("🎤 Mute button pressed on %s but capture mute is unavailable", event.device_name)
+                    return
                 
                 # Play button (or mapped MSC_SCAN play) → Toggle wake/sleep
                 elif event.key in ("play_pause", "play", "pause"):
+                    await pause_system_media_if_needed("play button")
                     if config.wake_word_enabled and wake_state == WakeState.AWAKE:
                         await trigger_sleep("play button")
                     else:
@@ -1202,24 +1341,30 @@ async def run_orchestrator() -> None:
                 
                 # Next/Previous track → Also trigger wake (instead of skipping tracks)
                 elif event.key in ("next", "previous"):
+                    await pause_system_media_if_needed("play button")
                     await trigger_wake("play button")
                 
                 # Long press play button (0.5s+) → Alternative wake trigger (if supported)
                 elif event.key == "play_pause_long":
+                    await pause_system_media_if_needed("play button long-press")
                     await trigger_wake("play button long-press")
                 
                 # Phone button → Trigger wake word (stop audio, notification sound, unmute mic, wake system)
                 elif event.key == "phone":
+                    await pause_system_media_if_needed("phone button")
                     await trigger_wake("phone button")
                 
+                # Volume controls -> orchestrator-managed TTS + music volume.
+                elif event.key == "volume_up":
+                    await adjust_output_volume(1)
+
+                elif event.key == "volume_down":
+                    await adjust_output_volume(-1)
+
                 # Standard media controls
                 elif config.media_keys_control_music and music_manager:
                     if event.key == "stop":
                         asyncio.create_task(music_manager.stop())
-                    elif event.key == "volume_up":
-                        asyncio.create_task(music_manager.increase_volume(5))
-                    elif event.key == "volume_down":
-                        asyncio.create_task(music_manager.decrease_volume(5))
                     else:
                         logger.debug("Unhandled media key: %s", event.key)
             
@@ -1301,8 +1446,134 @@ async def run_orchestrator() -> None:
     
     # Generate audio feedback sounds
     logger.info("→ Generating audio feedback sounds...")
-    wake_click_sound = generate_click_sound(sample_rate=config.audio_sample_rate, duration_ms=12, frequency=2000)
-    timeout_swoosh_sound = None
+    wake_variant = (config.wake_feedback_variant or "click").strip().lower()
+    if wake_variant == "knocklow":
+        wake_click_sound = generate_knock_sound(
+            sample_rate=config.audio_sample_rate,
+            duration_ms=78,
+            base_frequency=210,
+        )
+    elif wake_variant == "knock":
+        wake_click_sound = generate_knock_sound(
+            sample_rate=config.audio_sample_rate,
+            duration_ms=72,
+            base_frequency=250,
+        )
+    elif wake_variant == "doubleknock":
+        knock_a = wav_bytes_to_pcm(
+            generate_knock_sound(
+                sample_rate=config.audio_sample_rate,
+                duration_ms=66,
+                base_frequency=250,
+            )
+        )
+        knock_b = wav_bytes_to_pcm(
+            generate_knock_sound(
+                sample_rate=config.audio_sample_rate,
+                duration_ms=70,
+                base_frequency=220,
+            )
+        )
+        gap = bytes(int(config.audio_sample_rate * 0.055) * 2)
+        wake_click_sound = pcm_to_wav_bytes(knock_a + gap + knock_b, config.audio_sample_rate)
+    elif wake_variant == "cluck":
+        wake_click_sound = generate_cluck_sound(
+            sample_rate=config.audio_sample_rate,
+            duration_ms=92,
+            base_frequency=430,
+        )
+    elif wake_variant == "doublecluck":
+        cluck_a = wav_bytes_to_pcm(
+            generate_cluck_sound(
+                sample_rate=config.audio_sample_rate,
+                duration_ms=82,
+                base_frequency=420,
+            )
+        )
+        cluck_b = wav_bytes_to_pcm(
+            generate_cluck_sound(
+                sample_rate=config.audio_sample_rate,
+                duration_ms=88,
+                base_frequency=380,
+            )
+        )
+        gap = bytes(int(config.audio_sample_rate * 0.06) * 2)
+        wake_click_sound = pcm_to_wav_bytes(cluck_a + gap + cluck_b, config.audio_sample_rate)
+    elif wake_variant == "double":
+        click_a = wav_bytes_to_pcm(
+            generate_click_sound(sample_rate=config.audio_sample_rate, duration_ms=12, frequency=1900)
+        )
+        click_b = wav_bytes_to_pcm(
+            generate_click_sound(sample_rate=config.audio_sample_rate, duration_ms=14, frequency=2300)
+        )
+        gap = bytes(int(config.audio_sample_rate * 0.05) * 2)
+        wake_click_sound = pcm_to_wav_bytes(click_a + gap + click_b, config.audio_sample_rate)
+    elif wake_variant == "bright":
+        wake_click_sound = generate_click_sound(
+            sample_rate=config.audio_sample_rate,
+            duration_ms=18,
+            frequency=2800,
+        )
+    elif wake_variant == "soft":
+        wake_click_sound = generate_click_sound(
+            sample_rate=config.audio_sample_rate,
+            duration_ms=20,
+            frequency=1300,
+        )
+    else:
+        wake_click_sound = generate_click_sound(sample_rate=config.audio_sample_rate, duration_ms=12, frequency=2000)
+
+    sleep_variant = (config.sleep_feedback_variant or "swoosh").strip().lower()
+    if sleep_variant == "none":
+        timeout_swoosh_sound = None
+    elif sleep_variant == "exhale":
+        timeout_swoosh_sound = generate_exhale_sound(
+            sample_rate=config.audio_sample_rate,
+            duration_ms=660,
+            brightness=0.24,
+        )
+    elif sleep_variant == "exhaleshort":
+        timeout_swoosh_sound = generate_exhale_sound(
+            sample_rate=config.audio_sample_rate,
+            duration_ms=460,
+            brightness=0.28,
+        )
+    elif sleep_variant == "exhalelong":
+        timeout_swoosh_sound = generate_exhale_sound(
+            sample_rate=config.audio_sample_rate,
+            duration_ms=1320,
+            brightness=0.22,
+        )
+    elif sleep_variant == "sigh":
+        timeout_swoosh_sound = generate_sigh_sound(
+            sample_rate=config.audio_sample_rate,
+            duration_ms=560,
+            start_frequency=520,
+            end_frequency=110,
+        )
+    elif sleep_variant == "sighshort":
+        timeout_swoosh_sound = generate_sigh_sound(
+            sample_rate=config.audio_sample_rate,
+            duration_ms=420,
+            start_frequency=560,
+            end_frequency=140,
+        )
+    elif sleep_variant == "short":
+        timeout_swoosh_sound = generate_swoosh_sound(
+            sample_rate=config.audio_sample_rate,
+            duration_ms=180,
+            start_frequency=900,
+            end_frequency=260,
+        )
+    elif sleep_variant == "deep":
+        timeout_swoosh_sound = generate_swoosh_sound(
+            sample_rate=config.audio_sample_rate,
+            duration_ms=340,
+            start_frequency=650,
+            end_frequency=120,
+        )
+    else:
+        timeout_swoosh_sound = generate_swoosh_sound(sample_rate=config.audio_sample_rate)
     aec = WebRTCAEC(
         sample_rate=config.audio_sample_rate,
         frame_ms=config.audio_frame_ms,
@@ -1316,7 +1587,8 @@ async def run_orchestrator() -> None:
     )
     logger.info("✓ AEC: enabled=%s backend=%s available=%s", aec_status.enabled, aec_status.backend, aec_status.available)
 
-    tts_queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
+    tts_queue: deque[TTSQueueItem] = deque()
+    tts_queue_event = asyncio.Event()
     tts_stop_event = threading.Event()
     tts_playback_start_ts: float | None = None
     current_tts_text = ""
@@ -1343,6 +1615,80 @@ async def run_orchestrator() -> None:
     debounce_task: asyncio.Task | None = None
     processing_request = False  # Flag to prevent concurrent gateway requests
 
+    def _tts_has_pending() -> bool:
+        return len(tts_queue) > 0
+
+    def _tts_drop_stale_replies(new_request_id: int) -> int:
+        if new_request_id <= 0 or not tts_queue:
+            return 0
+        original_len = len(tts_queue)
+        kept = deque(
+            item
+            for item in tts_queue
+            if not (item.kind == "reply" and item.request_id < new_request_id)
+        )
+        dropped = original_len - len(kept)
+        if dropped:
+            tts_queue.clear()
+            tts_queue.extend(kept)
+        return dropped
+
+    def _tts_clear_all(reason: str) -> int:
+        dropped = len(tts_queue)
+        if dropped:
+            tts_queue.clear()
+            logger.info("🧹 Cleared %d queued TTS item(s): %s", dropped, reason)
+        tts_queue_event.clear()
+        return dropped
+
+    MAX_NOTIFICATION_QUEUE_DEPTH = 5
+
+    def _tts_enqueue(item: TTSQueueItem) -> None:
+        if item.kind == "notification":
+            notification_count = sum(1 for i in tts_queue if i.kind == "notification")
+            if notification_count >= MAX_NOTIFICATION_QUEUE_DEPTH:
+                # Drop oldest notification to make room
+                for idx, queued in enumerate(tts_queue):
+                    if queued.kind == "notification":
+                        del tts_queue[idx]
+                        logger.warning(
+                            "⚠️ Notification queue full (%d); dropped oldest: %.40s…",
+                            MAX_NOTIFICATION_QUEUE_DEPTH,
+                            queued.text,
+                        )
+                        break
+        tts_queue.append(item)
+        tts_queue_event.set()
+
+    async def _tts_dequeue() -> TTSQueueItem:
+        while True:
+            if tts_queue:
+                item = tts_queue.popleft()
+                if not tts_queue:
+                    tts_queue_event.clear()
+                return item
+            tts_queue_event.clear()
+            await tts_queue_event.wait()
+
+    def _tts_start_gate_block_reason(now_ts: float, item_request_id: int = 0) -> str | None:
+        if cut_in_tts_hold_active:
+            return "cut_in_hold"
+        if tts_playing:
+            return "tts_playing"
+        # Continuation sentences (same request as last completed TTS item) should not be
+        # gated on listening_state or speech_recent — those checks are only meaningful for
+        # the very first sentence of a new request (preventing TTS diving in mid-speech).
+        is_continuation = item_request_id > 0 and item_request_id == tts_last_played_request_id
+        if not is_continuation:
+            if state == VoiceState.LISTENING:
+                return "listening_state"
+            if last_speech_ts is not None:
+                silence_ms = int((now_ts - last_speech_ts) * 1000)
+                required_silence = max(350, config.vad_min_silence_ms // 2)
+                if silence_ms < required_silence:
+                    return f"speech_recent:{silence_ms}ms"
+        return None
+
     def clean_text_for_tts(text: str) -> str:
         """Remove punctuation and icon symbols that should not be spoken by TTS.
         
@@ -1354,7 +1700,6 @@ async def run_orchestrator() -> None:
         text = text.replace(":", "")  # colon
         text = text.replace(";", "")  # semicolon
         text = text.replace('"', "")  # quote
-        text = text.replace("'", "")  # apostrophe (but keeps contractions)
         text = text.replace("(", "")  # open paren
         text = text.replace(")", "")  # close paren
         text = text.replace("[", "")  # open bracket
@@ -1362,6 +1707,9 @@ async def run_orchestrator() -> None:
         text = text.replace("{", "")  # open brace
         text = text.replace("}", "")  # close brace
         text = text.replace("/", " ")  # slash -> space
+
+        # Preserve contraction apostrophes (I'm, don't) but normalize curly to straight.
+        text = text.replace("’", "'")
 
         # Remove emoji/icon symbols and emoji formatting code points.
         # So = Symbol, Other (emoji/pictographs), plus variation selector/joiner helpers.
@@ -1380,14 +1728,27 @@ async def run_orchestrator() -> None:
 
         return text
 
-    async def submit_tts(text: str, request_id: int = 0) -> None:
+    async def submit_tts(text: str, request_id: int = 0, kind: str = "reply") -> None:
         nonlocal last_tts_text, last_tts_ts
         nonlocal current_tts_text, current_tts_duration_s, tts_playback_start_ts
         nonlocal tts_playing, current_tts_request_id
+        nonlocal cut_in_tts_hold_active, cut_in_tts_hold_started_ts, cut_in_tts_hold_request_id
         
         # Filter out NO_REPLY markers (final safeguard)
         if "NO_REPLY" in text or "NO_RE" in text or text.strip() in ["NO", "_RE", "NO _RE"]:
             logger.info("🚫 Filtered NO_REPLY from TTS: '%s'", text)
+            return
+
+        normalized_kind = "notification" if kind == "notification" else "reply"
+        effective_request_id = request_id if request_id else current_request_id
+        if normalized_kind == "reply" and effective_request_id <= 0:
+            effective_request_id = current_request_id
+        if normalized_kind == "reply" and effective_request_id < current_request_id:
+            logger.info(
+                "🚫 Dropped stale reply TTS [req#%d < current#%d]",
+                effective_request_id,
+                current_request_id,
+            )
             return
         
         now = time.monotonic()
@@ -1417,8 +1778,19 @@ async def run_orchestrator() -> None:
 
         last_tts_text = text
         last_tts_ts = now
-        effective_request_id = request_id if request_id else current_request_id
-        await tts_queue.put((text, effective_request_id))
+        if normalized_kind == "reply":
+            dropped = _tts_drop_stale_replies(effective_request_id)
+            if dropped:
+                logger.info("🧹 Dropped %d stale reply TTS item(s) before enqueue [req#%d]", dropped, effective_request_id)
+
+        _tts_enqueue(
+            TTSQueueItem(
+                text=text,
+                request_id=effective_request_id,
+                kind=normalized_kind,
+                created_ts=now,
+            )
+        )
 
     async def send_debounced_transcripts() -> None:
         """Send accumulated transcripts after debounce period."""
@@ -1464,7 +1836,19 @@ async def run_orchestrator() -> None:
             
             # Try quick answer first if enabled
             should_send_to_gateway = True
-            if quick_answer_client:
+            nonlocal last_gateway_send_ts, last_thinking_phrase_ts
+            bypass_window_ms = config.quick_answer_bypass_window_ms
+            in_bypass_window = (
+                bypass_window_ms > 0
+                and last_gateway_send_ts is not None
+                and (time.monotonic() - last_gateway_send_ts) * 1000 < bypass_window_ms
+            )
+            if in_bypass_window:
+                logger.info(
+                    "⏩ QA bypass: within %dms of last gateway send; skipping quick answer",
+                    bypass_window_ms,
+                )
+            if quick_answer_client and not in_bypass_window:
                 try:
                     qa_start = time.monotonic()
                     # Use tool-enabled method if tools are configured
@@ -1483,14 +1867,32 @@ async def run_orchestrator() -> None:
                         should_send_to_gateway = False
                         # Clear all transcripts processed (including any that arrived during LLM call)
                         pending_transcripts.clear()
+                        # Mirror both turns to the openclaw session so they appear in the web chat UI
+                        if config.quick_answer_mirror_enabled:
+                            from orchestrator.gateway.providers import OpenClawGateway
+                            if isinstance(gateway, OpenClawGateway):
+                                mirror_session_key = f"agent:{agent_id}:{session_id}"
+                                async def _mirror_qa(user_text: str, assistant_text: str, sk: str) -> None:
+                                    try:
+                                        await gateway.inject_message(sk, user_text, label="🎤 Voice")
+                                        await gateway.inject_message(sk, assistant_text)
+                                        logger.info("✓ QA MIRROR: Injected QA pair to session %s", sk)
+                                    except Exception as mirror_exc:
+                                        logger.warning("QA MIRROR: Failed to inject turns to %s: %s", sk, mirror_exc)
+                                asyncio.create_task(_mirror_qa(combined_transcript, quick_response, mirror_session_key))
                     else:
                         # Need to escalate to gateway - check for additional transcripts
                         logger.info("← QUICK ANSWER: Escalating to upstream (latency: %dms)", qa_elapsed)
                         
-                        # Play a thinking phrase while gateway processes
-                        thinking_phrase = get_random_thinking_phrase()
-                        logger.info("→ TTS QUEUE [req#%d]: Enqueuing thinking phrase: '%s'", current_request_id, thinking_phrase)
-                        await submit_tts(thinking_phrase, request_id=current_request_id)
+                        # Play a thinking phrase while gateway processes (suppress if one was said recently)
+                        thinking_suppress_ms = 12000
+                        if last_thinking_phrase_ts is None or (time.monotonic() - last_thinking_phrase_ts) * 1000 >= thinking_suppress_ms:
+                            thinking_phrase = get_random_thinking_phrase()
+                            logger.info("→ TTS QUEUE [req#%d]: Enqueuing thinking phrase: '%s'", current_request_id, thinking_phrase)
+                            await submit_tts(thinking_phrase, request_id=current_request_id)
+                            last_thinking_phrase_ts = time.monotonic()
+                        else:
+                            logger.info("→ TTS QUEUE [req#%d]: Suppressing thinking phrase (said one %.0fms ago)", current_request_id, (time.monotonic() - last_thinking_phrase_ts) * 1000)
                         
                         if len(pending_transcripts) > initial_count:
                             additional_transcripts = pending_transcripts[initial_count:]
@@ -1505,11 +1907,16 @@ async def run_orchestrator() -> None:
                     qa_elapsed = int((time.monotonic() - qa_start) * 1000) if 'qa_start' in locals() else 0
                     logger.error("Quick answer failed: %s; falling back to gateway (latency: %dms)", exc, qa_elapsed)
                     
-                    # Play a thinking phrase on error too
+                    # Play a thinking phrase on error too (suppress if one was said recently)
                     try:
-                        thinking_phrase = get_random_thinking_phrase()
-                        logger.info("→ TTS QUEUE [req#%d]: Enqueuing thinking phrase (error fallback): '%s'", current_request_id, thinking_phrase)
-                        await submit_tts(thinking_phrase, request_id=current_request_id)
+                        thinking_suppress_ms = 12000
+                        if last_thinking_phrase_ts is None or (time.monotonic() - last_thinking_phrase_ts) * 1000 >= thinking_suppress_ms:
+                            thinking_phrase = get_random_thinking_phrase()
+                            logger.info("→ TTS QUEUE [req#%d]: Enqueuing thinking phrase (error fallback): '%s'", current_request_id, thinking_phrase)
+                            await submit_tts(thinking_phrase, request_id=current_request_id)
+                            last_thinking_phrase_ts = time.monotonic()
+                        else:
+                            logger.info("→ TTS QUEUE [req#%d]: Suppressing thinking phrase (error fallback; said one %.0fms ago)", current_request_id, (time.monotonic() - last_thinking_phrase_ts) * 1000)
                     except Exception as tts_exc:
                         logger.error("Failed to play thinking phrase: %s", tts_exc)
                     
@@ -1532,6 +1939,7 @@ async def run_orchestrator() -> None:
                 
                 final_text = f"[{emotion_tag}] {combined_transcript}" if emotion_tag else combined_transcript
                 logger.info("→ GATEWAY: Sending debounced transcript (%d parts) to %s [req#%d]", transcript_count, gateway.provider, current_request_id)
+                last_gateway_send_ts = time.monotonic()
                 gw_start = time.monotonic()
                 try:
                     response_text = await gateway.send_message(
@@ -1587,6 +1995,13 @@ async def run_orchestrator() -> None:
         if not text:
             return ""
 
+        # Ignore descriptor-only transcripts such as "(knocking on door)" or
+        # "[door closes]" where no actual spoken words are present.
+        without_bracket_descriptors = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", text)
+        if not re.search(r"[a-zA-Z0-9]", without_bracket_descriptors):
+            logger.info("⊘ Transcript filtered: bracketed sound descriptor only ('%s')", text[:120])
+            return ""
+
         lowered = text.lower()
         ignore_markers = (
             "[inaudible]",
@@ -1612,6 +2027,7 @@ async def run_orchestrator() -> None:
         chunk_started_ts: float | None = None,
     ) -> None:
         nonlocal active_transcriptions, state, pending_transcripts, debounce_task
+        nonlocal cut_in_tts_hold_active, cut_in_tts_hold_started_ts, cut_in_tts_hold_request_id
         active_transcriptions += 1
         state = VoiceState.SENDING
         try:
@@ -1671,6 +2087,12 @@ async def run_orchestrator() -> None:
                     logger.info("← EMOTION: No emotion detected (%dms)", emotion_elapsed)
 
             # Add to pending transcripts and restart debounce timer
+            if cut_in_tts_hold_active:
+                cut_in_tts_hold_active = False
+                cut_in_tts_hold_started_ts = None
+                cut_in_tts_hold_request_id = 0
+                logger.info("🔓 Cut-in TTS hold released after successful transcript")
+
             pending_transcripts.append((transcript, emotion_tag))
             logger.info("⏱️ Transcript queued for debounce (%d pending)", len(pending_transcripts))
             
@@ -1687,10 +2109,33 @@ async def run_orchestrator() -> None:
         nonlocal tts_playing, tts_gain, last_playback_frame, tts_playback_start_ts
         nonlocal current_tts_text, current_tts_duration_s
         nonlocal current_tts_request_id, last_activity_ts
+        nonlocal tts_last_played_request_id
+        nonlocal wake_state, wake_sleep_ts, last_wake_detected_ts
         while True:
-            text, request_id = await tts_queue.get()
+            item = await _tts_dequeue()
+            text = item.text
+            request_id = item.request_id
             if not text:
                 continue
+
+            if item.kind == "reply" and request_id < current_request_id:
+                logger.info("🚫 Dropped stale reply before playback [req#%d < current#%d]", request_id, current_request_id)
+                continue
+
+            while True:
+                now_ts = time.monotonic()
+                if item.kind == "reply" and request_id < current_request_id:
+                    logger.info("🚫 Dropped stale reply during gate wait [req#%d < current#%d]", request_id, current_request_id)
+                    text = ""
+                    break
+                blocked_reason = _tts_start_gate_block_reason(now_ts, request_id)
+                if blocked_reason is None:
+                    break
+                await asyncio.sleep(0.08)
+
+            if not text:
+                continue
+
             tts_playing = True
             current_tts_text = text
             current_tts_request_id = request_id  # Track which request is now playing
@@ -1731,9 +2176,15 @@ async def run_orchestrator() -> None:
                         logger.info("← TTS PLAY: Playback complete in %dms", play_elapsed)
                         # Reset wake timeout after TTS completes to keep conversation alive
                         last_activity_ts = time.monotonic()
+                        if config.wake_word_enabled:
+                            wake_state = WakeState.AWAKE
+                            wake_sleep_ts = None
+                            last_wake_detected_ts = last_activity_ts
+                            logger.info("🌙 Wake state kept AWAKE after TTS completion")
                     last_playback_frame = None
                     tts_playback_start_ts = None
                     if not interrupted:
+                        tts_last_played_request_id = request_id
                         logger.info("↻ Restarting audio capture after TTS playback")
                         try:
                             capture.restart()
@@ -1962,18 +2413,18 @@ async def run_orchestrator() -> None:
                 logger.error("Failed to play timer bell: %s", e)
             # Announce timer completion
             if name:
-                await submit_tts(f"Timer {name} is complete")
+                await submit_tts(f"Timer {name} is complete", kind="notification")
             else:
-                await submit_tts("Timer is complete")
+                await submit_tts("Timer is complete", kind="notification")
         
         async def on_alarm_triggered(alarm_id: str, name: str):
             """Called when an alarm first triggers."""
             logger.info("⏰ ALARM TRIGGERED: %s (%s)", name or alarm_id, alarm_id)
             # Announce alarm
             if name:
-                await submit_tts(f"Alarm {name}")
+                await submit_tts(f"Alarm {name}", kind="notification")
             else:
-                await submit_tts("Alarm")
+                await submit_tts("Alarm", kind="notification")
         
         async def on_alarm_ringing(alarm_id: str, name: str):
             """Called repeatedly while alarm is ringing (every few seconds)."""
@@ -2039,6 +2490,14 @@ async def run_orchestrator() -> None:
 
             now = time.monotonic()
             frame_count += 1
+
+            if cut_in_tts_hold_active and cut_in_tts_hold_started_ts is not None:
+                hold_elapsed_ms = int((now - cut_in_tts_hold_started_ts) * 1000)
+                if hold_elapsed_ms >= max(0, config.vad_cut_in_tts_hold_timeout_ms):
+                    cut_in_tts_hold_active = False
+                    cut_in_tts_hold_started_ts = None
+                    cut_in_tts_hold_request_id = 0
+                    logger.info("🔓 Cut-in TTS hold timeout reached (%dms) - allowing TTS again", hold_elapsed_ms)
 
             processed_frame = frame
             
@@ -2178,7 +2637,7 @@ async def run_orchestrator() -> None:
 
             if config.wake_word_enabled and wake_state == WakeState.ASLEEP:
                 # Keep awake while TTS is playing or queued so cut-in can work
-                if tts_playing or not tts_queue.empty():
+                if tts_playing or _tts_has_pending():
                     wake_state = WakeState.AWAKE
                     last_activity_ts = now
                 else:
@@ -2439,6 +2898,18 @@ async def run_orchestrator() -> None:
                         silero_conf if silero_conf is not None else -1.0,
                     )
                     tts_stop_event.set()
+
+                    if not cut_in_tts_hold_active:
+                        cut_in_tts_hold_active = True
+                        cut_in_tts_hold_started_ts = now
+                        cut_in_tts_hold_request_id = current_tts_request_id if current_tts_request_id else current_request_id
+                        dropped_tts = _tts_clear_all("cut-in")
+                        logger.info(
+                            "🛑 Cut-in hold activated (%dms) for req#%d. Dropped %d queued TTS item(s)",
+                            max(0, config.vad_cut_in_tts_hold_timeout_ms),
+                            cut_in_tts_hold_request_id,
+                            dropped_tts,
+                        )
                     
                     # Stop music playback when voice cut-in detected
                     if config.music_enabled and music_manager:
@@ -2494,7 +2965,7 @@ async def run_orchestrator() -> None:
                     if (
                         state in (VoiceState.IDLE, VoiceState.LISTENING)
                         and not tts_playing
-                        and tts_queue.empty()
+                        and not _tts_has_pending()
                         and not debounce_pending
                         and not has_pending_transcripts
                         and active_transcriptions == 0
@@ -2506,14 +2977,18 @@ async def run_orchestrator() -> None:
                         if wake_detector and hasattr(wake_detector, 'reset_state'):
                             wake_detector.reset_state()
                         logger.info("Wake timeout reached → asleep")
-                        # Timeout swoosh sound disabled
-                        # (Was: play_pcm on timeout, but disabled per user request)
-                        if False and timeout_swoosh_sound:  # DISABLED
+                        if timeout_swoosh_sound:
                             try:
-                                pcm_swoosh = wav_bytes_to_pcm(timeout_swoosh_sound)
-                                asyncio.create_task(asyncio.to_thread(playback.play_pcm, pcm_swoosh, 1.0, threading.Event()))
+                                asyncio.create_task(
+                                    asyncio.to_thread(
+                                        playback.play_pcm,
+                                        timeout_swoosh_sound,
+                                        float(max(0.1, config.sleep_feedback_gain)),
+                                        threading.Event(),
+                                    )
+                                )
                             except Exception as exc:
-                                logger.debug("Failed to play timeout swoosh sound: %s", exc)
+                                logger.debug("Failed to play timeout sleep cue: %s", exc)
 
             await asyncio.sleep(0)
     finally:
