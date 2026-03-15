@@ -1,14 +1,5 @@
-"""Compatibility surface for gateway providers.
-
-Provider implementations live under ``orchestrator.gateway.provider_backends``.
-Keep importing from ``orchestrator.gateway.providers`` to avoid churn.
-"""
-
-from orchestrator.gateway.provider_backends import (
-    BaseGateway,
-    GatewayResponse,
-    GenericGateway,
-    OpenClawGateway,
+from .core import BaseGateway, GatewayResponse, GenericGateway, OpenClawGateway
+from .others import (
     ZeroClawGateway,
     TinyClawGateway,
     IronClawGateway,
