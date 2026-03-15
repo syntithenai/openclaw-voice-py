@@ -33,6 +33,8 @@ def _build_ui_html(
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>OpenClaw Voice</title>
   <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
   <script>
         if (window.tailwind) {{
             tailwind.config = {{
@@ -49,6 +51,21 @@ def _build_ui_html(
     @keyframes fadeIn {{ from {{ opacity:0; transform:translateY(4px); }} to {{ opacity:1; transform:none; }} }}
     ::-webkit-scrollbar {{ width:6px; }} ::-webkit-scrollbar-track {{ background:transparent; }}
     ::-webkit-scrollbar-thumb {{ background:#3e4d8a; border-radius:999px; }}
+    .md-content h1,.md-content h2,.md-content h3 {{ font-weight:600; margin:0.5em 0 0.25em; line-height:1.3; }}
+    .md-content h1 {{ font-size:1.2em; }} .md-content h2 {{ font-size:1.1em; }} .md-content h3 {{ font-size:1em; }}
+    .md-content p {{ margin:0.35em 0; }}
+    .md-content ul,.md-content ol {{ padding-left:1.4em; margin:0.35em 0; }}
+    .md-content li {{ margin:0.1em 0; }}
+    .md-content code {{ background:#1e2436; border-radius:3px; padding:1px 4px; font-size:0.85em; font-family:monospace; }}
+    .md-content pre {{ background:#1e2436; border-radius:6px; padding:0.6em 0.8em; overflow-x:auto; margin:0.45em 0; }}
+    .md-content pre code {{ background:none; padding:0; }}
+    .md-content blockquote {{ border-left:3px solid #4b5a8a; padding-left:0.8em; color:#9aa3c0; margin:0.35em 0; }}
+    .md-content a {{ color:#7ca3ff; text-decoration:underline; }}
+    .md-content table {{ border-collapse:collapse; width:100%; margin:0.45em 0; }}
+    .md-content th,.md-content td {{ border:1px solid #3f4a64; padding:0.25em 0.5em; text-align:left; }}
+    .md-content th {{ background:#242a3b; font-weight:600; }}
+    .md-content hr {{ border:none; border-top:1px solid #3f4a64; margin:0.5em 0; }}
+    .md-content>*:first-child {{ margin-top:0; }} .md-content>*:last-child {{ margin-bottom:0; }}
   </style>
 </head>
 <body class="bg-gray-950 text-gray-100 h-screen flex flex-col overflow-hidden">
@@ -525,9 +542,15 @@ function mkBubble(m){{
 
         d.appendChild(wrap);
         return d;
-    }}
-
-    if(role==='context_group'){{
+            const b=document.createElement('div');
+            b.className='px-4 py-2 rounded-2xl rounded-bl-md text-sm leading-relaxed bg-gray-700 text-gray-100 md-content';
+            const _rawText=(m.text||'');
+            if(typeof marked!=='undefined'&&typeof DOMPurify!=='undefined'&&_rawText){{
+                marked.setOptions({{breaks:true,gfm:true}});
+                b.innerHTML=DOMPurify.sanitize(marked.parse(_rawText),{{ALLOWED_TAGS:['p','strong','em','h1','h2','h3','h4','h5','h6','ul','ol','li','code','pre','blockquote','a','hr','table','thead','tbody','tr','th','td','br','del','s'],ALLOWED_ATTR:['href','title']}});
+            }}else{{
+                b.textContent=_rawText;
+            }}
         const wrap=document.createElement('div');
         wrap.className='max-w-xs sm:max-w-sm lg:max-w-md space-y-1';
 
@@ -956,9 +979,30 @@ function handleMsg(msg){{
             applyMicState();
             applyMicControlToggles();
             break;
+            case 'feedback_sound':
+                playFeedbackSound(msg.audio_b64, msg.gain||1.0);
+                break;
   }}
 }}
 
+async function playFeedbackSound(b64, gain) {{
+    try {{
+        if (!b64) return;
+        const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const buf = await ctx.decodeAudioData(bytes.buffer.slice(0));
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        const gainNode = ctx.createGain();
+        gainNode.gain.value = Math.max(0, Math.min(4, Number(gain) || 1.0));
+        src.connect(gainNode);
+        gainNode.connect(ctx.destination);
+        src.onended = () => ctx.close();
+        src.start();
+    }} catch(e) {{
+        console.debug('Feedback sound error:', e);
+    }}
+}}
 function applyOrch(o){{
   if(o.voice_state!==undefined) S.voice_state=o.voice_state;
   if(o.wake_state!==undefined)  S.wake_state=o.wake_state;
@@ -1393,6 +1437,19 @@ class EmbeddedVoiceWebService:
     # ------------------------------------------------------------------
 
     async def broadcast(self, payload: dict[str, Any]) -> None:
+        # ------------------------------------------------------------------
+        # Feedback sound helper
+        # ------------------------------------------------------------------
+
+        def send_feedback_sound(self, wav_bytes: bytes, gain: float = 1.0) -> None:
+            """Broadcast a short feedback sound to all browser clients as base64-encoded WAV."""
+            import base64
+            asyncio.create_task(self.broadcast({
+                "type": "feedback_sound",
+                "audio_b64": base64.b64encode(wav_bytes).decode(),
+                "gain": float(gain),
+            }))
+
         if not self._clients:
             return
         message = json.dumps(payload)

@@ -200,7 +200,7 @@ class MediaKeyDetector:
     @staticmethod
     def parse_scan_code_list(scan_codes: Optional[str]) -> Set[int]:
         """Parse comma-separated scan codes (supports decimal or hex like 0xc00b6)."""
-        if not scan_codes:
+            if not scan_codes:
             return set()
 
         parsed: Set[int] = set()

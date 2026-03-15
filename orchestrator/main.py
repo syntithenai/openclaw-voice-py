@@ -1393,6 +1393,12 @@ async def run_orchestrator() -> None:
                     if not pcm:
                         return
 
+                    if web_service and web_service.has_active_client():
+                        _audio_authority = str(getattr(config, "web_ui_audio_authority", "native") or "native").lower()
+                        if _audio_authority in ("browser", "hybrid"):
+                            _wav = pcm if pcm[:4] == b"RIFF" else pcm_to_wav_bytes(pcm, config.audio_sample_rate)
+                            web_service.send_feedback_sound(_wav, gain)
+
                     async def _runner() -> None:
                         try:
                             await asyncio.to_thread(
@@ -1847,6 +1853,12 @@ async def run_orchestrator() -> None:
         """Play short cues in background with explicit error logging."""
         if not pcm:
             return
+
+        if web_service and web_service.has_active_client():
+            _audio_authority = str(getattr(config, "web_ui_audio_authority", "native") or "native").lower()
+            if _audio_authority in ("browser", "hybrid"):
+                _wav = pcm if pcm[:4] == b"RIFF" else pcm_to_wav_bytes(pcm, config.audio_sample_rate)
+                web_service.send_feedback_sound(_wav, gain)
 
         async def _runner() -> None:
             try:
