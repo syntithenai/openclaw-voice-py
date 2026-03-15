@@ -202,6 +202,7 @@ class OpenClawGateway(BaseGateway):
         self._identity_path = Path.home() / ".openclaw" / "identity" / "device.json"
         self._device_identity_cache: Optional[dict[str, str]] = None
         self._last_streamed_text: str = ""  # Track last text for delta extraction
+        self._last_reasoning_text: str = ""
         self._raw_dump_path = Path("/tmp/openclaw_gateway_stream.jsonl")
 
     def _dump_raw_frame(self, raw_message: str, *, parsed: Any = None, note: str = "") -> None:
@@ -228,6 +229,39 @@ class OpenClawGateway(BaseGateway):
         cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
         cleaned = re.sub(r"\s{2,}", " ", cleaned)
         return cleaned
+
+    @staticmethod
+    def _split_reasoning_text(text: str) -> tuple[str, str]:
+        """Split assistant text into visible content and reasoning-tag content.
+
+        Handles complete and partial <reasoning>...</reasoning> regions.
+        """
+        if not text:
+            return "", ""
+        lower = text.lower()
+        start_tag = "<reasoning>"
+        end_tag = "</reasoning>"
+        visible_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        cursor = 0
+
+        while True:
+            start = lower.find(start_tag, cursor)
+            if start == -1:
+                visible_parts.append(text[cursor:])
+                break
+            visible_parts.append(text[cursor:start])
+            content_start = start + len(start_tag)
+            end = lower.find(end_tag, content_start)
+            if end == -1:
+                reasoning_parts.append(text[content_start:])
+                break
+            reasoning_parts.append(text[content_start:end])
+            cursor = end + len(end_tag)
+
+        visible = "".join(visible_parts)
+        reasoning = "\n".join(part.strip() for part in reasoning_parts if part and part.strip())
+        return visible, reasoning
 
     async def _emit_step_event(self, name: str, phase: str, tool_call_id: str, details_obj: Any) -> None:
         try:
@@ -689,9 +723,26 @@ class OpenClawGateway(BaseGateway):
                         if isinstance(text, str) and text.strip():
                             # Extract delta: only new text not seen in previous stream updates
                             full_text = text.strip()
+                            visible_text, reasoning_text = self._split_reasoning_text(full_text)
+
+                            if reasoning_text:
+                                if reasoning_text.startswith(self._last_reasoning_text):
+                                    reasoning_delta = reasoning_text[len(self._last_reasoning_text):].strip()
+                                else:
+                                    reasoning_delta = reasoning_text.strip()
+                                if reasoning_delta:
+                                    await self._emit_step_event("reasoning", "interim", "", reasoning_delta)
+                                self._last_reasoning_text = reasoning_text
+                            elif self._last_reasoning_text:
+                                self._last_reasoning_text = ""
+
                             if full_text.startswith(self._last_streamed_text):
                                 # Only strip trailing whitespace to preserve leading spaces (word boundaries)
-                                delta = full_text[len(self._last_streamed_text):].rstrip()
+                                visible_prev, _ = self._split_reasoning_text(self._last_streamed_text)
+                                if visible_text.startswith(visible_prev):
+                                    delta = visible_text[len(visible_prev):].rstrip()
+                                else:
+                                    delta = visible_text.rstrip()
                                 if delta:
                                     # Clean delta for TTS: remove markdown formatting and filter special markers
                                     cleaned = delta
@@ -711,7 +762,7 @@ class OpenClawGateway(BaseGateway):
                                 self._last_streamed_text = full_text
                             else:
                                 # New message or reset - queue full text with cleaning
-                                cleaned = full_text.replace("**", "").replace("*", "")
+                                cleaned = visible_text.replace("**", "").replace("*", "")
                                 cleaned = self._strip_heartbeat_markers(cleaned)
                                 if not cleaned.startswith("NO_RE"):
                                     if cleaned.strip():
@@ -747,6 +798,7 @@ class OpenClawGateway(BaseGateway):
         
         # Reset streaming state for new message
         self._last_streamed_text = ""
+        self._last_reasoning_text = ""
         
         await self._ensure_connected()
         

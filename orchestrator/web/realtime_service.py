@@ -576,34 +576,85 @@ function mkBubble(m){{
 
         const events=(m.events||[]);
         if(events.length>0){{
-            const rows=events.map(ev=>{{
+            const toolGroups=new Map();
+            const lifecycleItems=[];
+            const reasoningLines=[];
+            const seenReasoning=new Set();
+            const addReasoning=(line)=>{{
+                const s=String(line||'').trim();
+                if(!s) return;
+                if(seenReasoning.has(s)) return;
+                seenReasoning.add(s);
+                reasoningLines.push(s);
+            }};
+
+            let hasLifecycleStart=false;
+            let hasLifecycleEnd=false;
+            let anonIdx=0;
+
+            for(const ev of events){{
                 const kind=(ev&&ev.kind)||'lifecycle';
                 const payload=(ev&&ev.payload)||{{}};
+
                 if(kind==='tool'){{
-                    const toolName=String(payload.name||payload.text||'tool');
+                    const toolName=String(payload.name||payload.text||'tool').trim()||'tool';
                     const phase=String(payload.phase||'update').toLowerCase();
-                    const icon=phase==='start'?'\u25b6':(phase==='end'||phase==='result')?'\u2713':'\u2022';
+                    const callId=String(payload.tool_call_id||payload.toolCallId||'').trim();
+                    const key=callId||('anon:'+toolName+':'+(++anonIdx));
+                    if(!toolGroups.has(key)){{
+                        toolGroups.set(key,{{
+                            name:toolName,
+                            callId,
+                            phases:[],
+                            command:'',
+                            files:[],
+                            metas:[],
+                            isError:null,
+                            requestPreview:'',
+                            payloads:[],
+                            results:[],
+                        }});
+                    }}
+                    const g=toolGroups.get(key);
+                    if(!g.phases.includes(phase)) g.phases.push(phase);
+
                     const parsed=parseDetails(payload.details);
-                    const requestSummary=summarizeRequest(toolName, parsed);
-                    const resultText=extractResult(parsed) || String(payload.details||'').trim();
-                    const payloadText=String(payload.details||'').trim() || (parsed?toPretty(parsed):'');
-                    const payloadBlock='<details class="mt-1 rounded border border-gray-700/70 bg-gray-900/40">'
-                        +'<summary class="px-1.5 py-1 cursor-pointer text-[10px] text-gray-300 hover:text-gray-100">payload</summary>'
-                        +'<pre class="px-1.5 pb-1.5 whitespace-pre-wrap break-words text-[11px] text-gray-300">'+esc(payloadText||'(no payload)')+'</pre>'
-                        +'</details>';
-                    const resultBlock='<details class="mt-1 rounded border border-gray-700/70 bg-gray-900/40">'
-                        +'<summary class="px-1.5 py-1 cursor-pointer text-[10px] text-gray-300 hover:text-gray-100">result</summary>'
-                        +'<pre class="px-1.5 pb-1.5 whitespace-pre-wrap break-words text-[11px] text-gray-300">'+esc(resultText||'(no result)')+'</pre>'
-                        +'</details>';
-                    return '<div class="px-2 py-1 border-b border-gray-800/60 last:border-b-0">'
-                        +'<div class="text-[11px] text-amber-300 flex items-center gap-1"><span class="w-3 text-center">'+icon+'</span><span class="font-mono">'+esc(toolName)+'</span><span class="text-[10px] text-gray-500">'+esc(phase)+'</span></div>'
-                        +'<div class="text-[11px] text-gray-300 mt-0.5">'+esc(requestSummary||'(no request details)')+'</div>'
-                        +payloadBlock
-                        +resultBlock
-                        +'</div>';
+                    const rawPayload=String(payload.details||'').trim() || (parsed?toPretty(parsed):'');
+                    if(rawPayload && !g.payloads.includes(rawPayload)) g.payloads.push(rawPayload);
+
+                    const req=parsed&&typeof parsed==='object'
+                        ? (parsed.args!==undefined?parsed.args:(parsed.arguments!==undefined?parsed.arguments:parsed.input))
+                        : undefined;
+                    if(!g.requestPreview) g.requestPreview=summarizeRequest(toolName, parsed);
+
+                    if(req && typeof req==='object'){{
+                        const cmd=req.command||req.cmd||req.argv||req.script;
+                        if(cmd!==undefined && !g.command) g.command=typeof cmd==='string'?cmd:toPretty(cmd);
+                        const fp=req.filePath||req.path||req.old_path||req.new_path||req.uri;
+                        if(fp!==undefined){{
+                            const f=String(fp);
+                            if(!g.files.includes(f)) g.files.push(f);
+                        }}
+                    }}
+
+                    if(parsed && typeof parsed==='object'){{
+                        if(parsed.meta!==undefined){{
+                            const metaTxt=toPretty(parsed.meta);
+                            if(metaTxt && !g.metas.includes(metaTxt)) g.metas.push(metaTxt);
+                        }}
+                        if(parsed.isError!==undefined) g.isError=!!parsed.isError;
+                    }}
+
+                    const resultText=extractResult(parsed) || '';
+                    if(resultText && !g.results.includes(resultText)) g.results.push(resultText);
+                    continue;
                 }}
 
-                const name=String(payload.text||payload.name||payload.phase||'lifecycle');
+                const name=String(payload.text||payload.name||payload.phase||'lifecycle').toLowerCase();
+                const phase=String(payload.phase||'').toLowerCase();
+                if(name==='lifecycle' && phase==='start'){{ hasLifecycleStart=true; continue; }}
+                if(name==='lifecycle' && phase==='end'){{ hasLifecycleEnd=true; continue; }}
+
                 const parsed=parseDetails(payload.details);
                 let details='';
                 if(parsed&&typeof parsed==='object'){{
@@ -612,20 +663,76 @@ function mkBubble(m){{
                 }} else {{
                     details=String(payload.details||'').trim();
                 }}
+                lifecycleItems.push({{name:String(payload.text||payload.name||payload.phase||'lifecycle'), details}});
+                addReasoning((payload.text||payload.name||'event')+': '+details);
+            }}
+
+            for(const g of toolGroups.values()){{
+                for(const mtxt of g.metas) addReasoning(mtxt);
+            }}
+
+            const waiting=(hasLifecycleStart && !hasLifecycleEnd);
+            const waitingRow=waiting
+                ? '<div class="px-2 py-1 border-b border-gray-800/60 text-[11px] text-yellow-300 flex items-center gap-2">'
+                    +'<span class="inline-block w-3 h-3 border-2 border-yellow-300/80 border-t-transparent rounded-full animate-spin"></span>'
+                    +'<span>waiting…</span>'
+                  +'</div>'
+                : '';
+
+            const toolRows=[...toolGroups.values()].map(g=>{{
+                const success=(g.isError===false || g.phases.includes('result') || g.phases.includes('end'));
+                const failed=(g.isError===true);
+                const icon=failed?'✕':(success?'✓':'•');
+                const phaseLabel=g.phases.filter(Boolean).join(', ')||'update';
+
+                const summaryParts=[];
+                if(g.command) summaryParts.push('command: '+g.command);
+                if(g.files.length) summaryParts.push('file: '+g.files.join(', '));
+                if(!summaryParts.length && g.requestPreview) summaryParts.push(g.requestPreview);
+                if(g.isError!==null) summaryParts.push('isError: '+String(g.isError));
+                if(g.metas.length) summaryParts.push('meta: '+g.metas.join(' | '));
+                const summary=summaryParts.join(' · ') || '(no request details)';
+
+                const resultJoined=(g.results.length?g.results.join('\\n\\n---\\n\\n'):'') || '(no result)';
+                const payloadJoined=(g.payloads.length?g.payloads.join('\\n\\n---\\n\\n'):'') || '(no payload)';
+                const payloadBlock='<details class="mt-1 rounded border border-gray-700/70 bg-gray-900/40">'
+                    +'<summary class="px-1.5 py-1 cursor-pointer text-[10px] text-gray-300 hover:text-gray-100">payload</summary>'
+                    +'<pre class="px-1.5 pb-1.5 whitespace-pre-wrap break-words text-[11px] text-gray-300">'+esc(payloadJoined)+'</pre>'
+                    +'</details>';
+                const resultInline=(resultJoined && resultJoined!=='(no result)')
+                    ? '<div class="mt-1 text-[11px] text-gray-200 whitespace-pre-wrap break-words">'+esc(resultJoined)+'</div>'
+                    : '';
+
+                return '<div class="px-2 py-1 border-b border-gray-800/60 last:border-b-0">'
+                    +'<div class="text-[11px] text-amber-300 flex items-center gap-1"><span class="w-3 text-center">'+icon+'</span><span class="font-mono">'+esc(g.name)+'</span><span class="text-[10px] text-gray-500">'+esc(phaseLabel)+'</span></div>'
+                    +'<div class="text-[11px] text-gray-300 mt-0.5">'+esc(summary)+'</div>'
+                    +resultInline
+                    +payloadBlock
+                    +'</div>';
+            }}).join('');
+
+            const lifecycleRows=lifecycleItems.map(item=>{{
                 const detailsBlock='<details class="mt-1 rounded border border-gray-700/70 bg-gray-900/40">'
                     +'<summary class="px-1.5 py-1 cursor-pointer text-[10px] text-gray-300 hover:text-gray-100">payload</summary>'
-                    +'<pre class="px-1.5 pb-1.5 whitespace-pre-wrap break-words text-[11px] text-gray-300">'+esc(details||'(no details)')+'</pre>'
+                    +'<pre class="px-1.5 pb-1.5 whitespace-pre-wrap break-words text-[11px] text-gray-300">'+esc(item.details||'(no details)')+'</pre>'
                     +'</details>';
                 return '<div class="px-2 py-1 border-b border-gray-800/60 last:border-b-0">'
-                    +'<div class="text-[10px] text-sky-500 font-mono">'+esc(name)+'</div>'
+                    +'<div class="text-[10px] text-sky-500 font-mono">'+esc(item.name)+'</div>'
                     +detailsBlock
                     +'</div>';
             }}).join('');
 
+            const interimBlock=reasoningLines.length
+                ? '<details class="mt-2 rounded border border-gray-700/70 bg-gray-900/40">'
+                    +'<summary class="px-2 py-1 cursor-pointer text-[10px] text-gray-300 hover:text-gray-100">Interim/Reasoning</summary>'
+                    +'<pre class="px-2 pb-2 whitespace-pre-wrap break-words text-[11px] text-gray-300">'+esc(reasoningLines.join('\\n'))+'</pre>'
+                  +'</details>'
+                : '';
+
             const timeline=document.createElement('div');
             timeline.innerHTML='<details class="rounded-xl bg-gray-900/60 border border-gray-700 text-xs overflow-hidden" open>'
                 +'<summary class="px-3 py-1.5 cursor-pointer text-gray-200 hover:text-gray-100 select-none">Execution Sequence</summary>'
-                +'<div class="px-2 pb-2 pt-1">'+rows+'</div>'
+                +'<div class="px-2 pb-2 pt-1">'+waitingRow+toolRows+lifecycleRows+interimBlock+'</div>'
                 +'</details>';
             wrap.appendChild(timeline);
         }}
