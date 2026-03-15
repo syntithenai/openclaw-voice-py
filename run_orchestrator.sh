@@ -31,6 +31,14 @@ if [ -z "$PREFERRED_SINK_VALUE" ] && [ -f "$ENV_FILE_PATH" ]; then
 fi
 PREFERRED_SINK_VALUE="$(printf '%s' "$PREFERRED_SINK_VALUE" | xargs)"
 
+# Resolve optional preferred PipeWire source from environment (or env file fallback).
+# This helps keep input routing stable when using AUDIO_CAPTURE_DEVICE=pipewire.
+PREFERRED_SOURCE_VALUE="${AUDIO_PREFERRED_SOURCE:-}"
+if [ -z "$PREFERRED_SOURCE_VALUE" ] && [ -f "$ENV_FILE_PATH" ]; then
+  PREFERRED_SOURCE_VALUE="$(grep -E '^AUDIO_PREFERRED_SOURCE=' "$ENV_FILE_PATH" | tail -n1 | cut -d= -f2-)"
+fi
+PREFERRED_SOURCE_VALUE="$(printf '%s' "$PREFERRED_SOURCE_VALUE" | xargs)"
+
 # PipeWire: ensure PortAudio ALSA plugin can locate the PipeWire session socket.
 # Without this, opening the 'pipewire' ALSA device hangs indefinitely.
 export PIPEWIRE_RUNTIME_DIR="/run/user/$(id -u)"
@@ -148,6 +156,18 @@ if [ -n "$PREFERRED_SINK_VALUE" ] && command -v pactl >/dev/null 2>&1; then
     done
   else
     echo "WARN: Preferred sink '$PREFERRED_SINK_VALUE' not found; leaving PipeWire default unchanged"
+  fi
+fi
+
+# Best-effort preferred source pinning for host PipeWire usage.
+if [ -n "$PREFERRED_SOURCE_VALUE" ] && command -v pactl >/dev/null 2>&1; then
+  if pactl list short sources 2>/dev/null | awk '{print $2}' | grep -Fxq "$PREFERRED_SOURCE_VALUE"; then
+    echo "INFO: Pinning preferred source: $PREFERRED_SOURCE_VALUE"
+    pactl set-default-source "$PREFERRED_SOURCE_VALUE" >/dev/null 2>&1 || true
+    pactl set-source-mute "$PREFERRED_SOURCE_VALUE" 0 >/dev/null 2>&1 || true
+    pactl set-source-volume "$PREFERRED_SOURCE_VALUE" 100% >/dev/null 2>&1 || true
+  else
+    echo "WARN: Preferred source '$PREFERRED_SOURCE_VALUE' not found; leaving PipeWire default unchanged"
   fi
 fi
 

@@ -122,6 +122,7 @@ class VoiceConfig(BaseSettings):
     wake_sleep_cooldown_ms: int = Field(2500)  # Ignore wake detections briefly after going to sleep
     wake_min_detect_rms: float = Field(0.0015)  # Reject wake detections on near-silence frames
     wake_clear_ring_buffer: bool = Field(False)  # Clear ring buffer on wake to avoid ghost transcripts (ARM/Pi only)
+    wake_detect_prebuffer_ms: int = Field(280)  # One-shot prebuffer fed into wake detector after music cut-in duck starts
 
     # Wake word - Precise Engine (Mycroft Precise v0.3.0)
     precise_enabled: bool = Field(False)
@@ -223,7 +224,10 @@ class VoiceConfig(BaseSettings):
     web_ui_music_poll_ms: int = Field(1000)  # How often to poll MPD for music state (ms)
     web_ui_timer_poll_ms: int = Field(500)  # How often to push timer state to UI (ms)
     web_ui_mic_starts_disabled: bool = Field(True)  # Mic button starts in disabled (red) state
-    web_ui_audio_authority: str = Field("native")  # native|browser|hybrid - which audio input is authoritative
+    web_ui_audio_authority: str = Field("native")  # native=OS mic only; browser=browser audio while connected (fallback local when disconnected); hybrid=same handoff semantics with explicit shared wake-state intent
+    web_ui_ssl_certfile: str = Field("")  # Path to TLS certificate file (PEM); empty = plain HTTP
+    web_ui_ssl_keyfile: str = Field("")   # Path to TLS private key file (PEM)
+    web_ui_http_redirect_port: int = Field(0)  # Port for HTTP→HTTPS redirector (0 = disabled)
 
     # Tool System
     tools_enabled: bool = Field(True)  # Enable timer/alarm tool system
@@ -288,14 +292,27 @@ class VoiceConfig(BaseSettings):
             ])
             if enabled_engines == 0:
                 arch = (os.uname().machine or "").lower()
-                if arch.startswith("arm"):
+                is_pi = False
+                for model_path in (
+                    "/proc/device-tree/model",
+                    "/sys/firmware/devicetree/base/model",
+                ):
+                    try:
+                        model_text = Path(model_path).read_text(errors="ignore").strip().lower()
+                    except Exception:
+                        continue
+                    if "raspberry pi" in model_text:
+                        is_pi = True
+                        break
+
+                if is_pi and (arch.startswith("armv7") or arch.startswith("armv6")):
                     self.precise_enabled = True
                     if not self.precise_model_path:
                         self.precise_model_path = "docker/wakeword-models/hey-mycroft.pb"
                     if not self.precise_wake_word:
                         self.precise_wake_word = "hey-mycroft"
                     logger.info(
-                        "Auto-selected wake-word engine: Precise (ARM detected; no explicit engine configured)"
+                        "Auto-selected wake-word engine: Precise (Raspberry Pi ARMv7/ARMv6 detected; no explicit engine configured)"
                     )
                 else:
                     self.openwakeword_enabled = True
@@ -304,7 +321,7 @@ class VoiceConfig(BaseSettings):
                     if not self.openwakeword_wake_word:
                         self.openwakeword_wake_word = "hey_mycroft"
                     logger.info(
-                        "Auto-selected wake-word engine: OpenWakeWord (non-ARM detected; no explicit engine configured)"
+                        "Auto-selected wake-word engine: OpenWakeWord (default; non-Raspberry-Pi-armv7/armv6 or non-ARM detected)"
                     )
 
         # Validate wake word configuration
@@ -435,6 +452,15 @@ class VoiceConfig(BaseSettings):
                 )
             if self.web_ui_audio_authority not in ("native", "browser", "hybrid"):
                 errors.append(f"WEB_UI_AUDIO_AUTHORITY must be 'native', 'browser', or 'hybrid'; got '{self.web_ui_audio_authority}'")
+            if bool(self.web_ui_ssl_certfile) != bool(self.web_ui_ssl_keyfile):
+                errors.append("WEB_UI_SSL_CERTFILE and WEB_UI_SSL_KEYFILE must both be set or both be empty")
+            if self.web_ui_http_redirect_port != 0:
+                if not (1 <= self.web_ui_http_redirect_port <= 65535):
+                    errors.append(f"WEB_UI_HTTP_REDIRECT_PORT={self.web_ui_http_redirect_port} must be 1–65535 or 0 to disable")
+                elif self.web_ui_http_redirect_port in (self.web_ui_port, self.web_ui_ws_port):
+                    errors.append("WEB_UI_HTTP_REDIRECT_PORT must differ from WEB_UI_PORT and WEB_UI_WS_PORT")
+                elif not self.web_ui_ssl_certfile:
+                    errors.append("WEB_UI_HTTP_REDIRECT_PORT requires WEB_UI_SSL_CERTFILE to be configured")
             if self.web_ui_music_poll_ms < 100:
                 errors.append(f"WEB_UI_MUSIC_POLL_MS={self.web_ui_music_poll_ms} must be >= 100 ms")
             if self.web_ui_timer_poll_ms < 100:

@@ -31,6 +31,7 @@ from collections import deque
 from contextlib import redirect_stderr
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 from urllib.request import urlretrieve
 
@@ -260,6 +261,17 @@ def extract_text_from_gateway_message(message: str) -> str:
     return ""
 
 
+def strip_gateway_control_markers(text: str) -> str:
+    """Remove non-user-facing control markers that can leak from upstream agent automation."""
+    if not text:
+        return ""
+    cleaned = re.sub(r"(?i)HEARTBEAT\s*[_ ]?OK(?:\s*NO\s*[_ ]?REPLY)?", " ", text)
+    cleaned = re.sub(r"(?i)\bNO\s*[_ ]?REPLY\b", " ", cleaned)
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    return cleaned
+
+
 def validate_runtime_config(config: VoiceConfig) -> None:
     """
     Validate orchestrator runtime configuration at startup.
@@ -281,6 +293,20 @@ def validate_runtime_config(config: VoiceConfig) -> None:
     # Detect system architecture
     arch_bits = struct.calcsize("P") * 8  # 32 or 64 bits
     machine = platform.machine().lower()  # armv7l, aarch64, i686, x86_64, etc.
+
+    # Detect Raspberry Pi hardware model (best effort)
+    is_raspberry_pi = False
+    for model_path in (
+        "/proc/device-tree/model",
+        "/sys/firmware/devicetree/base/model",
+    ):
+        try:
+            model_text = Path(model_path).read_text(errors="ignore").strip().lower()
+        except Exception:
+            continue
+        if "raspberry pi" in model_text:
+            is_raspberry_pi = True
+            break
     
     # Categorize architecture
     is_armv7 = "armv7" in machine or (arch_bits == 32 and "arm" in machine)
@@ -297,15 +323,15 @@ def validate_runtime_config(config: VoiceConfig) -> None:
         logger.info("→ Validating wake word configuration...")
         
         # Architecture-specific wake word engine requirements
-        if is_armv7:
-            logger.info("  System: ARMv7 (Raspberry Pi) - Requires Precise or Picovoice")
+        if is_armv7 and is_raspberry_pi:
+            logger.info("  System: Raspberry Pi ARMv7/ARMv6 - Requires Precise or Picovoice")
             if not (config.precise_enabled or config.picovoice_enabled):
                 errors.append(
-                    "ARMv7 system detected but wake word engine not compatible. "
+                    "Raspberry Pi ARMv7/ARMv6 detected but wake word engine not compatible. "
                     "Set PRECISE_ENABLED=true or PICOVOICE_ENABLED=true. "
                     "(OpenWakeWord is not recommended for ARMv7)"
                 )
-        elif is_arm64 or is_i386 or is_x86_64:
+        elif is_arm64 or is_i386 or is_x86_64 or is_armv7:
             logger.info("  System: %s - Requires OpenWakeWord or Picovoice", machine.upper())
             if not (config.openwakeword_enabled or config.picovoice_enabled):
                 errors.append(
@@ -632,6 +658,64 @@ def _auto_select_audio_device(want_input: bool) -> int | None:
 
         candidates.sort(key=lambda x: (x[0], x[1]))
         return candidates[0][1]
+    except Exception:
+        return None
+
+
+def _auto_select_physical_input_device(preferred_rate: int | None = None) -> int | None:
+    """Prefer a physical input device (USB/ALSA hw) over virtual PipeWire/Pulse inputs.
+
+    If preferred_rate is provided, prefer devices that can open at that sample rate.
+    """
+    try:
+        import sounddevice as sd
+
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+
+        physical_usb: list[int] = []
+        physical_other: list[int] = []
+        for i, dev in enumerate(devices):
+            if int(dev.get("max_input_channels", 0) or 0) <= 0:
+                continue
+
+            hostapi_idx = int(dev.get("hostapi", -1) or -1)
+            hostapi_name = ""
+            if 0 <= hostapi_idx < len(hostapis):
+                hostapi_name = str(hostapis[hostapi_idx].get("name", ""))
+
+            name = str(dev.get("name", ""))
+            txt = f"{name} {hostapi_name}".lower()
+            if "pipewire" in txt or "pulse" in txt or "pulseaudio" in txt:
+                continue
+
+            if "usb" in txt:
+                physical_usb.append(i)
+            else:
+                physical_other.append(i)
+
+        def _supports_rate(idx: int) -> bool:
+            if preferred_rate is None:
+                return True
+            try:
+                sd.check_input_settings(device=idx, samplerate=int(preferred_rate), channels=1)
+                return True
+            except Exception:
+                return False
+
+        for idx in physical_usb:
+            if _supports_rate(idx):
+                return idx
+        for idx in physical_other:
+            if _supports_rate(idx):
+                return idx
+
+        # Fall back to first physical device even if rate support is unknown.
+        if physical_usb:
+            return physical_usb[0]
+        if physical_other:
+            return physical_other[0]
+        return None
     except Exception:
         return None
 
@@ -1503,8 +1587,9 @@ async def run_orchestrator() -> None:
                         return
 
                     asyncio.create_task(pause_system_media_if_needed("play button"))
+                    continuous_mode = bool(web_service and web_service._ui_control_state.get("continuous_mode", False))
 
-                    if config.wake_word_enabled and wake_state == WakeState.AWAKE:
+                    if config.wake_word_enabled and (not continuous_mode) and wake_state == WakeState.AWAKE:
                         await trigger_sleep("play button")
                     else:
                         await trigger_wake("play button")
@@ -1834,6 +1919,9 @@ async def run_orchestrator() -> None:
                 mic_starts_disabled=config.web_ui_mic_starts_disabled,
                 audio_authority=config.web_ui_audio_authority,
                 chat_history_limit=config.web_ui_chat_history_limit,
+                ssl_certfile=config.web_ui_ssl_certfile,
+                ssl_keyfile=config.web_ui_ssl_keyfile,
+                http_redirect_port=config.web_ui_http_redirect_port,
             )
             await web_service.start()
             web_service.update_orchestrator_status(
@@ -1844,18 +1932,32 @@ async def run_orchestrator() -> None:
                 mic_rms=0.0,
                 queue_depth=0,
             )
+            ui_scheme = "https" if config.web_ui_ssl_certfile and config.web_ui_ssl_keyfile else "http"
+            ws_scheme = "wss" if ui_scheme == "https" else "ws"
             logger.info(
-                "✓ Embedded Voice Web UI ready at http://%s:%d (ws://%s:%d)",
+                "✓ Embedded Voice Web UI ready at %s://%s:%d (%s://%s:%d)",
+                ui_scheme,
                 config.web_ui_host,
                 config.web_ui_port,
+                ws_scheme,
                 config.web_ui_host,
                 config.web_ui_ws_port,
             )
-            print(f"✓ Embedded Voice Web UI ready at http://{config.web_ui_host}:{config.web_ui_port}", flush=True)
+            if config.web_ui_http_redirect_port:
+                logger.info(
+                    "✓ Embedded Voice Web UI HTTP redirector ready at http://%s:%d",
+                    config.web_ui_host,
+                    config.web_ui_http_redirect_port,
+                )
+            print(
+                f"✓ Embedded Voice Web UI ready at {ui_scheme}://{config.web_ui_host}:{config.web_ui_port}",
+                flush=True,
+            )
 
             # Register web UI action handlers
             async def _ui_mic_toggle(client_id: str) -> None:
                 nonlocal wake_state, state, last_wake_detected_ts, last_activity_ts
+                continuous_mode = bool(web_service._ui_control_state.get("continuous_mode", False))
                 cur_mic = web_service._ui_control_state.get("mic_enabled", False)
                 if not cur_mic:
                     web_service.update_ui_control_state(mic_enabled=True)
@@ -1866,7 +1968,7 @@ async def run_orchestrator() -> None:
                     web_service.note_hotword_detected()
                     if config.music_enabled and music_manager:
                         asyncio.create_task(music_manager.pause_if_playing())
-                elif wake_state == WakeState.AWAKE:
+                elif config.wake_word_enabled and (not continuous_mode) and wake_state == WakeState.AWAKE:
                     web_service.update_ui_control_state(mic_enabled=False)
                     wake_state = WakeState.ASLEEP
                     last_wake_detected_ts = None
@@ -1883,6 +1985,35 @@ async def run_orchestrator() -> None:
                     wake_state=wake_state.value, voice_state=state.value,
                     mic_enabled=web_service._ui_control_state.get("mic_enabled", False),
                 )
+
+            async def _ui_tts_mute_set(enabled: bool, client_id: str) -> None:
+                nonlocal tts_playing
+                web_service.update_ui_control_state(tts_muted=bool(enabled))
+                if enabled:
+                    tts_stop_event.set()
+                    tts_playing = False
+
+            async def _ui_browser_audio_set(enabled: bool, client_id: str) -> None:
+                web_service.update_ui_control_state(browser_audio_enabled=bool(enabled))
+
+            async def _ui_continuous_mode_set(enabled: bool, client_id: str) -> None:
+                nonlocal wake_state, state, last_wake_detected_ts, last_activity_ts, wake_sleep_ts
+                on = bool(enabled)
+                web_service.update_ui_control_state(continuous_mode=on)
+                if on:
+                    web_service.update_ui_control_state(mic_enabled=True)
+                    wake_state = WakeState.AWAKE
+                    state = VoiceState.LISTENING
+                    wake_sleep_ts = None
+                    last_wake_detected_ts = time.monotonic()
+                    last_activity_ts = last_wake_detected_ts
+                    if web_service:
+                        web_service.note_hotword_detected()
+                    web_service.update_orchestrator_status(
+                        wake_state=wake_state.value,
+                        voice_state=state.value,
+                        mic_enabled=True,
+                    )
 
             async def _ui_music_toggle(client_id: str) -> None:
                 if music_manager:
@@ -1911,6 +2042,13 @@ async def run_orchestrator() -> None:
                         await timer_manager.cancel_timer(timer_id)
                     except Exception as exc:
                         logger.warning("Web UI timer_cancel id=%s: %s", timer_id, exc)
+
+            async def _ui_alarm_cancel(alarm_id: str, client_id: str) -> None:
+                if alarm_manager:
+                    try:
+                        await alarm_manager.cancel_alarm(alarm_id)
+                    except Exception as exc:
+                        logger.warning("Web UI alarm_cancel id=%s: %s", alarm_id, exc)
 
             async def _ui_chat_new(client_id: str) -> None:
                 nonlocal pending_transcripts, debounce_task, processing_request
@@ -1957,14 +2095,18 @@ async def run_orchestrator() -> None:
                 on_music_stop=_ui_music_stop,
                 on_music_play_track=_ui_music_play_track,
                 on_timer_cancel=_ui_timer_cancel,
+                on_alarm_cancel=_ui_alarm_cancel,
                 on_chat_new=_ui_chat_new,
                 on_chat_text=_ui_chat_text,
+                on_tts_mute_set=_ui_tts_mute_set,
+                on_browser_audio_set=_ui_browser_audio_set,
+                on_continuous_mode_set=_ui_continuous_mode_set,
             )
 
             # Start music + timer state publisher
             async def _web_ui_publisher() -> None:
                 last_music_hash = ""
-                last_timer_hash = ""
+                last_schedule_hash = ""
                 music_poll = config.web_ui_music_poll_ms / 1000.0
                 timer_poll = config.web_ui_timer_poll_ms / 1000.0
                 music_tick = 0.0
@@ -1989,10 +2131,27 @@ async def run_orchestrator() -> None:
                         timer_tick = now
                         try:
                             timers = timer_manager.list_ui_timers()
-                            th = str([(t["id"], round(t["remaining_seconds"])) for t in timers])
-                            if th != last_timer_hash:
-                                last_timer_hash = th
-                                web_service.update_timers_state(timers)
+                            alarms = alarm_manager.list_ui_alarms() if alarm_manager else []
+                            entries = []
+                            for t in timers:
+                                item = dict(t)
+                                item.setdefault("kind", "timer")
+                                entries.append(item)
+                            for a in alarms:
+                                entries.append(dict(a))
+                            entries.sort(key=lambda x: (0 if str(x.get("kind", "timer")).lower() == "alarm" else 1, float(x.get("remaining_seconds", 0.0))))
+                            sh = str([
+                                (
+                                    e.get("kind", "timer"),
+                                    e.get("id"),
+                                    int(round(float(e.get("remaining_seconds", 0.0)))),
+                                    bool(e.get("ringing", False)),
+                                )
+                                for e in entries
+                            ])
+                            if sh != last_schedule_hash:
+                                last_schedule_hash = sh
+                                web_service.update_timers_state(entries)
                         except Exception:
                             pass
 
@@ -2160,6 +2319,11 @@ async def run_orchestrator() -> None:
         nonlocal current_tts_text, current_tts_duration_s, tts_playback_start_ts
         nonlocal tts_playing, current_tts_request_id
         nonlocal cut_in_tts_hold_active, cut_in_tts_hold_started_ts, cut_in_tts_hold_request_id
+
+        text = strip_gateway_control_markers(text).strip()
+        if not text:
+            logger.info("🚫 Filtered gateway control marker-only TTS payload")
+            return
         
         # Filter out NO_REPLY markers (final safeguard)
         if "NO_REPLY" in text or "NO_RE" in text or text.strip() in ["NO", "_RE", "NO _RE"]:
@@ -2596,6 +2760,31 @@ async def run_orchestrator() -> None:
                 )
                 return
 
+            canonical_transcript = canonicalize_transcript_for_match(transcript)
+            if canonical_transcript in {
+                "thank you",
+                "thanks",
+                "thankyou",
+                "thanks you",
+                "thank you very much",
+                "sigh",
+                "sighs",
+                "sighing",
+                "deep sigh",
+                "heavy sigh",
+                "big sigh",
+                "long sigh",
+                "audible sigh",
+                "exhales",
+                "exhale",
+                "hmm",
+            }:
+                logger.warning(
+                    "⊘ Transcript filtered as low-signal noise: '%s'",
+                    transcript[:120],
+                )
+                return
+
             # Guardrail: suppress likely self-echo transcripts captured from speaker
             # output during playback and immediately after playback tails.
             now_ts = time.monotonic()
@@ -2686,6 +2875,10 @@ async def run_orchestrator() -> None:
 
             if item.kind == "reply" and request_id < current_request_id:
                 logger.info("🚫 Dropped stale reply before playback [req#%d < current#%d]", request_id, current_request_id)
+                continue
+
+            if web_service and bool(web_service._ui_control_state.get("tts_muted", False)):
+                logger.info("🔇 TTS muted by UI; skipping playback for req#%d", request_id)
                 continue
 
             while True:
@@ -2782,6 +2975,82 @@ async def run_orchestrator() -> None:
         reconnect_delay_s = 1.0
         reconnect_delay_max_s = 8.0
 
+        def _payload_short_text(value: Any, limit: int = 280) -> str:
+            if value is None:
+                return ""
+            if isinstance(value, str):
+                s = value.strip()
+            else:
+                try:
+                    s = json.dumps(value, ensure_ascii=False)
+                except Exception:
+                    s = str(value)
+            if len(s) > limit:
+                return s[: limit - 1] + "…"
+            return s
+
+        def _extract_structured_event(payload: dict[str, Any], request_id: int) -> tuple[dict[str, Any] | None, dict[str, Any] | None, bool]:
+            event_type = str(payload.get("event") or payload.get("type") or "").strip().lower()
+            phase = str(payload.get("phase") or payload.get("status") or payload.get("event") or payload.get("type") or "update")
+            tool_call_id = payload.get("tool_call_id") or payload.get("toolCallId") or payload.get("call_id") or payload.get("callId")
+            tool_name = payload.get("tool_name") or payload.get("tool") or payload.get("name") or payload.get("function")
+            has_tool_fields = any(
+                k in payload
+                for k in ("tool_call_id", "toolCallId", "tool_name", "tool", "args", "arguments", "result", "partialResult", "output", "stdout", "stderr")
+            )
+            is_tool_event = has_tool_fields or ("tool" in event_type and event_type not in {""})
+            is_reasoning_event = event_type in {"lifecycle", "reasoning", "compaction", "intermediate", "phase"}
+
+            if not is_tool_event and not is_reasoning_event:
+                return None, None, False
+
+            details_json = json.dumps(payload, ensure_ascii=False)
+            req_id = int(request_id)
+
+            if is_tool_event:
+                name = str(tool_name or "tool")
+                step_msg = {
+                    "role": "step",
+                    "text": name,
+                    "name": name,
+                    "phase": phase,
+                    "request_id": req_id,
+                    "tool_call_id": str(tool_call_id or ""),
+                    "details": details_json,
+                    "source": "gateway_stream",
+                }
+                summary_raw = (
+                    payload.get("result")
+                    or payload.get("partialResult")
+                    or payload.get("output")
+                    or payload.get("stdout")
+                    or payload.get("stderr")
+                    or payload.get("message")
+                )
+                summary = _payload_short_text(summary_raw)
+                interim_msg = None
+                if summary:
+                    interim_msg = {
+                        "role": "interim",
+                        "text": name,
+                        "phase": phase,
+                        "request_id": req_id,
+                        "details": json.dumps({"text": summary}, ensure_ascii=False),
+                        "source": "gateway_stream",
+                    }
+                return step_msg, interim_msg, True
+
+            label = str(payload.get("name") or payload.get("phase") or payload.get("event") or payload.get("type") or "lifecycle")
+            interim_msg = {
+                "role": "interim",
+                "text": label,
+                "phase": phase,
+                "request_id": req_id,
+                "details": details_json,
+                "source": "gateway_stream",
+            }
+            return None, interim_msg, True
+
         def should_emit_fast_start_chunk(text: str) -> bool:
             """Avoid early TTS kickoff at awkward clause boundaries (e.g., ending with 'so')."""
             s = text.strip()
@@ -2818,7 +3087,7 @@ async def run_orchestrator() -> None:
                 return
             
             # Filter out NO_REPLY markers
-            text_to_send = buffer.strip()
+            text_to_send = strip_gateway_control_markers(buffer).strip()
             if "NO_REPLY" in text_to_send or "NO_RE" in text_to_send or text_to_send in ["NO", "_RE", "NO _RE"]:
                 logger.info("🚫 Filtered NO_REPLY from flush: '%s'", text_to_send)
                 buffer = ""
@@ -2848,7 +3117,24 @@ async def run_orchestrator() -> None:
                         if flush_task and not flush_task.done():
                             flush_task.cancel()
 
-                    text = extract_text_from_gateway_message(message)
+                    payload_obj: dict[str, Any] | None = None
+                    try:
+                        parsed = json.loads(message)
+                        if isinstance(parsed, dict):
+                            payload_obj = parsed
+                    except Exception:
+                        payload_obj = None
+
+                    if payload_obj is not None and web_service:
+                        step_msg, interim_msg, consumed = _extract_structured_event(payload_obj, current_request_id)
+                        if step_msg:
+                            web_service.append_chat_message(step_msg)
+                        if interim_msg:
+                            web_service.append_chat_message(interim_msg)
+                        if consumed:
+                            continue
+
+                    text = strip_gateway_control_markers(extract_text_from_gateway_message(message))
                     if not text:
                         continue
 
@@ -2913,8 +3199,9 @@ async def run_orchestrator() -> None:
 
                     match = re.search(r"(.+?[.!?])\s*$", buffer)
                     if match:
-                        sentence = match.group(1).strip()
-                        buffer = buffer[len(sentence):].strip()
+                        raw_sentence = match.group(1)
+                        sentence = strip_gateway_control_markers(raw_sentence).strip()
+                        buffer = buffer[len(raw_sentence):].strip()
                         
                         # Filter out NO_REPLY markers and other special tokens
                         if "NO_REPLY" in sentence or "NO_RE" in sentence or sentence.strip() in ["NO", "_RE", "NO _RE"]:
@@ -2954,6 +3241,55 @@ async def run_orchestrator() -> None:
             await asyncio.sleep(reconnect_delay_s)
             reconnect_delay_s = min(reconnect_delay_max_s, reconnect_delay_s * 2.0)
 
+    async def gateway_steps_listener() -> None:
+        nonlocal current_request_id
+        reconnect_delay_s = 1.0
+        reconnect_delay_max_s = 8.0
+        while True:
+            try:
+                async for step in gateway.listen_steps():
+                    reconnect_delay_s = 1.0
+                    if not isinstance(step, dict) or not web_service:
+                        continue
+
+                    name = str(step.get("name") or "event").strip() or "event"
+                    phase = str(step.get("phase") or "update").strip() or "update"
+                    details = step.get("details")
+                    tool_call_id = str(step.get("toolCallId") or step.get("tool_call_id") or "").strip()
+
+                    details_text = details if isinstance(details, str) else json.dumps(details, ensure_ascii=False)
+                    if name.lower() in {"lifecycle", "compaction", "reasoning"}:
+                        web_service.append_chat_message(
+                            {
+                                "role": "interim",
+                                "text": name,
+                                "phase": phase,
+                                "request_id": current_request_id,
+                                "details": details_text,
+                                "source": "gateway_stream",
+                            }
+                        )
+                    else:
+                        web_service.append_chat_message(
+                            {
+                                "role": "step",
+                                "text": name,
+                                "name": name,
+                                "phase": phase,
+                                "request_id": current_request_id,
+                                "tool_call_id": tool_call_id,
+                                "details": details_text,
+                                "source": "gateway_stream",
+                            }
+                        )
+            except (ConnectionRefusedError, OSError) as exc:
+                logger.warning("Gateway step listener unavailable (%s); retrying in %.1fs", exc, reconnect_delay_s)
+            except Exception as exc:
+                logger.error("Gateway step listener error: %s (retrying in %.1fs)", exc, reconnect_delay_s)
+
+            await asyncio.sleep(reconnect_delay_s)
+            reconnect_delay_s = min(reconnect_delay_max_s, reconnect_delay_s * 2.0)
+
     print("🎤 Audio capture starting. Press Ctrl+C to stop.", flush=True)
     logger.info("🎤 Audio capture starting. Press Ctrl+C to stop.")
     try:
@@ -2987,6 +3323,8 @@ async def run_orchestrator() -> None:
     # Start gateway listener if supported
     if getattr(gateway, "supports_listen", False):
         asyncio.create_task(gateway_listener())
+        if hasattr(gateway, "listen_steps"):
+            asyncio.create_task(gateway_steps_listener())
     
     # Start tool monitor for timers/alarms if enabled
     if timers_feature_enabled and tool_router and alert_gen:
@@ -3060,7 +3398,11 @@ async def run_orchestrator() -> None:
     mic_level_count = 0
     swoosh_played = False
     last_nonzero_mic_ts = time.monotonic()
+    last_nonzero_sample_ts = time.monotonic()
     mic_silence_restart_s = 0.0
+    hard_zero_restart_s = 6.0
+    hard_zero_restarts = 0
+    hard_zero_rebind_attempted = False
     mic_level_threshold = 0.001
     last_tts_speech_log_ts = 0.0
     tts_speech_log_interval = 1.0
@@ -3126,10 +3468,23 @@ async def run_orchestrator() -> None:
     try:
         local_capture_paused_for_browser = False
         local_capture_prev_muted = False
+        browser_no_audio_logged = False
         while True:
             now = time.monotonic()  # Always advance time, even when no audio frame arrives
 
-            use_browser_audio = bool(web_service and web_service.has_active_client())
+            browser_connected = bool(web_service and web_service.has_active_client())
+            browser_audio_enabled = bool(web_service and web_service._ui_control_state.get("browser_audio_enabled", True))
+            continuous_mode = bool(web_service and web_service._ui_control_state.get("continuous_mode", False))
+            browser_audio_ready = bool(web_service and web_service.has_recent_browser_audio(max_age_s=1.2))
+            audio_authority = str(getattr(config, "web_ui_audio_authority", "native") or "native").lower()
+            if not browser_audio_enabled:
+                use_browser_audio = False
+            elif audio_authority == "browser":
+                use_browser_audio = browser_connected and browser_audio_ready
+            elif audio_authority == "hybrid":
+                use_browser_audio = browser_connected and browser_audio_ready
+            else:  # native (default)
+                use_browser_audio = False
             if use_browser_audio:
                 if not local_capture_paused_for_browser and hasattr(capture, "is_muted") and hasattr(capture, "set_muted"):
                     local_capture_prev_muted = bool(capture.is_muted())
@@ -3138,6 +3493,11 @@ async def run_orchestrator() -> None:
                     logger.info("🌐 Browser client connected: pausing local mic stream")
                 frame = await web_service.read_browser_frame(timeout=1.0)
             else:
+                if browser_connected and not browser_audio_ready and not browser_no_audio_logged:
+                    logger.info("🌐 Browser client connected but no PCM frames yet; continuing to use local mic")
+                    browser_no_audio_logged = True
+                elif (not browser_connected or browser_audio_ready) and browser_no_audio_logged:
+                    browser_no_audio_logged = False
                 if local_capture_paused_for_browser and hasattr(capture, "set_muted"):
                     capture.set_muted(local_capture_prev_muted)
                     local_capture_paused_for_browser = False
@@ -3352,9 +3712,74 @@ async def run_orchestrator() -> None:
             try:
                 raw_samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32)
                 if raw_samples.size:
+                    if np.any(raw_samples != 0.0):
+                        last_nonzero_sample_ts = now
                     rms_raw = float(np.sqrt(np.mean(raw_samples ** 2)) / 32768.0)
             except Exception:  # pragma: no cover
                 rms_raw = 0.0
+
+            # Recovery for stale/invalid capture handles that return digital silence forever
+            # (common after USB replug or PipeWire source churn): restart, then rebind once.
+            if (
+                not use_browser_audio
+                and not tts_playing
+                and (now - last_nonzero_sample_ts) >= hard_zero_restart_s
+            ):
+                logger.warning("Mic frames all-zero for %.1fs → restarting capture", hard_zero_restart_s)
+                try:
+                    capture.restart()
+                    hard_zero_restarts += 1
+                except Exception as exc:  # pragma: no cover
+                    logger.warning("Audio capture restart (all-zero recovery) failed: %s", exc)
+                last_nonzero_sample_ts = now
+
+                if (
+                    hard_zero_restarts >= 2
+                    and not hard_zero_rebind_attempted
+                    and config.audio_backend != "portaudio-duplex"
+                ):
+                    configured_capture = str(config.audio_capture_device).strip().lower()
+                    stay_pipewire_shared = configured_capture in {"pipewire", "default"}
+                    if stay_pipewire_shared:
+                        hard_zero_rebind_attempted = True
+                        logger.warning(
+                            "Mic still all-zero after restarts, but capture device is '%s' → keeping PipeWire shared mode (no direct ALSA rebind)",
+                            config.audio_capture_device,
+                        )
+                        continue
+
+                    hard_zero_rebind_attempted = True
+                    auto_cap_idx = _auto_select_physical_input_device(preferred_rate=config.audio_sample_rate)
+                    if auto_cap_idx is None:
+                        auto_cap_idx = _auto_select_audio_device(want_input=True)
+                    if auto_cap_idx is not None:
+                        logger.warning(
+                            "Mic still all-zero after restarts → rebinding capture to auto-selected input %s",
+                            _describe_device(auto_cap_idx),
+                        )
+                        try:
+                            candidate_capture = AudioCapture(
+                                sample_rate=config.audio_sample_rate,
+                                frame_samples=frame_samples,
+                                device=auto_cap_idx,
+                                input_gain=config.audio_input_gain,
+                            )
+                            candidate_capture.start()
+                        except Exception as exc:
+                            logger.warning(
+                                "Auto-rebind candidate failed (%s): %s; keeping existing capture",
+                                _describe_device(auto_cap_idx),
+                                exc,
+                            )
+                        else:
+                            try:
+                                capture.stop()
+                            except Exception:
+                                pass
+                            capture = candidate_capture
+                            hard_zero_restarts = 0
+                            last_nonzero_sample_ts = now
+                            logger.warning("Capture rebind recovery succeeded; monitoring mic levels")
 
             if aec and tts_playing and last_playback_frame:
                 try:
@@ -3390,7 +3815,7 @@ async def run_orchestrator() -> None:
             # We use RMS baseline tracking for echo rejection instead
             ring_buffer.add_frame(frame)
 
-            if config.wake_word_enabled and wake_state == WakeState.ASLEEP:
+            if config.wake_word_enabled and (not continuous_mode) and wake_state == WakeState.ASLEEP:
                 # While sleeping during music playback, use voice cut-in only to duck
                 # volume briefly so the hotword can be heard more reliably.
                 if (
@@ -3844,7 +4269,7 @@ async def run_orchestrator() -> None:
                     last_speech_ts = None
                     cut_in_triggered_ts = None
 
-            if config.wake_word_enabled and wake_state == WakeState.AWAKE:
+            if config.wake_word_enabled and (not continuous_mode) and wake_state == WakeState.AWAKE:
                 if last_wake_detected_ts is None:
                     wake_state = WakeState.ASLEEP
                     wake_sleep_ts = now
@@ -3866,6 +4291,13 @@ async def run_orchestrator() -> None:
                         wake_state = WakeState.ASLEEP
                         wake_sleep_ts = now
                         last_wake_detected_ts = None
+                        if web_service and web_service._ui_control_state.get("mic_enabled", False):
+                            web_service.update_ui_control_state(mic_enabled=False)
+                            web_service.update_orchestrator_status(
+                                wake_state=wake_state.value,
+                                voice_state=state.value,
+                                mic_enabled=False,
+                            )
                         # Reset wake detector state to prevent immediate re-detection
                         if wake_detector and hasattr(wake_detector, 'reset_state'):
                             wake_detector.reset_state()

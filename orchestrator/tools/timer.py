@@ -56,16 +56,16 @@ class Timer:
         """Check if timer has expired."""
         return time.time() >= self.expires_at
 
-        def to_ui_dict(self, now_ts: float | None = None) -> dict:
-            """Return lightweight dict for web UI serialization."""
-            ts = now_ts if now_ts is not None else time.time()
-            return {
-                "id": self.id,
-                "label": self.label,
-                "remaining_seconds": max(0.0, self.expires_at - ts),
-                "expires_at": self.expires_at,
-                "duration_seconds": self.duration_seconds,
-            }
+    def to_ui_dict(self, now_ts: float | None = None) -> dict:
+        """Return lightweight dict for web UI serialization."""
+        ts = now_ts if now_ts is not None else time.time()
+        return {
+            "id": self.id,
+            "label": self.label,
+            "remaining_seconds": max(0.0, self.expires_at - ts),
+            "expires_at": self.expires_at,
+            "duration_seconds": self.duration_seconds,
+        }
 
 
 class TimerManager:
@@ -210,11 +210,12 @@ class TimerManager:
     def list_active_timers(self) -> List[Timer]:
         """Get list of all active timers."""
         return list(self.active_timers.values())
-    
-        def list_ui_timers(self, now_ts: float | None = None) -> list:
-            """Return active timers as UI-ready dicts."""
-            now = now_ts if now_ts is not None else time.time()
-            return [t.to_ui_dict(now) for t in self.active_timers.values()]
+
+    def list_ui_timers(self, now_ts: float | None = None) -> list:
+        """Return active timers as UI-ready dicts."""
+        now = now_ts if now_ts is not None else time.time()
+        return [t.to_ui_dict(now) for t in self.active_timers.values()]
+
     async def load_from_disk(self):
         """Load timers from disk on startup."""
         timer_data_list = await self.state_manager.load_timers()

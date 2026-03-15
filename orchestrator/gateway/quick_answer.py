@@ -118,6 +118,44 @@ def build_system_prompt(current_datetime: str, timers_enabled: bool, music_enabl
     )
 
 
+# Per-message character caps for history injection.
+# Assistant responses are capped tighter because gateway replies can be very long.
+_HISTORY_MAX_TURNS = 10
+_HISTORY_USER_CHAR_LIMIT = 300
+_HISTORY_ASSISTANT_CHAR_LIMIT = 150
+
+
+def build_history_messages(
+    chat_history: list[dict],
+    *,
+    max_turns: int = _HISTORY_MAX_TURNS,
+    user_char_limit: int = _HISTORY_USER_CHAR_LIMIT,
+    assistant_char_limit: int = _HISTORY_ASSISTANT_CHAR_LIMIT,
+) -> list[dict[str, str]]:
+    """Build a trimmed OpenAI-format message list from web service chat history.
+
+    Only includes final user/assistant turns; skips steps, partials, and empty
+    entries.  Each message is hard-truncated so history stays compact — assistant
+    responses especially can be very verbose.
+    """
+    filtered = [
+        m for m in chat_history
+        if m.get("role") in ("user", "assistant")
+        and m.get("segment_kind", "final") == "final"
+        and m.get("text", "").strip()
+    ]
+    recent = filtered[-max_turns:]
+    result: list[dict[str, str]] = []
+    for m in recent:
+        role = m["role"]
+        text = m.get("text", "").strip()
+        limit = user_char_limit if role == "user" else assistant_char_limit
+        if len(text) > limit:
+            text = text[:limit].rstrip() + "\u2026"
+        result.append({"role": role, "content": text})
+    return result
+
+
 UPSTREAM_ONLY_PATTERNS = [
     r"\b(email|emails|inbox|mailbox|gmail|outlook)\b",
     r"\b(notification|notifications|message|messages|text|texts|voicemail|voicemails)\b",
@@ -149,26 +187,64 @@ ACTION_INTENT_PATTERNS = [
     r"\b(open|go to|navigate to|visit)\b\s+([\w-]+\.)+[a-z]{2,}\b",
 ]
 
+TIMER_ALARM_INTENT_PATTERNS = [
+    r"\b(timer|timers|alarm|alarms|countdown)\b",
+    r"\b(set|add|create|start|cancel|stop|list|show|delete|remove)\b.*\b(timer|alarm)\b",
+    r"\b(in\s+\d+\s*(seconds?|minutes?|hours?))\b",
+]
 
-def should_force_upstream(user_query: str) -> bool:
-    """Return True for queries that should bypass quick answer and go upstream."""
+MUSIC_INTENT_PATTERNS = [
+    r"\b(music|song|songs|track|tracks|playlist|album|artist)\b",
+    r"\b(play|pause|resume|skip|next|previous|stop)\b.*\b(music|song|track|playlist)\b",
+]
+
+
+def classify_upstream_decision(
+    user_query: str,
+    *,
+    timers_enabled: bool = False,
+    music_enabled: bool = False,
+) -> tuple[bool, str]:
+    """Classify whether a query should bypass quick answer and why."""
     query = user_query.strip().lower()
     if not query:
-        return True
+        return True, "empty_query"
 
     if any(re.search(pattern, query) for pattern in UPSTREAM_ONLY_PATTERNS):
-        return True
+        return True, "context_or_account_specific"
 
     if any(re.search(pattern, query) for pattern in WEB_LOOKUP_PATTERNS):
-        return True
+        return True, "web_lookup"
 
     if any(re.search(pattern, query) for pattern in TIME_SENSITIVE_PATTERNS):
-        return True
+        return True, "time_sensitive"
+
+    # If timers/alarms or music tooling is available, keep those intents local.
+    if timers_enabled and any(re.search(pattern, query) for pattern in TIMER_ALARM_INTENT_PATTERNS):
+        return False, "timer_alarm_local"
+
+    if music_enabled and any(re.search(pattern, query) for pattern in MUSIC_INTENT_PATTERNS):
+        return False, "music_local"
 
     if any(re.search(pattern, query) for pattern in ACTION_INTENT_PATTERNS):
-        return True
+        return True, "action_intent"
 
-    return False
+    return False, "quick_answer_allowed"
+
+
+def should_force_upstream(
+    user_query: str,
+    *,
+    timers_enabled: bool = False,
+    music_enabled: bool = False,
+) -> bool:
+    """Return True for queries that should bypass quick answer and go upstream."""
+    decision, _reason = classify_upstream_decision(
+        user_query,
+        timers_enabled=timers_enabled,
+        music_enabled=music_enabled,
+    )
+    return decision
 
 
 TIMER_TOOL_DEFINITIONS = [
@@ -565,30 +641,43 @@ class QuickAnswerClient:
         self.timers_enabled = bool(timers_enabled and tool_router is not None)
         self.music_enabled = bool(music_enabled and music_router is not None)
         self.tool_definitions = build_tool_definitions(self.timers_enabled, self.music_enabled)
+        self._last_tool_steps: list[dict[str, str]] = []
 
     def has_tool_capabilities(self) -> bool:
         """Whether any tool family is enabled for quick-answer routing."""
         return bool(self.tool_definitions)
+
+    def pop_last_tool_steps(self) -> list[dict[str, str]]:
+        """Return and clear tool-call steps from the most recent quick-answer run."""
+        steps = list(self._last_tool_steps)
+        self._last_tool_steps.clear()
+        return steps
         
-    async def get_quick_answer(self, user_query: str) -> tuple[bool, str]:
+    async def get_quick_answer(self, user_query: str, *, chat_history: list[dict] | None = None) -> tuple[bool, str]:
         """
         Try to get a quick answer from the LLM.
         
         Args:
             user_query: The user's transcript/question
+            chat_history: Optional recent chat messages from the web service for context.
+                          Up to the last 10 user/assistant turns are included, each
+                          hard-truncated (user ≤300 chars, assistant ≤150 chars).
             
         Returns:
             Tuple of (should_use_upstream, response_text)
             - If should_use_upstream is True, response_text will be empty and gateway should be used
             - If should_use_upstream is False, response_text contains the quick answer
         """
-        if should_force_upstream(user_query):
-            logger.info("← QUICK ANSWER: Heuristic escalation to upstream for context/account-specific query")
+        should_use_upstream, reason = classify_upstream_decision(user_query)
+        if should_use_upstream:
+            logger.info("← QUICK ANSWER: Heuristic escalation to upstream (%s)", reason)
             return True, ""
 
         try:
             current_datetime = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
             system_prompt = build_system_prompt(current_datetime, False, False)
+
+            history_msgs = build_history_messages(chat_history) if chat_history else []
             
             headers = {"Content-Type": "application/json"}
             if self.api_key:
@@ -598,7 +687,8 @@ class QuickAnswerClient:
                 "model": self.model,
                 "messages": [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_query}
+                    *history_msgs,
+                    {"role": "user", "content": user_query},
                 ],
                 "temperature": 0.0,  # Deterministic for factual answers
                 "max_tokens": 100,  # Keep responses brief
@@ -651,7 +741,7 @@ class QuickAnswerClient:
             logger.error("Quick answer LLM failed: %s", exc)
             return True, ""  # Fall back to upstream
 
-    async def get_quick_answer_with_tools(self, user_query: str) -> tuple[bool, str]:
+    async def get_quick_answer_with_tools(self, user_query: str, *, chat_history: list[dict] | None = None) -> tuple[bool, str]:
         """
         Try to get a quick answer with tool calling support.
         
@@ -661,15 +751,25 @@ class QuickAnswerClient:
         
         Args:
             user_query: The user's transcript/question
+            chat_history: Optional recent chat messages from the web service for context.
+                          Up to the last 10 user/assistant turns are included, each
+                          hard-truncated (user ≤300 chars, assistant ≤150 chars).
             
         Returns:
             Tuple of (should_use_upstream, response_text)
             - If should_use_upstream is True, response_text will be empty and gateway should be used
             - If should_use_upstream is False, response_text contains the quick answer
         """
-        if should_force_upstream(user_query):
-            logger.info("← QUICK ANSWER: Heuristic escalation to upstream for context/account-specific query")
+        should_use_upstream, reason = classify_upstream_decision(
+            user_query,
+            timers_enabled=self.timers_enabled,
+            music_enabled=self.music_enabled,
+        )
+        if should_use_upstream:
+            logger.info("← QUICK ANSWER: Heuristic escalation to upstream (%s)", reason)
             return True, ""
+        if reason in ("timer_alarm_local", "music_local"):
+            logger.info("← QUICK ANSWER: Keeping request local via heuristic (%s)", reason)
 
         # Try music fast-path first if enabled
         if self.music_enabled and self.music_router:
@@ -687,14 +787,17 @@ class QuickAnswerClient:
         
         # If neither system is enabled, fall back to regular quick answer
         if not self.has_tool_capabilities():
-            return await self.get_quick_answer(user_query)
+            return await self.get_quick_answer(user_query, chat_history=chat_history)
         
         # Fast-path didn't match, try LLM with tool calling
         try:
+            self._last_tool_steps.clear()
             current_datetime = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
             system_prompt = build_system_prompt(current_datetime, self.timers_enabled, self.music_enabled)
             music_like_query = bool(self.music_enabled and self.music_router and self.music_router.is_music_related(user_query))
-            
+
+            history_msgs = build_history_messages(chat_history) if chat_history else []
+
             headers = {"Content-Type": "application/json"}
             if self.api_key:
                 headers["Authorization"] = f"Bearer {self.api_key}"
@@ -703,7 +806,8 @@ class QuickAnswerClient:
                 "model": self.model,
                 "messages": [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_query}
+                    *history_msgs,
+                    {"role": "user", "content": user_query},
                 ],
                 "temperature": 0.0,
                 "max_tokens": 150,
@@ -748,6 +852,14 @@ class QuickAnswerClient:
                     
                     if func_name:
                         logger.info("← QUICK ANSWER: LLM requested tool call: %s", func_name)
+                        args_preview = _preview(func_args, 220)
+                        self._last_tool_steps.append(
+                            {
+                                "name": str(func_name),
+                                "phase": "start",
+                                "details": f"args={args_preview}",
+                            }
+                        )
                         try:
                             import json
                             args_dict = json.loads(func_args) if isinstance(func_args, str) else func_args
@@ -811,10 +923,25 @@ class QuickAnswerClient:
                             else:
                                 result = f"Tool handler not available for {func_name}"
                             
-                            results.append(sanitize_quick_answer_text(result))
+                            spoken_result = sanitize_quick_answer_text(result)
+                            results.append(spoken_result)
+                            self._last_tool_steps.append(
+                                {
+                                    "name": str(func_name),
+                                    "phase": "end",
+                                    "details": f"result={_preview(spoken_result, 220)}",
+                                }
+                            )
                         except Exception as e:
                             logger.error("Tool execution failed for %s: %s", func_name, e)
                             results.append(f"Error: {str(e)}")
+                            self._last_tool_steps.append(
+                                {
+                                    "name": str(func_name),
+                                    "phase": "end",
+                                    "details": f"error={_preview(e, 220)}",
+                                }
+                            )
                 
                 # Return the tool execution result(s)
                 final_result = " ".join(results) if results else "Tool execution completed"

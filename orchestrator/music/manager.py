@@ -693,53 +693,53 @@ class MusicManager:
         """Decrease volume by specified amount."""
         return await self.volume_down(amount)
 
-        # ========== Web UI Helpers ==========
+    # ========== Web UI Helpers ==========
 
-        async def get_ui_music_state(self) -> dict:
-            """Return compact music state dict for web UI snapshot/delta events."""
-            try:
-                status = await self.get_status()
-                track = await self.get_current_track()
-                vol_raw = status.get("volume")
-                return {
-                    "state": status.get("state", "stop"),
-                    "elapsed": float(status.get("elapsed", 0) or 0),
-                    "duration": float(status.get("duration", status.get("time", "0").split(":")[0] if "time" in status else 0) or 0),
-                    "queue_length": int(status.get("playlistlength", 0) or 0),
-                    "position": int(status.get("song", -1) or -1),
-                    "volume": int(vol_raw) if vol_raw is not None else None,
-                    "title": track.get("Title", ""),
-                    "artist": track.get("Artist", ""),
-                    "album": track.get("Album", ""),
-                    "file": track.get("file", ""),
-                    "random": status.get("random", "0") == "1",
-                    "repeat": status.get("repeat", "0") == "1",
-                }
-            except Exception as e:
-                logger.error(f"Failed to get UI music state: {e}")
-                return {"state": "error", "queue_length": 0}
+    async def get_ui_music_state(self) -> dict:
+        """Return compact music state dict for web UI snapshot/delta events."""
+        try:
+            status = await self.get_status()
+            track = await self.get_current_track()
+            vol_raw = status.get("volume")
+            return {
+                "state": status.get("state", "stop"),
+                "elapsed": float(status.get("elapsed", 0) or 0),
+                "duration": float(status.get("duration", status.get("time", "0").split(":")[0] if "time" in status else 0) or 0),
+                "queue_length": int(status.get("playlistlength", 0) or 0),
+                "position": int(status.get("song", -1) or -1),
+                "volume": int(vol_raw) if vol_raw is not None else None,
+                "title": track.get("title") or track.get("Title", ""),
+                "artist": track.get("artist") or track.get("Artist", ""),
+                "album": track.get("album") or track.get("Album", ""),
+                "file": track.get("file", ""),
+                "random": status.get("random", "0") == "1",
+                "repeat": status.get("repeat", "0") == "1",
+            }
+        except Exception as e:
+            logger.error(f"Failed to get UI music state: {e}")
+            return {"state": "error", "queue_length": 0}
 
-        async def get_ui_playlist(self, limit: int = 200) -> list:
-            """Return a compact queue list for the web UI music page."""
-            try:
-                queue = await self.get_queue()
-                result = []
-                for i, item in enumerate(queue[:limit]):
-                    raw_dur = item.get("duration") or item.get("Time") or 0
-                    try:
-                        dur = float(raw_dur)
-                    except (TypeError, ValueError):
-                        dur = 0.0
-                    result.append({
-                        "pos": int(item.get("Pos", i) or i),
-                        "id": item.get("Id", ""),
-                        "title": item.get("Title") or item.get("file", "").split("/")[-1],
-                        "artist": item.get("Artist", ""),
-                        "album": item.get("Album", ""),
-                        "file": item.get("file", ""),
-                        "duration": dur,
-                    })
-                return result
-            except Exception as e:
-                logger.error(f"Failed to get UI playlist: {e}")
-                return []
+    async def get_ui_playlist(self, limit: int = 200) -> list:
+        """Return a compact queue list for the web UI music page."""
+        try:
+            queue = await self.get_queue()
+            result = []
+            for i, item in enumerate(queue[:limit]):
+                raw_dur = item.get("duration") or item.get("time") or item.get("Time") or 0
+                try:
+                    dur = float(raw_dur)
+                except (TypeError, ValueError):
+                    dur = 0.0
+                result.append({
+                    "pos": int(item.get("pos", item.get("Pos", i)) or i),
+                    "id": item.get("id", item.get("Id", "")),
+                    "title": item.get("title") or item.get("Title") or item.get("file", "").split("/")[-1],
+                    "artist": item.get("artist") or item.get("Artist", ""),
+                    "album": item.get("album") or item.get("Album", ""),
+                    "file": item.get("file", ""),
+                    "duration": dur,
+                })
+            return result
+        except Exception as e:
+            logger.error(f"Failed to get UI playlist: {e}")
+            return []

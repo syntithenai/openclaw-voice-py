@@ -3,6 +3,7 @@ import base64
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
@@ -48,6 +49,10 @@ class BaseGateway:
     async def listen(self) -> AsyncIterator[str]:
         if False:
             yield ""
+
+    async def listen_steps(self) -> AsyncIterator[dict]:
+        if False:
+            yield {}
         return
 
 
@@ -188,6 +193,7 @@ class OpenClawGateway(BaseGateway):
         self._ws: Optional[Any] = None
         self._pending_requests: dict[str, asyncio.Future] = {}
         self._incoming_texts: asyncio.Queue[str] = asyncio.Queue()
+        self._step_events: asyncio.Queue[dict] = asyncio.Queue()
         self._connection_lock = asyncio.Lock()
         self._reader_task: Optional[asyncio.Task] = None
         self._hello_ok = False
@@ -196,6 +202,46 @@ class OpenClawGateway(BaseGateway):
         self._identity_path = Path.home() / ".openclaw" / "identity" / "device.json"
         self._device_identity_cache: Optional[dict[str, str]] = None
         self._last_streamed_text: str = ""  # Track last text for delta extraction
+        self._raw_dump_path = Path("/tmp/openclaw_gateway_stream.jsonl")
+
+    def _dump_raw_frame(self, raw_message: str, *, parsed: Any = None, note: str = "") -> None:
+        """Persist raw websocket frames for debugging gateway stream semantics."""
+        entry: dict[str, Any] = {
+            "ts": time.time(),
+            "session_key": self._current_session_key,
+            "note": note,
+            "raw": raw_message,
+        }
+        if parsed is not None:
+            entry["parsed"] = parsed
+        try:
+            self._raw_dump_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._raw_dump_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            logger.debug("Failed to write OpenClaw raw frame dump: %s", exc)
+
+    @staticmethod
+    def _strip_heartbeat_markers(text: str) -> str:
+        cleaned = re.sub(r"(?i)HEARTBEAT\s*[_ ]?OK(?:\s*NO\s*[_ ]?REPLY)?", " ", text)
+        cleaned = re.sub(r"(?i)\bNO\s*[_ ]?REPLY\b", " ", cleaned)
+        cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned)
+        return cleaned
+
+    async def _emit_step_event(self, name: str, phase: str, tool_call_id: str, details_obj: Any) -> None:
+        try:
+            details_text = details_obj if isinstance(details_obj, str) else json.dumps(details_obj, ensure_ascii=False)
+        except Exception:
+            details_text = str(details_obj)
+        await self._step_events.put(
+            {
+                "name": str(name),
+                "phase": str(phase or "update"),
+                "toolCallId": str(tool_call_id or ""),
+                "details": details_text,
+            }
+        )
 
     def _ws_is_open(self) -> bool:
         """Version-tolerant check for websocket connection state."""
@@ -454,7 +500,7 @@ class OpenClawGateway(BaseGateway):
                         "platform": "python",
                         "mode": client_mode,
                     },
-                    "caps": [],
+                    "caps": ["tool-events"],
                     "role": role,
                     "scopes": scopes,
                     "auth": {"token": self.token},
@@ -490,8 +536,11 @@ class OpenClawGateway(BaseGateway):
                     try:
                         data = json.loads(message)
                     except json.JSONDecodeError:
+                        self._dump_raw_frame(message, note="json_decode_error")
                         logger.debug("Failed to parse WebSocket message: %s", message[:100])
                         continue
+
+                    self._dump_raw_frame(message, parsed=data)
                     
                     if not isinstance(data, dict):
                         continue
@@ -515,6 +564,112 @@ class OpenClawGateway(BaseGateway):
                                 self._connect_nonce = nonce.strip()
                                 self._connect_nonce_event.set()
                             continue
+
+                        # Handle agent stream events (tool calls, lifecycle).
+                        if event_name == "agent":
+                            agent_stream = payload.get("stream")
+                            if agent_stream == "tool":
+                                step_data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+                                if not isinstance(step_data, dict):
+                                    step_data = {}
+                                name = (
+                                    step_data.get("name")
+                                    or step_data.get("tool")
+                                    or step_data.get("toolName")
+                                    or step_data.get("tool_name")
+                                    or ""
+                                )
+                                raw_phase = (
+                                    step_data.get("phase")
+                                    or step_data.get("status")
+                                    or step_data.get("state")
+                                    or step_data.get("event")
+                                    or ""
+                                )
+                                phase_text = str(raw_phase).strip().lower()
+                                if phase_text in {"start", "begin", "started", "call_start", "running"}:
+                                    phase = "start"
+                                elif phase_text in {"end", "ended", "finish", "finished", "done", "complete", "completed", "success", "final"}:
+                                    phase = "end"
+                                else:
+                                    phase = phase_text or "update"
+
+                                tool_call_id = (
+                                    step_data.get("toolCallId")
+                                    or step_data.get("tool_call_id")
+                                    or step_data.get("callId")
+                                    or ""
+                                )
+                                if name:
+                                    details_obj = {
+                                        k: v
+                                        for k, v in step_data.items()
+                                        if k not in {"name", "tool", "toolName", "tool_name", "phase", "status", "state", "event"}
+                                    }
+                                    await self._emit_step_event(str(name), str(phase), str(tool_call_id), details_obj)
+                                    logger.debug(
+                                        "← OpenClaw tool[%s] phase=%s id=%s",
+                                        name,
+                                        phase,
+                                        str(tool_call_id)[:8] if tool_call_id else "",
+                                    )
+                                continue
+
+                            if agent_stream in {"lifecycle", "compaction", "reasoning"}:
+                                step_data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+                                if not isinstance(step_data, dict):
+                                    step_data = {}
+                                phase = str(step_data.get("phase") or "update").strip().lower() or "update"
+                                await self._emit_step_event(str(agent_stream), phase, "", step_data)
+                                continue
+
+                            if agent_stream == "assistant":
+                                step_data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+                                if isinstance(step_data, dict):
+                                    reasoning_text = (
+                                        step_data.get("reasoning")
+                                        or step_data.get("thinking")
+                                        or step_data.get("analysis")
+                                        or step_data.get("thought")
+                                        or ""
+                                    )
+                                    if isinstance(reasoning_text, str) and reasoning_text.strip():
+                                        await self._emit_step_event("reasoning", "interim", "", reasoning_text.strip())
+
+                            # Some agent frames carry message-style tool calls/results rather than stream=tool.
+                            data_obj = payload.get("data")
+                            message_obj = payload.get("message") if isinstance(payload.get("message"), dict) else None
+                            content_items = []
+                            if isinstance(data_obj, dict) and isinstance(data_obj.get("content"), list):
+                                content_items.extend([c for c in data_obj.get("content", []) if isinstance(c, dict)])
+                            if message_obj and isinstance(message_obj.get("content"), list):
+                                content_items.extend([c for c in message_obj.get("content", []) if isinstance(c, dict)])
+
+                            role = ""
+                            if isinstance(data_obj, dict):
+                                role = str(data_obj.get("role") or "")
+                            if not role and message_obj:
+                                role = str(message_obj.get("role") or "")
+
+                            for item in content_items:
+                                item_type = str(item.get("type") or "").strip()
+                                if item_type == "toolCall":
+                                    await self._emit_step_event(
+                                        str(item.get("name") or item.get("toolName") or "tool"),
+                                        "start",
+                                        str(item.get("id") or item.get("toolCallId") or ""),
+                                        item,
+                                    )
+                                elif role == "toolResult" or item_type == "toolResult":
+                                    await self._emit_step_event(
+                                        str((data_obj or {}).get("toolName") or (message_obj or {}).get("toolName") or item.get("toolName") or "tool"),
+                                        "end",
+                                        str((data_obj or {}).get("toolCallId") or (message_obj or {}).get("toolCallId") or item.get("toolCallId") or item.get("id") or ""),
+                                        {
+                                            "message": data_obj if isinstance(data_obj, dict) else message_obj,
+                                            "content": item,
+                                        },
+                                    )
 
                         # Best-effort text extraction for streaming agent responses.
                         text: Optional[str] = None
@@ -542,6 +697,7 @@ class OpenClawGateway(BaseGateway):
                                     cleaned = delta
                                     # Remove markdown bold/italic
                                     cleaned = cleaned.replace("**", "").replace("*", "")
+                                    cleaned = self._strip_heartbeat_markers(cleaned)
                                     # Filter out NO_REPLY markers
                                     if cleaned.lstrip().startswith("NO_RE"):
                                         logger.debug("Filtered NO_REPLY marker from delta")
@@ -556,9 +712,11 @@ class OpenClawGateway(BaseGateway):
                             else:
                                 # New message or reset - queue full text with cleaning
                                 cleaned = full_text.replace("**", "").replace("*", "")
+                                cleaned = self._strip_heartbeat_markers(cleaned)
                                 if not cleaned.startswith("NO_RE"):
-                                    await self._incoming_texts.put(cleaned)
-                                    logger.info("← OpenClaw event[%s]: %s", event_name, cleaned[:80])
+                                    if cleaned.strip():
+                                        await self._incoming_texts.put(cleaned)
+                                        logger.info("← OpenClaw event[%s]: %s", event_name, cleaned[:80])
                                 else:
                                     logger.debug("Filtered NO_REPLY marker from full text")
                                 self._last_streamed_text = full_text
@@ -650,6 +808,16 @@ class OpenClawGateway(BaseGateway):
                     yield text
         except Exception as exc:
             logger.warning("OpenClaw listen error: %s", exc)
+
+    async def listen_steps(self) -> AsyncIterator[dict]:
+        """Listen for tool-call step events from the agent run."""
+        await self._ensure_connected()
+        try:
+            while self._ws and self._ws_is_open():
+                step = await self._step_events.get()
+                yield step
+        except Exception as exc:
+            logger.warning("OpenClaw listen_steps error: %s", exc)
 
 
 class ZeroClawGateway(BaseGateway):

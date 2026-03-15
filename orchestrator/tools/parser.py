@@ -33,7 +33,11 @@ class FastPathParser:
     
     # Timer cancel patterns
     TIMER_CANCEL_PATTERNS = [
-        (r'cancel\s+(?:the\s+)?(\w+)\s+timer', 'cancel_timer_by_label'),
+        # Generic cancel (no label) — place before label extraction so
+        # "cancel the timer" doesn't capture "the" as a label.
+        (r'cancel\s+(?:(?:all|the)\s+)?timers?$', 'cancel_all_timers'),
+        # Label-based cancel: "cancel kitchen timer", "cancel the pasta timer"
+        (r'cancel\s+(?:the\s+)?(?!the\b|a\b|an\b|all\b)(\w+)\s+timer\b', 'cancel_timer_by_label'),
         (r'cancel\s+(?:all\s+)?timers?', 'cancel_all_timers'),
         (r'stop\s+(?:the\s+)?timer', 'cancel_all_timers'),
     ]

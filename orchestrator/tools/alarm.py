@@ -57,6 +57,20 @@ class Alarm:
         """Get time until alarm in seconds."""
         return max(0, self.trigger_time - time.time())
 
+    def to_ui_dict(self, now_ts: float | None = None) -> dict:
+        """Return lightweight dict for web UI serialization."""
+        ts = now_ts if now_ts is not None else time.time()
+        return {
+            "id": self.id,
+            "label": self.label,
+            "kind": "alarm",
+            "remaining_seconds": max(0.0, self.trigger_time - ts),
+            "trigger_time": self.trigger_time,
+            "ringing": bool(self.ringing),
+            "enabled": bool(self.enabled),
+            "triggered": bool(self.triggered),
+        }
+
 
 class AlarmManager:
     """Manages alarms."""
@@ -267,6 +281,15 @@ class AlarmManager:
     def list_ringing_alarms(self) -> List[Alarm]:
         """Get list of currently ringing alarms."""
         return [self.alarms[aid] for aid in self.ringing_alarms if aid in self.alarms]
+
+    def list_ui_alarms(self, now_ts: float | None = None) -> list:
+        """Return alarms as UI-ready dicts (including ringing alarms)."""
+        now = now_ts if now_ts is not None else time.time()
+        return [
+            alarm.to_ui_dict(now)
+            for alarm in self.alarms.values()
+            if alarm.enabled or alarm.ringing
+        ]
     
     async def load_from_disk(self):
         """Load alarms from disk on startup."""

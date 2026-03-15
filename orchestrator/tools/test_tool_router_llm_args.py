@@ -127,6 +127,18 @@ class ToolRouterLlmArgsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.get("data", {}).get("stopped_count"), 1)
 
+    async def test_fast_path_cancel_the_timer_is_not_label_the(self) -> None:
+        """'Cancel the timer' should cancel all timers, not look for label='the'."""
+        created = await self.router.execute_tool(
+            "set_timer",
+            {"duration_seconds": 30, "name": ""},
+        )
+        self.assertTrue(created.get("success"), created)
+
+        result = await self.router.try_deterministic_parse("Cancel the timer.")
+        self.assertIsNotNone(result, "fast-path should have matched 'Cancel the timer.'")
+        self.assertEqual(result.get("data", {}).get("cancelled_count"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,37 @@
+{
+  "prompt": "check my email and tell me unread messages",
+  "captured_at": 1773525560.356231,
+  "error": null,
+  "final": null,
+  "events": [
+    {
+      "name": "read",
+      "phase": "start",
+      "toolCallId": "fc_2da9add6-0859-4665-8803-085ab0f33ee2",
+      "details": "{\"toolCallId\": \"fc_2da9add6-0859-4665-8803-085ab0f33ee2\", \"args\": {\"file_path\": \"~/.openclaw/workspace-voice/skills/google-apis/SKILL.md\"}}",
+      "type": "step_event",
+      "ts": 1773525540.6974096
+    },
+    {
+      "name": "read",
+      "phase": "result",
+      "toolCallId": "fc_2da9add6-0859-4665-8803-085ab0f33ee2",
+      "details": "{\"toolCallId\": \"fc_2da9add6-0859-4665-8803-085ab0f33ee2\", \"meta\": \"from ~/.openclaw/workspace-voice/skills/google-apis/SKILL.md\", \"isError\": false}",
+      "type": "step_event",
+      "ts": 1773525540.6985345
+    },
+    {
+      "name": "exec",
+      "phase": "start",
+      "toolCallId": "fc_0d66bb12-ff15-4d4a-9b5b-c55e34edaa92",
+      "details": "{\"toolCallId\": \"fc_0d66bb12-ff15-4d4a-9b5b-c55e34edaa92\", \"args\": {\"command\": \"gog gmail search 'is:unread in:inbox' --max 1000\"}}",
+      "type": "step_event",
+      "ts": 1773525541.5791671
+    },
+    {
+      "type": "final_response",
+      "text": null,
+      "ts": 1773525541.8791671
+    }
+  ]
+}
