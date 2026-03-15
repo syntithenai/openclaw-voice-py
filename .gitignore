@@ -28,7 +28,7 @@ artifacts/prebuilt-test/precise-engine_0.3.0_armv7l.tar.gz
 artifacts/precise-engine-armv7/precise-engine.tar.gz
 artifacts/precise-engine-armv7/precise-engine.tar.gz.md5
 artifacts/sounds
-timers/
+timers/ 
 orchestrator.log
 
 # SSL certificates (generated locally, never commit private keys)
