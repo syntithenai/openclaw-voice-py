@@ -81,6 +81,64 @@ def test_scroll_down_button_visibility_and_action_contract() -> None:
     assert "const scrollDownBtn = e.target.closest('[data-action=\"chat-scroll-down\"]');" in source
 
 
+def test_music_page_muted_tts_chat_notice_contract() -> None:
+    source = Path("orchestrator/web/realtime_service.py").read_text(encoding="utf-8")
+
+    assert 'id="mutedChatNotice"' in source
+    assert 'id="mutedChatNoticeText"' in source
+    assert "function showMutedChatNoticeForMessage(msg)" in source
+    assert "if(S.page!=='music' || !S.ttsMuted) return;" in source
+    assert "S.mutedChatNoticeTimer=setTimeout" in source
+    assert "if(nextMsg) showMutedChatNoticeForMessage(nextMsg);" in source
+
+
+def test_scroll_up_button_visibility_and_action_contract() -> None:
+    source = Path("orchestrator/web/realtime_service.py").read_text(encoding="utf-8")
+
+    assert 'id="scrollUpWrap"' in source
+    assert 'data-action="chat-scroll-up"' in source
+    assert "function scrollChatToTop()" in source
+    assert "const shouldShowUp=overflow && !atTop && !!S.chatUserScrolledUp;" in source
+    assert "const scrollUpBtn = e.target.closest('[data-action=\"chat-scroll-up\"]');" in source
+
+
+def test_chat_history_sort_order_and_live_filter_contract() -> None:
+    source = Path("orchestrator/web/realtime_service.py").read_text(encoding="utf-8")
+
+    assert "function sortChatThreadsBySavedOrder(threads)" in source
+    assert "return bCreated-aCreated;" in source
+    assert 'id="chatThreadSearchInput"' in source
+    assert 'type="search"' in source
+    assert 'placeholder="Search chats"' in source
+    assert 'id="chatThreadSearchClearBtn"' in source
+    assert 'data-action="chat-search-clear"' in source
+    assert "const query=String(S.chatThreadSearchQuery||'').trim().toLowerCase();" in source
+    assert "threadSearchInput.addEventListener('input'" in source
+    assert "threadSearchInput.addEventListener('search'" in source
+    assert "function updateChatThreadSearchUi()" in source
+    assert "const hasThreadSearch=!!document.getElementById('chatThreadSearchInput');" in source
+
+
+def test_chat_history_delete_with_confirmation_modal_contract() -> None:
+    source = Path("orchestrator/web/realtime_service.py").read_text(encoding="utf-8")
+
+    assert 'data-action="chat-open-delete"' in source
+    assert "function closeChatDeleteModal()" in source
+    assert "function confirmChatDeleteModal()" in source
+    assert "function renderHomeDeleteModal()" in source
+    assert 'id="chatDeleteModalMount"' in source
+    assert 'id="chatDeleteModalBackdrop"' in source
+    assert 'id="chatDeleteConfirmBtn"' in source
+    assert 'id="chatDeleteCancelBtn"' in source
+    assert "data-action=\"chat-delete-confirm\"" in source
+    assert "Really delete chat conversation history - <span class=\"font-semibold\">" in source
+    assert 'onclick="closeChatDeleteModal()"' in source
+    assert 'onclick="confirmChatDeleteModal()"' in source
+    assert "sendAction({type:'chat_delete', thread_id: tid});" in source
+    assert 'if msg_type == "chat_delete":' in source
+    assert "self.delete_chat_thread(str(payload.get(\"thread_id\", \"\")))" in source
+
+
 def test_query_contract_with_tagged_mermaid_response() -> None:
     tagged_response = (
         "Here is the chart.\n"

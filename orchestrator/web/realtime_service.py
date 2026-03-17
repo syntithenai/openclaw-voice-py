@@ -23,6 +23,33 @@ from orchestrator.web.http_server import start_http_servers
 logger = logging.getLogger("orchestrator.web.realtime")
 
 
+class _WebsocketHandshakeNoiseFilter(logging.Filter):
+    """Suppress expected client-abort handshake noise from websockets logger."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if "opening handshake failed" not in message:
+            return True
+        exc_text = ""
+        if record.exc_info:
+            exc_text = " ".join(str(part) for part in record.exc_info if part)
+        combined = f"{message} {exc_text}".lower()
+        return "no close frame received or sent" not in combined
+
+
+_WS_NOISE_FILTER_INSTALLED = False
+
+
+def _install_websockets_noise_filter() -> None:
+    global _WS_NOISE_FILTER_INSTALLED
+    if _WS_NOISE_FILTER_INSTALLED:
+        return
+    noise_filter = _WebsocketHandshakeNoiseFilter()
+    logging.getLogger("websockets.server").addFilter(noise_filter)
+    logging.getLogger("websockets.asyncio.server").addFilter(noise_filter)
+    _WS_NOISE_FILTER_INSTALLED = True
+
+
 def _build_ui_html(
     ws_port: int,
     mic_starts_disabled: bool = True,
@@ -116,6 +143,12 @@ def _build_ui_html(
     <div class="relative flex items-center flex-none gap-3" id="micControlWrap">
         <button id="micBtn" class="mic-btn w-11 h-11 flex items-center justify-center font-bold text-xl rounded-full border-4 border-transparent" title="Microphone">&#127908;</button>
         <button id="micMenuBtn" class="w-7 h-7 flex items-center justify-center rounded-full text-gray-300 bg-gray-800/60 border border-gray-700 hover:bg-gray-700 transition-colors" title="Microphone options">&#9662;</button>
+        <div id="mutedChatNotice" class="hidden absolute right-0 top-14 z-40 max-w-[19rem]">
+            <div class="relative rounded-2xl border-2 border-gray-100 bg-amber-200 text-gray-900 px-3 py-2 shadow-lg text-xs font-semibold leading-snug">
+                <span class="mr-1">💬</span><span id="mutedChatNoticeText"></span>
+                <span class="absolute -top-1.5 right-6 w-3 h-3 bg-amber-200 border-l-2 border-t-2 border-gray-100 rotate-45"></span>
+            </div>
+        </div>
         <div id="micControlDropdown" class="hidden absolute right-0 top-12 w-72 bg-gray-800 border border-gray-700 rounded-xl shadow-xl z-50 p-2 flex flex-col gap-2">
             <div class="flex items-center justify-between px-2 py-1">
                 <span id="ttsMuteLabel" class="text-xs text-gray-300">Mute TTS output</span>
@@ -169,7 +202,11 @@ const S = {{
   micEnabled:!MIC_STARTS_DISABLED,
   voice_state:'idle', wake_state:'asleep', tts_playing:false, mic_rms:0,
     chat:[], music:{{state:'stop',title:'',artist:'',queue_length:0,elapsed:0,duration:0,position:-1,loaded_playlist:''}},
-    chatThreads:[], activeChatId:'active', selectedChatId:'active', chatSidebarOpen:true,
+        chatThreads:[], activeChatId:'active', selectedChatId:'active', chatSidebarOpen:true,
+                chatThreadSearchQuery:'',
+            chatDeleteModalOpen:false,
+            chatDeleteTargetId:'',
+            chatDeleteTargetTitle:'',
         chatFollowLatest:true,
     musicQueue:[], musicPlaylists:[], musicLibraryResults:[],
         musicQueueFilter:'', musicQueueSelectionByIds:{{}}, musicQueueLastCheckedId:null,
@@ -196,8 +233,12 @@ const S = {{
     wsPingTimer:null,
     captureRetryTimer:null,
     lastAudioInputCount:null,
+    mutedChatNoticeTimer:null,
     scrollToBottomPending:false,
     autoScrollUntilTs:0,
+    chatLastScrollTop:0,
+    chatUserScrolledUp:false,
+    suppressScrollDirectionTracking:false,
 }};
 
 function applyToggle(btn, enabled){{
@@ -270,14 +311,28 @@ function normalizeChatThread(t){{
     return thread;
 }}
 
+function sortChatThreadsBySavedOrder(threads){{
+    return [...(Array.isArray(threads)?threads:[])].sort((a,b)=>{{
+        const aCreated=Number(a?.created_ts||0);
+        const bCreated=Number(b?.created_ts||0);
+        if(aCreated!==bCreated) return bCreated-aCreated;
+        const aUpdated=Number(a?.updated_ts||0);
+        const bUpdated=Number(b?.updated_ts||0);
+        if(aUpdated!==bUpdated) return bUpdated-aUpdated;
+        return String(b?.id||'').localeCompare(String(a?.id||''));
+    }});
+}}
+
 function mergeChatThreads(serverThreads, cachedThreads){{
     const merged = new Map();
     (Array.isArray(cachedThreads)?cachedThreads:[]).map(normalizeChatThread).filter(Boolean).forEach(t=>merged.set(t.id, t));
     (Array.isArray(serverThreads)?serverThreads:[]).map(normalizeChatThread).filter(Boolean).forEach(t=>{{
         const existing = merged.get(t.id);
-        if(!existing || Number(t.updated_ts||0) >= Number(existing.updated_ts||0)) merged.set(t.id, t);
+        const nextThread=Object.assign({{}}, t);
+        if(existing && Number(existing.created_ts||0)>0) nextThread.created_ts=Number(existing.created_ts||nextThread.created_ts||0);
+        if(!existing || Number(t.updated_ts||0) >= Number(existing.updated_ts||0)) merged.set(t.id, nextThread);
     }});
-    return [...merged.values()].sort((a,b)=>Number(b.updated_ts||0)-Number(a.updated_ts||0));
+    return sortChatThreadsBySavedOrder([...merged.values()]);
 }}
 
 function persistChatCache(){{
@@ -301,7 +356,7 @@ function hydrateChatCache(){{
         const data = JSON.parse(raw);
         if(!data || typeof data!=='object') return;
         if(Array.isArray(data.chat)) S.chat = data.chat.map(normalizeChatMessage).filter(Boolean);
-        if(Array.isArray(data.chatThreads)) S.chatThreads = data.chatThreads.map(normalizeChatThread).filter(Boolean);
+        if(Array.isArray(data.chatThreads)) S.chatThreads = sortChatThreadsBySavedOrder(data.chatThreads.map(normalizeChatThread).filter(Boolean));
         if(data.activeChatId) S.activeChatId = String(data.activeChatId);
         if(data.selectedChatId) S.selectedChatId = String(data.selectedChatId);
     }} catch(_) {{}}
@@ -310,12 +365,23 @@ function hydrateChatCache(){{
 function applyServerChatState(chat, chatThreads, activeChatId, replaceThreads=false){{
     if(Array.isArray(chat)) S.chat = chat.map(normalizeChatMessage).filter(Boolean);
     if(Array.isArray(chatThreads)){{
-        S.chatThreads = replaceThreads
-            ? chatThreads.map(normalizeChatThread).filter(Boolean).sort((a,b)=>Number(b.updated_ts||0)-Number(a.updated_ts||0))
-            : mergeChatThreads(chatThreads, S.chatThreads);
+        if(replaceThreads){{
+            const existingById = new Map((Array.isArray(S.chatThreads)?S.chatThreads:[]).map(normalizeChatThread).filter(Boolean).map(t=>[t.id, t]));
+            const next = chatThreads.map(normalizeChatThread).filter(Boolean).map(t=>{{
+                const existing = existingById.get(t.id);
+                if(existing && Number(existing.created_ts||0)>0) t.created_ts=Number(existing.created_ts||t.created_ts||0);
+                return t;
+            }});
+            S.chatThreads = sortChatThreadsBySavedOrder(next);
+        }} else {{
+            S.chatThreads = mergeChatThreads(chatThreads, S.chatThreads);
+        }}
     }}
     if(activeChatId) S.activeChatId = String(activeChatId);
     if(!S.selectedChatId) S.selectedChatId = 'active';
+    if(String(S.selectedChatId||'active')==='active' && String(S.activeChatId||'active')!=='active'){{
+        S.selectedChatId = String(S.activeChatId||'active');
+    }}
     const selected = String(S.selectedChatId||'active');
     if(selected!=='active' && !(S.chatThreads||[]).some(t=>String(t.id||'')===selected)) S.selectedChatId = 'active';
     persistChatCache();
@@ -326,17 +392,6 @@ function loadUiPrefs(){{
     S.browserAudioEnabled = readBoolPref(PREF_BROWSER_AUDIO, true);
     S.continuousMode = readBoolPref(PREF_CONTINUOUS, false);
     S.chatFollowLatest = readBoolPref(PREF_CHAT_FOLLOW, true);
-}}
-
-function updateChatFollowToggleState(){{
-    const btn=document.getElementById('chatFollowToggle');
-    if(!btn) return;
-    const on=!!S.chatFollowLatest;
-    btn.textContent=on?'Follow latest: On':'Follow latest: Off';
-    btn.classList.toggle('bg-emerald-700', on);
-    btn.classList.toggle('hover:bg-emerald-600', on);
-    btn.classList.toggle('bg-gray-800', !on);
-    btn.classList.toggle('hover:bg-gray-700', !on);
 }}
 
 function pushUiPrefsToServer(){{
@@ -367,6 +422,44 @@ function applyMicControlToggles(){{
     if(ttsLabel) ttsLabel.textContent='Mute TTS output'+(ttsErr?' ⚠ '+ttsErr:'');
     if(browserLabel) browserLabel.textContent='Browser audio streaming'+(browserErr?' ⚠ '+browserErr:'');
     if(contLabel) contLabel.textContent='Continuous mode'+(contErr?' ⚠ '+contErr:'');
+    refreshMutedChatNoticeVisibility();
+}}
+
+function hideMutedChatNotice(){{
+    const wrap=document.getElementById('mutedChatNotice');
+    if(!wrap) return;
+    if(S.mutedChatNoticeTimer){{
+        clearTimeout(S.mutedChatNoticeTimer);
+        S.mutedChatNoticeTimer=null;
+    }}
+    wrap.classList.add('hidden');
+}}
+
+function refreshMutedChatNoticeVisibility(){{
+    if(S.page==='music' && !!S.ttsMuted) return;
+    hideMutedChatNotice();
+}}
+
+function showMutedChatNoticeForMessage(msg){{
+    if(S.page!=='music' || !S.ttsMuted) return;
+    if(!msg || typeof msg!=='object') return;
+    const role=String(msg.role||'').toLowerCase();
+    if(role!=='user' && role!=='assistant') return;
+    const text=String(msg.text||'').trim();
+    if(!text) return;
+    const wrap=document.getElementById('mutedChatNotice');
+    const textEl=document.getElementById('mutedChatNoticeText');
+    if(!wrap || !textEl) return;
+
+    const label=(role==='user')?'You':'Bot';
+    const preview=text.length>120?(text.slice(0,117)+'...'):text;
+    textEl.textContent=label+': '+preview;
+    wrap.classList.remove('hidden');
+
+    if(S.mutedChatNoticeTimer) clearTimeout(S.mutedChatNoticeTimer);
+    S.mutedChatNoticeTimer=setTimeout(()=>{{
+        hideMutedChatNotice();
+    }}, 2000);
 }}
 
 function updateWsDebugBanner(){{
@@ -441,20 +534,41 @@ function isChatAtBottom(){{
     return (area.scrollTop + area.clientHeight) >= (area.scrollHeight - 8);
 }}
 
+function isChatAtTop(){{
+    const area=document.getElementById('chatArea');
+    if(!area) return true;
+    return area.scrollTop <= 8;
+}}
+
 function updateScrollDownButton(){{
     const wrap=document.getElementById('scrollDownWrap');
-    if(!wrap) return;
+    const upWrap=document.getElementById('scrollUpWrap');
+    if(!wrap && !upWrap) return;
     const area=document.getElementById('chatArea');
     if(!area || S.page!=='home'){{
-        wrap.classList.add('hidden');
-        wrap.classList.remove('flex');
+        if(wrap){{
+            wrap.classList.add('hidden');
+            wrap.classList.remove('flex');
+        }}
+        if(upWrap){{
+            upWrap.classList.add('hidden');
+            upWrap.classList.remove('flex');
+        }}
         return;
     }}
     const overflow=area.scrollHeight > (area.clientHeight + 1);
     const atBottom=isChatAtBottom();
+    const atTop=isChatAtTop();
     const shouldShow=overflow && !atBottom;
-    wrap.classList.toggle('hidden', !shouldShow);
-    wrap.classList.toggle('flex', shouldShow);
+    const shouldShowUp=overflow && !atTop && !!S.chatUserScrolledUp;
+    if(wrap){{
+        wrap.classList.toggle('hidden', !shouldShow);
+        wrap.classList.toggle('flex', shouldShow);
+    }}
+    if(upWrap){{
+        upWrap.classList.toggle('hidden', !shouldShowUp);
+        upWrap.classList.toggle('flex', shouldShowUp);
+    }}
 }}
 
 function requestScrollToBottomBurst(){{
@@ -497,27 +611,48 @@ document.addEventListener('click', e => {{
         return;
     }}
 
+    const clearThreadSearchBtn = e.target.closest('[data-action="chat-search-clear"]');
+    if (clearThreadSearchBtn) {{
+        S.chatThreadSearchQuery='';
+        const input=document.getElementById('chatThreadSearchInput');
+        if(input) input.value='';
+        updateChatThreadSearchUi();
+        renderThreadList(S.selectedChatId || 'active');
+        return;
+    }}
+
     const selectThreadBtn = e.target.closest('[data-action="chat-select"]');
     if (selectThreadBtn) {{
         const tid = selectThreadBtn.dataset.threadId || 'active';
         S.selectedChatId = tid;
+        sendAction({{type:'chat_select', thread_id: tid}});
         persistChatCache();
         renderPage();
         return;
     }}
 
-    const followLatestBtn = e.target.closest('[data-action="chat-follow-toggle"]');
-    if (followLatestBtn) {{
-        S.chatFollowLatest = !S.chatFollowLatest;
-        writeBoolPref(PREF_CHAT_FOLLOW, !!S.chatFollowLatest);
-        updateChatFollowToggleState();
-        if(S.chatFollowLatest) scrollChat();
+    const openDeleteThreadBtn = e.target.closest('[data-action="chat-open-delete"]');
+    if (openDeleteThreadBtn) {{
+        e.stopPropagation();
+        const tid = String(openDeleteThreadBtn.dataset.threadId || '').trim();
+        if(!tid) return;
+        const t=(S.chatThreads||[]).find(x=>String(x.id||'')===tid);
+        S.chatDeleteTargetId=tid;
+        S.chatDeleteTargetTitle=String((t&&t.title)||'Untitled').trim()||'Untitled';
+        S.chatDeleteModalOpen=true;
+        renderHomeDeleteModal();
         return;
     }}
 
     const scrollDownBtn = e.target.closest('[data-action="chat-scroll-down"]');
     if (scrollDownBtn) {{
         scrollChat();
+        return;
+    }}
+
+    const scrollUpBtn = e.target.closest('[data-action="chat-scroll-up"]');
+    if (scrollUpBtn) {{
+        scrollChatToTop();
         return;
     }}
 
@@ -690,7 +825,13 @@ document.addEventListener('click', e => {{
     const removeSelectedBtn = e.target.closest('[data-action="music-remove-selected"]');
     if (removeSelectedBtn) {{
         const song_ids = Object.keys(S.musicQueueSelectionByIds).filter(k=>S.musicQueueSelectionByIds[k]);
-        if(song_ids.length) sendMusicAction('music_remove_selected', {{positions: [], song_ids}});
+        if(song_ids.length) {{
+            const positions = (S.musicQueue||[])
+                .filter(item=>S.musicQueueSelectionByIds[String(item.id||'').trim()])
+                .map(item=>Number(item.pos))
+                .filter(Number.isFinite);
+            sendMusicAction('music_remove_selected', {{positions, song_ids}});
+        }}
         S.musicQueueSelectionByIds = {{}};
         renderMusicPage(document.getElementById('main'));
         return;
@@ -814,11 +955,6 @@ document.addEventListener('submit', e => {{
     updateChatComposerState();
     sendAction({{type:'chat_text', text, client_msg_id:clientMsgId}});
     input.value = '';
-    if (S.selectedChatId !== 'active') {{
-        S.selectedChatId = 'active';
-        persistChatCache();
-        renderPage();
-    }}
 }});
 
 document.addEventListener('keydown', e => {{
@@ -988,16 +1124,21 @@ function renderPage(){{
     }} else {{
         if(dock) dock.classList.remove('hidden');
         if(main && main.dataset.page==='home'){{
-            const selected = S.selectedChatId || 'active';
-            renderThreadList(selected);
-            renderChatMessages(selected);
-            updateChatFollowToggleState();
+            const hasThreadSearch=!!document.getElementById('chatThreadSearchInput');
+            if(!hasThreadSearch){{
+                renderHomePage(main);
+            }} else {{
+                const selected = S.selectedChatId || 'active';
+                renderThreadList(selected);
+                renderChatMessages(selected);
+            }}
         }} else {{
             renderHomePage(main);
         }}
         updateChatComposerState();
     }}
     applyMusicHeader();
+    refreshMutedChatNoticeVisibility();
 }}
 
 function renderHomePage(main){{
@@ -1011,6 +1152,12 @@ function renderHomePage(main){{
         +'<aside id="chatSidebar" class="'+sidebarClass+' transition-all duration-200 overflow-hidden">'
             +'<div class="'+sidebarInnerClass+' h-full flex flex-col">'
                 +'<div class="px-0 py-3 text-xs uppercase tracking-wide text-gray-400 border-b border-gray-800">Previous chats</div>'
+                +'<div class="px-2 py-2 border-b border-gray-800">'
+                    +'<div class="relative">'
+                        +'<input id="chatThreadSearchInput" type="search" placeholder="Search chats" class="w-full rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 pr-9 text-xs text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
+                        +'<button id="chatThreadSearchClearBtn" data-action="chat-search-clear" type="button" class="hidden absolute right-1.5 top-1/2 -translate-y-1/2 w-6 h-6 rounded-md text-xs text-gray-300 bg-gray-700 hover:bg-gray-600 transition-colors" title="Clear search" aria-label="Clear search">x</button>'
+                    +'</div>'
+                +'</div>'
                 +'<div id="chatThreadList" class="flex-1 overflow-y-auto p-0 space-y-0"></div>'
             +'</div>'
         +'</aside>'
@@ -1018,25 +1165,93 @@ function renderHomePage(main){{
             +'<div class="px-3 py-2 border-b border-gray-800 flex items-center justify-between gap-2">'
                 +'<div class="flex items-center gap-2">'
                     +'<button data-action="chat-sidebar-toggle" class="px-2.5 py-1.5 rounded-lg text-xs bg-gray-800 hover:bg-gray-700 transition-colors">'+sidebarToggleText+'</button>'
-                    +'<button id="chatFollowToggle" data-action="chat-follow-toggle" class="px-2.5 py-1.5 rounded-lg text-xs transition-colors"></button>'
                 +'</div>'
                 +'<button data-action="chat-new" class="px-3 py-1.5 rounded-lg text-xs bg-blue-700 hover:bg-blue-600 transition-colors">New</button>'
             +'</div>'
+            +'<div id="scrollUpWrap" class="hidden justify-center border-b border-gray-800/70 px-3 py-2">'
+                +'<button id="scrollUpBtn" data-action="chat-scroll-up" type="button" class="px-3 py-1.5 rounded-lg text-xs bg-gray-800 hover:bg-gray-700 transition-colors">Scroll up</button>'
+            +'</div>'
             +'<div id="chatArea" class="flex-1 overflow-y-auto px-4 py-4 space-y-3 min-h-0"></div>'
         +'</div>'
+        +'<div id="chatDeleteModalMount"></div>'
     +'</div>';
 
     renderThreadList(selected);
     renderChatMessages(selected);
     const area=document.getElementById('chatArea');
     if(area){{
+        S.chatLastScrollTop=area.scrollTop;
         area.addEventListener('scroll', ()=>{{
+            const prevTop=Number(S.chatLastScrollTop||0);
+            const nextTop=area.scrollTop;
+            const movedUp=nextTop < prevTop;
+            if(!S.suppressScrollDirectionTracking && movedUp) S.chatUserScrolledUp=true;
+            if(isChatAtTop()) S.chatUserScrolledUp=false;
+            S.chatLastScrollTop=nextTop;
             if(!isChatAtBottom()) S.autoScrollUntilTs=0;
             updateScrollDownButton();
         }}, {{passive:true}});
     }}
-    updateChatFollowToggleState();
+    const threadSearchInput=document.getElementById('chatThreadSearchInput');
+    if(threadSearchInput){{
+        threadSearchInput.value=String(S.chatThreadSearchQuery||'');
+        threadSearchInput.addEventListener('input', ()=>{{
+            S.chatThreadSearchQuery=threadSearchInput.value||'';
+            updateChatThreadSearchUi();
+            renderThreadList(S.selectedChatId || 'active');
+        }});
+        threadSearchInput.addEventListener('search', ()=>{{
+            S.chatThreadSearchQuery=threadSearchInput.value||'';
+            updateChatThreadSearchUi();
+            renderThreadList(S.selectedChatId || 'active');
+        }});
+    }}
+    updateChatThreadSearchUi();
     updateScrollDownButton();
+    renderHomeDeleteModal();
+}}
+
+function updateChatThreadSearchUi(){{
+    const input=document.getElementById('chatThreadSearchInput');
+    const clearBtn=document.getElementById('chatThreadSearchClearBtn');
+    if(!input || !clearBtn) return;
+    const hasQuery=String(input.value||'').trim().length>0;
+    clearBtn.classList.toggle('hidden', !hasQuery);
+    clearBtn.classList.toggle('flex', hasQuery);
+}}
+
+function closeChatDeleteModal(){{
+    S.chatDeleteModalOpen=false;
+    S.chatDeleteTargetId='';
+    S.chatDeleteTargetTitle='';
+    renderHomeDeleteModal();
+}}
+
+function confirmChatDeleteModal(){{
+    const tid=String(S.chatDeleteTargetId||'').trim();
+    const title=String(S.chatDeleteTargetTitle||'').trim() || 'Untitled';
+    if(tid) sendAction({{type:'chat_delete', thread_id: tid, expected_title: title, confirmed: true}});
+    closeChatDeleteModal();
+}}
+
+function renderHomeDeleteModal(){{
+    const mount=document.getElementById('chatDeleteModalMount');
+    if(!mount) return;
+    if(S.page!=='home' || !S.chatDeleteModalOpen){{
+        mount.innerHTML='';
+        return;
+    }}
+    mount.innerHTML=''
+        +'<div id="chatDeleteModalBackdrop" class="fixed inset-0 z-40 flex items-center justify-center bg-black/50 px-4" onclick="closeChatDeleteModal()">'
+            +'<div id="chatDeleteModalDialog" class="w-full max-w-sm rounded-xl border border-gray-700 bg-gray-900 shadow-xl p-4" role="dialog" aria-modal="true" aria-label="Delete chat session" onclick="event.stopPropagation()">'
+                +'<h3 class="text-sm font-semibold text-white">Delete chat session</h3>'
+                +'<p class="mt-2 text-sm text-gray-300">Really delete chat conversation history - <span class="font-semibold">'+esc(S.chatDeleteTargetTitle||'Untitled')+'</span></p>'
+                +'<div class="mt-4 flex justify-end gap-2">'
+                    +'<button id="chatDeleteCancelBtn" type="button" data-action="chat-delete-cancel" onclick="closeChatDeleteModal()" class="px-3 py-1.5 rounded-lg text-sm bg-gray-800 hover:bg-gray-700 transition-colors">Cancel</button>'
+                    +'<button id="chatDeleteConfirmBtn" type="button" data-action="chat-delete-confirm" onclick="confirmChatDeleteModal()" class="px-3 py-1.5 rounded-lg text-sm bg-red-700 hover:bg-red-600 transition-colors">Delete</button>'
+                +'</div>'
+            +'</div>'
+        +'</div>';
 }}
 function getSelectedMessages(selectedId){{
     if(!selectedId || selectedId==='active') return S.chat;
@@ -1046,13 +1261,23 @@ function getSelectedMessages(selectedId){{
 function renderThreadList(selectedId){{
     const list=document.getElementById('chatThreadList');
     if(!list) return;
-    const currentActive = selectedId==='active' ? 'bg-blue-800 text-white' : 'bg-gray-800 text-gray-200 hover:bg-gray-700';
+    const query=String(S.chatThreadSearchQuery||'').trim().toLowerCase();
+    const sortedThreads=sortChatThreadsBySavedOrder(S.chatThreads||[]);
+    const visibleThreads=query
+        ? sortedThreads.filter(t=>String(t.title||'').toLowerCase().includes(query))
+        : sortedThreads;
     const items = [];
-    items.push('<button data-action="chat-select" data-thread-id="active" class="w-full text-left px-3 py-2 rounded-none text-sm transition-colors border-b border-gray-800 '+currentActive+'">Current chat</button>');
-    (S.chatThreads||[]).forEach(t=>{{
+    visibleThreads.forEach(t=>{{
         const title = esc((t.title||'Untitled').trim()||'Untitled');
         const activeCls = (t.id===selectedId) ? 'bg-blue-800 text-white' : 'bg-gray-800 text-gray-200 hover:bg-gray-700';
-        items.push('<button data-action="chat-select" data-thread-id="'+esc(t.id)+'" class="w-full text-left px-3 py-2 rounded-none transition-colors border-b border-gray-800 '+activeCls+'"><div class="text-sm truncate">'+title+'</div></button>');
+        items.push(''
+            +'<div class="w-full flex items-stretch border-b border-gray-800 '+activeCls+'">'
+                +'<button data-action="chat-select" data-thread-id="'+esc(t.id)+'" class="flex-1 min-w-0 text-left px-3 py-2 rounded-none transition-colors '+activeCls+'">'
+                    +'<div class="text-sm truncate">'+title+'</div>'
+                +'</button>'
+                +'<button data-action="chat-open-delete" data-thread-id="'+esc(t.id)+'" class="w-9 flex-none px-0 py-2 text-sm text-gray-300 hover:text-red-300 hover:bg-red-900/40 transition-colors" title="Delete chat" aria-label="Delete chat">✕</button>'
+            +'</div>'
+        );
     }});
     list.innerHTML = items.join('');
 }}
@@ -1089,9 +1314,30 @@ function renderChatMessages(selectedId){{
     }} else {{
         area.scrollTop=prevScrollTop;
     }}
+    S.chatLastScrollTop=area.scrollTop;
     updateScrollDownButton();
 }}
-function scrollChat(){{ const a=document.getElementById('chatArea'); if(a){{ a.scrollTop=a.scrollHeight; updateScrollDownButton(); }} }}
+function scrollChat(){{
+    const a=document.getElementById('chatArea');
+    if(a){{
+        S.suppressScrollDirectionTracking=true;
+        a.scrollTop=a.scrollHeight;
+        S.chatLastScrollTop=a.scrollTop;
+        setTimeout(()=>{{ S.suppressScrollDirectionTracking=false; }}, 0);
+        updateScrollDownButton();
+    }}
+}}
+function scrollChatToTop(){{
+    const a=document.getElementById('chatArea');
+    if(a){{
+        S.suppressScrollDirectionTracking=true;
+        a.scrollTop=0;
+        S.chatLastScrollTop=0;
+        S.chatUserScrolledUp=false;
+        setTimeout(()=>{{ S.suppressScrollDirectionTracking=false; }}, 0);
+        updateScrollDownButton();
+    }}
+}}
 function collateChatMessages(msgs){{
     const out=[];
     let activeBucket=null;
@@ -2322,12 +2568,21 @@ function handleMsg(msg){{
             if(msg.message){{
                 const nextMsg = normalizeChatMessage(msg.message);
                 if(nextMsg) S.chat.push(nextMsg);
+                if(nextMsg) showMutedChatNoticeForMessage(nextMsg);
+                if(nextMsg && S.activeChatId && S.activeChatId!=='active'){{
+                    const activeThread=(S.chatThreads||[]).find(t=>String(t.id||'')===String(S.activeChatId||''));
+                    if(activeThread){{
+                        if(!Array.isArray(activeThread.messages)) activeThread.messages=[];
+                        activeThread.messages.push(Object.assign({{}}, nextMsg));
+                        activeThread.updated_ts=Number(nextMsg.ts||Date.now()/1000) || Date.now()/1000;
+                    }}
+                }}
                 if(nextMsg && nextMsg.role==='user') requestScrollToBottomBurst();
-                S.selectedChatId='active';
                 persistChatCache();
                 if(S.page==='home'){{
-                    renderThreadList('active');
-                    renderChatMessages('active');
+                    const selected = S.selectedChatId || S.activeChatId || 'active';
+                    renderThreadList(selected);
+                    renderChatMessages(selected);
                 }}
             }}
             break;
@@ -2337,9 +2592,8 @@ function handleMsg(msg){{
             if(S.page==='home') renderPage();
             break;
         case 'chat_reset':
-            S.chat=[];
-            applyServerChatState([], msg.chat_threads, msg.active_chat_id, true);
-            S.selectedChatId='active';
+            applyServerChatState(msg.chat, msg.chat_threads, msg.active_chat_id, true);
+            S.selectedChatId=String(msg.active_chat_id || S.selectedChatId || 'active');
             persistChatCache();
             if(S.page==='home') renderPage();
             break;
@@ -2823,7 +3077,10 @@ class EmbeddedVoiceWebService:
         self._chat_seq: int = 0
         self._chat_threads: list[dict[str, Any]] = []
         self._active_chat_id: str = "active"
+        self._active_chat_source_thread_id: str | None = None
         self._chat_thread_limit = 100
+        self._chat_persist_debounce_s: float = 0.4
+        self._chat_persist_timer: asyncio.TimerHandle | None = None
         _default_persist = Path.home() / ".config" / "openclaw" / "chat_state.json"
         self._chat_persist_path = Path(chat_persist_path) if chat_persist_path else _default_persist
         self._load_chat_state()
@@ -2882,6 +3139,7 @@ class EmbeddedVoiceWebService:
 
     async def start(self) -> None:
         ssl_context = self._ensure_ssl_context()
+        _install_websockets_noise_filter()
         self._start_http_server()
         self._ws_server = await websockets.serve(
             self._ws_handler,
@@ -2940,6 +3198,9 @@ class EmbeddedVoiceWebService:
         if self._http_redirect_thread and self._http_redirect_thread.is_alive():
             self._http_redirect_thread.join(timeout=1.0)
         self._http_redirect_thread = None
+        if self._chat_persist_timer is not None:
+            self._chat_persist_timer.cancel()
+            self._chat_persist_timer = None
         self._clients.clear()
 
     # ------------------------------------------------------------------
@@ -2967,7 +3228,7 @@ class EmbeddedVoiceWebService:
             data = json.loads(raw)
             threads = data.get("threads")
             if isinstance(threads, list):
-                self._chat_threads = threads[: self._chat_thread_limit]
+                self._chat_threads = self._sorted_chat_threads(threads)[: self._chat_thread_limit]
             active = data.get("active_messages")
             if isinstance(active, list):
                 self._chat_messages = active[-self.chat_history_limit:]
@@ -2983,12 +3244,55 @@ class EmbeddedVoiceWebService:
         except Exception:
             logger.debug("Could not load chat state from disk (will start fresh)", exc_info=True)
 
+    def _has_non_empty_user_message(self, messages: list[dict[str, Any]]) -> bool:
+        for message in messages:
+            if str(message.get("role", "")).lower() != "user":
+                continue
+            if str(message.get("text", "")).strip():
+                return True
+        return False
+
+    def _chat_state_persistable(self) -> bool:
+        if self._has_non_empty_user_message(self._chat_messages):
+            return True
+        for thread in self._chat_threads:
+            msgs = thread.get("messages")
+            if isinstance(msgs, list) and self._has_non_empty_user_message(msgs):
+                return True
+        return False
+
+    def _sorted_chat_threads(self, threads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return sorted(
+            list(threads),
+            key=lambda t: float(t.get("updated_ts", t.get("created_ts", 0.0)) or 0.0),
+            reverse=True,
+        )
+
+    def _schedule_chat_state_persist(self) -> None:
+        if not self._chat_state_persistable():
+            return
+        if self._chat_persist_timer is not None:
+            self._chat_persist_timer.cancel()
+            self._chat_persist_timer = None
+        try:
+            loop = asyncio.get_running_loop()
+            self._chat_persist_timer = loop.call_later(
+                self._chat_persist_debounce_s,
+                self._persist_chat_state,
+            )
+        except RuntimeError:
+            # Fallback for non-async contexts.
+            self._persist_chat_state()
+
     def _persist_chat_state(self) -> None:
         """Atomically write chat threads and active messages to disk (best-effort)."""
+        if self._chat_persist_timer is not None:
+            self._chat_persist_timer.cancel()
+            self._chat_persist_timer = None
         try:
             self._chat_persist_path.parent.mkdir(parents=True, exist_ok=True)
             payload = {
-                "threads": self._chat_threads,
+                "threads": self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit],
                 "active_messages": self._chat_messages,
                 "chat_seq": self._chat_seq,
                 "saved_ts": time.time(),
@@ -3013,7 +3317,7 @@ class EmbeddedVoiceWebService:
 
     def update_chat_history(self, messages: list[dict[str, Any]]) -> None:
         self._chat_messages = list(messages[-self.chat_history_limit:])
-        self._persist_chat_state()
+        self._schedule_chat_state_persist()
 
     def _derive_chat_title(self, messages: list[dict[str, Any]]) -> str:
         for m in messages:
@@ -3024,7 +3328,11 @@ class EmbeddedVoiceWebService:
         return f"Chat {len(self._chat_threads) + 1}"
 
     def _archive_active_chat_if_needed(self) -> None:
+        if self._active_chat_source_thread_id:
+            return
         if not self._chat_messages:
+            return
+        if not self._has_non_empty_user_message(self._chat_messages):
             return
         now = time.time()
         archived = {
@@ -3035,36 +3343,174 @@ class EmbeddedVoiceWebService:
             "updated_ts": now,
         }
         self._chat_threads.insert(0, archived)
-        if len(self._chat_threads) > self._chat_thread_limit:
-            self._chat_threads = self._chat_threads[: self._chat_thread_limit]
-        self._persist_chat_state()
+        self._chat_threads = self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]
+        self._schedule_chat_state_persist()
+
+    def _promote_active_chat_to_thread_if_needed(self, now_ts: float | None = None) -> bool:
+        if self._active_chat_source_thread_id:
+            return False
+        if not self._has_non_empty_user_message(self._chat_messages):
+            return False
+        ts = float(now_ts or time.time())
+        promoted = {
+            "id": uuid.uuid4().hex[:12],
+            "title": self._derive_chat_title(self._chat_messages),
+            "messages": list(self._chat_messages),
+            "created_ts": ts,
+            "updated_ts": ts,
+        }
+        self._chat_threads.insert(0, promoted)
+        self._chat_threads = self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]
+        self._active_chat_id = str(promoted["id"])
+        self._active_chat_source_thread_id = str(promoted["id"])
+        self._schedule_chat_state_persist()
+        return True
 
     def start_new_chat(self) -> None:
         self._archive_active_chat_if_needed()
         self._chat_messages = []
         self._active_chat_id = "active"
-        self._persist_chat_state()
+        self._active_chat_source_thread_id = None
+        self._schedule_chat_state_persist()
         asyncio.create_task(
             self.broadcast(
                 {
                     "type": "chat_reset",
                     "active_chat_id": self._active_chat_id,
                     "chat": [],
-                    "chat_threads": list(self._chat_threads),
+                    "chat_threads": list(self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]),
+                }
+            )
+        )
+
+    def activate_chat_thread(self, thread_id: str) -> None:
+        target_id = str(thread_id or "active").strip() or "active"
+        if target_id == "active":
+            self._active_chat_id = "active"
+            self._active_chat_source_thread_id = None
+            self._schedule_chat_state_persist()
+            asyncio.create_task(
+                self.broadcast(
+                    {
+                        "type": "chat_reset",
+                        "active_chat_id": self._active_chat_id,
+                        "chat": list(self._chat_messages),
+                        "chat_threads": list(self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]),
+                    }
+                )
+            )
+            return
+
+        selected_index = -1
+        selected_thread: dict[str, Any] | None = None
+        for index, thread in enumerate(self._chat_threads):
+            if str(thread.get("id", "")) == target_id:
+                selected_index = index
+                selected_thread = thread
+                break
+
+        if selected_thread is None:
+            logger.debug("chat_select ignored: unknown thread_id=%s", target_id)
+            return
+
+        self._archive_active_chat_if_needed()
+        loaded = selected_thread.get("messages")
+        self._chat_messages = list(loaded[-self.chat_history_limit:]) if isinstance(loaded, list) else []
+        self._active_chat_id = target_id
+        self._active_chat_source_thread_id = target_id
+
+        self._chat_threads = self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]
+        self._schedule_chat_state_persist()
+        asyncio.create_task(
+            self.broadcast(
+                {
+                    "type": "chat_reset",
+                    "active_chat_id": self._active_chat_id,
+                    "chat": list(self._chat_messages),
+                    "chat_threads": list(self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]),
+                }
+            )
+        )
+
+    def delete_chat_thread(self, thread_id: str, expected_title: str = "", confirmed: bool = False) -> None:
+        if not confirmed:
+            logger.warning("chat_delete ignored: missing confirmation for thread_id=%s", thread_id)
+            return
+        target_id = str(thread_id or "").strip()
+        if not target_id:
+            return
+        expected_title = str(expected_title or "").strip()
+        matches = [
+            (index, thread)
+            for index, thread in enumerate(self._chat_threads)
+            if str(thread.get("id", "")) == target_id
+            and (not expected_title or str(thread.get("title", "")).strip() == expected_title)
+        ]
+        if len(matches) != 1:
+            logger.warning(
+                "chat_delete ignored: thread_id=%s expected_title=%s matches=%d",
+                target_id,
+                expected_title,
+                len(matches),
+            )
+            return
+        delete_index, _thread = matches[0]
+        del self._chat_threads[delete_index]
+        if delete_index < 0:
+            logger.debug("chat_delete ignored: unknown thread_id=%s", target_id)
+            return
+        if self._active_chat_source_thread_id == target_id:
+            self._active_chat_source_thread_id = None
+        if self._active_chat_id == target_id:
+            self._active_chat_id = "active"
+        self._chat_threads = self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]
+        self._schedule_chat_state_persist()
+        asyncio.create_task(
+            self.broadcast(
+                {
+                    "type": "chat_reset",
+                    "active_chat_id": self._active_chat_id,
+                    "chat": list(self._chat_messages),
+                    "chat_threads": list(self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]),
                 }
             )
         )
 
     def append_chat_message(self, message: dict[str, Any]) -> None:
         self._chat_seq += 1
+        now_ts = time.time()
         msg = dict(message)
         msg.setdefault("id", self._chat_seq)
-        msg.setdefault("ts", time.time())
+        msg.setdefault("ts", now_ts)
         self._chat_messages.append(msg)
         if len(self._chat_messages) > self.chat_history_limit:
             self._chat_messages = self._chat_messages[-self.chat_history_limit:]
-        self._persist_chat_state()
+        promoted = self._promote_active_chat_to_thread_if_needed(now_ts)
+        mirrored = promoted
+        if self._active_chat_source_thread_id:
+            for thread in self._chat_threads:
+                if str(thread.get("id", "")) != self._active_chat_source_thread_id:
+                    continue
+                thread["messages"] = list(self._chat_messages)
+                thread["updated_ts"] = now_ts
+                if not str(thread.get("title", "")).strip():
+                    thread["title"] = self._derive_chat_title(thread.get("messages") or [])
+                mirrored = True
+                break
+        if mirrored:
+            self._chat_threads = self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]
+        self._schedule_chat_state_persist()
         asyncio.create_task(self.broadcast({"type": "chat_append", "message": msg}))
+        if mirrored:
+            asyncio.create_task(
+                self.broadcast(
+                    {
+                        "type": "chat_threads_update",
+                        "chat_threads": list(self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]),
+                        "active_chat_id": self._active_chat_id,
+                    }
+                )
+            )
 
     def update_music_transport(self, **state: Any) -> None:
         self._music_state.update(state)
@@ -3359,6 +3805,24 @@ class EmbeddedVoiceWebService:
             return
 
         if msg_type in ("ui_ready", "navigate"):
+            return
+
+        if msg_type == "chat_select":
+            try:
+                self.activate_chat_thread(str(payload.get("thread_id", "active")))
+            except Exception as exc:
+                logger.warning("chat_select handler error: %s", exc)
+            return
+
+        if msg_type == "chat_delete":
+            try:
+                self.delete_chat_thread(
+                    str(payload.get("thread_id", "")),
+                    str(payload.get("expected_title", "")),
+                    bool(payload.get("confirmed", False)),
+                )
+            except Exception as exc:
+                logger.warning("chat_delete handler error: %s", exc)
             return
 
         if msg_type == "mic_toggle" and self._on_mic_toggle:
@@ -3866,7 +4330,7 @@ class EmbeddedVoiceWebService:
             "timers": list(self._timers_state),
             "timers_rev": self._timers_rev,
             "chat": list(self._chat_messages[-50:]),
-            "chat_threads": list(self._chat_threads),
+            "chat_threads": list(self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]),
             "active_chat_id": self._active_chat_id,
         }
 

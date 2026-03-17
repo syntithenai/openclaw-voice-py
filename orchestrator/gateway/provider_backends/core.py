@@ -199,7 +199,7 @@ class OpenClawGateway(BaseGateway):
         self.timeout_s = timeout_s
         self._current_session_key: Optional[str] = None
         self._ws: Optional[Any] = None
-        self._pending_requests: dict[str, asyncio.Future] = {}
+        self._pending_requests: dict[str, tuple[asyncio.Future, bool]] = {}
         self._incoming_texts: asyncio.Queue[str] = asyncio.Queue()
         self._step_events: asyncio.Queue[dict] = asyncio.Queue()
         self._connection_lock = asyncio.Lock()
@@ -444,7 +444,13 @@ class OpenClawGateway(BaseGateway):
         signature = private_key.sign(payload.encode("utf-8"))
         return self._b64url_encode(signature)
 
-    async def _send_request(self, method: str, params: dict, timeout_s: Optional[float] = None) -> dict:
+    async def _send_request(
+        self,
+        method: str,
+        params: dict,
+        timeout_s: Optional[float] = None,
+        expect_final: bool = False,
+    ) -> dict:
         if not self._ws_is_open() or self._ws is None:
             raise RuntimeError("OpenClaw WebSocket is not connected")
 
@@ -456,7 +462,7 @@ class OpenClawGateway(BaseGateway):
             "params": params,
         }
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._pending_requests[request_id] = fut
+        self._pending_requests[request_id] = (fut, expect_final)
         await self._ws.send(json.dumps(frame))
         try:
             response = await asyncio.wait_for(fut, timeout=timeout_s or self.timeout_s)
@@ -465,8 +471,10 @@ class OpenClawGateway(BaseGateway):
             return response
         except Exception:
             stale = self._pending_requests.pop(request_id, None)
-            if stale is not None and not stale.done():
-                stale.cancel()
+            if stale is not None:
+                stale_fut, _ = stale
+                if not stale_fut.done():
+                    stale_fut.cancel()
             raise
 
     async def _ensure_connected(self) -> None:
@@ -585,7 +593,13 @@ class OpenClawGateway(BaseGateway):
                     if frame_type == "res":
                         resp_id = data.get("id")
                         if isinstance(resp_id, str) and resp_id in self._pending_requests:
-                            fut = self._pending_requests.pop(resp_id)
+                            fut, expect_final = self._pending_requests[resp_id]
+                            if expect_final:
+                                payload_obj = data.get("payload") if isinstance(data.get("payload"), dict) else {}
+                                status = payload_obj.get("status")
+                                if status == "accepted":
+                                    continue
+                            self._pending_requests.pop(resp_id, None)
                             if not fut.done():
                                 fut.set_result(data)
                         continue
@@ -781,7 +795,8 @@ class OpenClawGateway(BaseGateway):
         except Exception as exc:
             logger.warning("OpenClaw frame reader error: %s", exc)
         finally:
-            for req_id, fut in list(self._pending_requests.items()):
+            for req_id, pending in list(self._pending_requests.items()):
+                fut, _ = pending
                 if not fut.done():
                     fut.set_exception(RuntimeError("OpenClaw websocket disconnected"))
                 self._pending_requests.pop(req_id, None)
@@ -810,7 +825,7 @@ class OpenClawGateway(BaseGateway):
             "idempotencyKey": str(uuid4()),
         }
 
-        res = await self._send_request("agent", payload, timeout_s=self.timeout_s)
+        res = await self._send_request("agent", payload, timeout_s=self.timeout_s, expect_final=True)
         if not bool(res.get("ok")):
             err = (res.get("error") or {}).get("message") if isinstance(res.get("error"), dict) else "agent request failed"
             raise RuntimeError(f"OpenClaw agent request failed: {err}")

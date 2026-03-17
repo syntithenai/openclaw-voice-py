@@ -1687,10 +1687,27 @@ async def run_orchestrator() -> None:
     debounce_task: asyncio.Task | None = None
     processing_request = False  # Flag to prevent concurrent gateway requests
     web_service = None
+    new_session_reset_task: asyncio.Task | None = None
+
+    async def _send_gateway_session_reset(source: str) -> None:
+        try:
+            await gateway.send_message(
+                "/reset",
+                session_id=session_id,
+                agent_id=agent_id,
+                metadata={"source": source},
+            )
+            logger.info("✓ Gateway session reset via /reset")
+        except asyncio.CancelledError:
+            logger.info("↪ Gateway /reset task cancelled (source=%s)", source)
+            raise
+        except Exception as exc:
+            logger.warning("Gateway /reset failed (continuing with local reset): %s", exc)
 
     async def _start_new_session(*, source: str, client_id: str | None = None) -> str:
         nonlocal pending_transcripts, debounce_task, processing_request, current_request_id
         nonlocal suppress_gateway_messages_for_new_session
+        nonlocal new_session_reset_task
         if client_id:
             logger.info("🆕 New session requested by %s (client=%s)", source, client_id)
         else:
@@ -1707,19 +1724,12 @@ async def run_orchestrator() -> None:
             _tts_clear_all(f"{source} new session")
             tts_stop_event.set()
 
-            try:
-                await gateway.send_message(
-                    "/reset",
-                    session_id=session_id,
-                    agent_id=agent_id,
-                    metadata={"source": source},
-                )
-                logger.info("✓ Gateway session reset via /reset")
-            except Exception as exc:
-                logger.warning("Gateway /reset failed (continuing with local reset): %s", exc)
-
             if web_service:
                 web_service.start_new_chat()
+
+            if new_session_reset_task and not new_session_reset_task.done():
+                new_session_reset_task.cancel()
+            new_session_reset_task = asyncio.create_task(_send_gateway_session_reset(source))
 
             return "Started a new session."
         finally:
@@ -1942,6 +1952,10 @@ async def run_orchestrator() -> None:
                 if music_manager:
                     try:
                         await music_manager.create_playlist_from_queue_positions(name, positions)
+                        if web_service:
+                            ms = await music_manager.get_ui_music_state()
+                            q = await music_manager.get_ui_playlist()
+                            web_service.update_music_state(queue=q, **ms)
                     except Exception as exc:
                         logger.warning("Web UI music_create_playlist '%s': %s", name, exc)
 
@@ -1949,6 +1963,10 @@ async def run_orchestrator() -> None:
                 if music_manager:
                     try:
                         await music_manager.save_playlist(name)
+                        if web_service:
+                            ms = await music_manager.get_ui_music_state()
+                            q = await music_manager.get_ui_playlist()
+                            web_service.update_music_state(queue=q, **ms)
                     except Exception as exc:
                         logger.warning("Web UI music_save_playlist '%s': %s", name, exc)
 
@@ -1956,6 +1974,10 @@ async def run_orchestrator() -> None:
                 if music_manager:
                     try:
                         await music_manager.delete_playlist(name)
+                        if web_service:
+                            ms = await music_manager.get_ui_music_state()
+                            q = await music_manager.get_ui_playlist()
+                            web_service.update_music_state(queue=q, **ms)
                     except Exception as exc:
                         logger.warning("Web UI music_delete_playlist '%s': %s", name, exc)
 
@@ -2006,10 +2028,9 @@ async def run_orchestrator() -> None:
             async def _ui_chat_text(text: str, client_id: str) -> None:
                 nonlocal pending_transcripts, debounce_task
                 normalized = normalize_transcript(text)
-                if not normalized:
+                if not enqueue_pending_transcript(normalized, ""):
                     return
                 logger.info("💬 Web UI text message from %s: '%s'", client_id, normalized[:120])
-                pending_transcripts.append((normalized, ""))
                 if debounce_task and not debounce_task.done():
                     debounce_task.cancel()
                 debounce_task = asyncio.create_task(send_debounced_transcripts(immediate=True))
@@ -2393,9 +2414,49 @@ async def run_orchestrator() -> None:
             # Save current transcripts but don't clear yet (more may arrive during LLM call)
             initial_transcripts = list(pending_transcripts)
             initial_count = len(initial_transcripts)
+
+            def _merge_incremental_transcript_parts(parts: list[str]) -> str:
+                merged = ""
+
+                def _token_overlap_words(left: str, right: str) -> int:
+                    left_words = left.split()
+                    right_words = right.split()
+                    max_overlap = min(len(left_words), len(right_words))
+                    for overlap in range(max_overlap, 0, -1):
+                        if [w.lower() for w in left_words[-overlap:]] == [w.lower() for w in right_words[:overlap]]:
+                            return overlap
+                    return 0
+
+                for raw_part in parts:
+                    part = normalize_transcript(raw_part)
+                    if not part:
+                        continue
+                    if not merged:
+                        merged = part
+                        continue
+
+                    merged_lower = merged.lower()
+                    part_lower = part.lower()
+
+                    if part_lower == merged_lower:
+                        continue
+                    if part_lower.startswith(merged_lower):
+                        merged = part
+                        continue
+                    if merged_lower.startswith(part_lower):
+                        continue
+
+                    overlap_words = _token_overlap_words(merged, part)
+                    if overlap_words > 0:
+                        part_words = part.split()
+                        merged = f"{merged} {' '.join(part_words[overlap_words:])}".strip()
+                    else:
+                        merged = f"{merged} {part}".strip()
+
+                return merged
             
             # Combine initial transcripts
-            combined_transcript = " ".join(t[0] for t in initial_transcripts)
+            combined_transcript = _merge_incremental_transcript_parts([t[0] for t in initial_transcripts])
             # Use emotion from first transcript (or combine if needed)
             emotion_tag = initial_transcripts[0][1] if initial_transcripts else ""
 
@@ -2475,6 +2536,7 @@ async def run_orchestrator() -> None:
                         # Quick answer handled locally. Some command classes intentionally
                         # return empty text to keep interactions silent (e.g. play/stop).
                         logger.info("✓ QUICK ANSWER: Using LLM/tool response instead of gateway (latency: %dms)", qa_elapsed)
+                        trailing_transcripts = pending_transcripts[initial_count:] if len(pending_transcripts) > initial_count else []
                         if quick_response:
                             print(f"\033[94m← QUICK ANSWER: {quick_response} [latency: {qa_elapsed}ms]\033[0m", flush=True)
                             logger.info("→ TTS QUEUE [req#%d]: Enqueuing quick answer: '%s'", current_request_id, quick_response[:80])
@@ -2498,8 +2560,17 @@ async def run_orchestrator() -> None:
 
                         should_send_to_gateway = False
                         last_user_went_upstream = False
-                        # Clear all transcripts processed (including any that arrived during LLM call)
-                        pending_transcripts.clear()
+                        # Keep any transcripts that arrived during QA handling so they can be debounced
+                        # into a follow-up request (often incremental STT extensions).
+                        pending_transcripts = list(trailing_transcripts)
+                        if pending_transcripts:
+                            logger.info(
+                                "⏱️ QUICK ANSWER local handled; preserving %d trailing transcript(s) for next debounce",
+                                len(pending_transcripts),
+                            )
+                            if debounce_task and not debounce_task.done():
+                                debounce_task.cancel()
+                            debounce_task = asyncio.create_task(send_debounced_transcripts())
                         # Mirror both turns to the openclaw session so they appear in the web chat UI
                         if config.quick_answer_mirror_enabled and quick_response:
                             from orchestrator.gateway.providers import OpenClawGateway
@@ -2529,9 +2600,9 @@ async def run_orchestrator() -> None:
                         
                         if len(pending_transcripts) > initial_count:
                             additional_transcripts = pending_transcripts[initial_count:]
-                            additional_text = normalize_transcript(" ".join(t[0] for t in additional_transcripts))
+                            additional_text = _merge_incremental_transcript_parts([t[0] for t in additional_transcripts])
                             if additional_text:
-                                combined_transcript = f"{combined_transcript} {additional_text}"
+                                combined_transcript = _merge_incremental_transcript_parts([combined_transcript, additional_text])
                             logger.info("⏱️ Quick answer escalating; collected %d additional transcripts during LLM call", len(additional_transcripts))
                             if additional_text:
                                 print(f"\033[93m→ USER (continued): {additional_text}\033[0m", flush=True)
@@ -2556,9 +2627,9 @@ async def run_orchestrator() -> None:
                     # Check for additional transcripts even on error
                     if len(pending_transcripts) > initial_count:
                         additional_transcripts = pending_transcripts[initial_count:]
-                        additional_text = normalize_transcript(" ".join(t[0] for t in additional_transcripts))
+                        additional_text = _merge_incremental_transcript_parts([t[0] for t in additional_transcripts])
                         if additional_text:
-                            combined_transcript = f"{combined_transcript} {additional_text}"
+                            combined_transcript = _merge_incremental_transcript_parts([combined_transcript, additional_text])
                         logger.info("⏱️ Quick answer error; collected %d additional transcripts", len(additional_transcripts))
                         if additional_text:
                             print(f"\033[93m→ USER (continued): {additional_text}\033[0m", flush=True)
@@ -2682,6 +2753,35 @@ async def run_orchestrator() -> None:
             return ""
 
         return text
+
+    def _is_incremental_prefix_extension(previous_text: str, next_text: str) -> bool:
+        prev = canonicalize_transcript_for_match(previous_text)
+        nxt = canonicalize_transcript_for_match(next_text)
+        return bool(prev and nxt and nxt.startswith(prev))
+
+    def enqueue_pending_transcript(transcript: str, emotion_tag: str) -> bool:
+        nonlocal pending_transcripts
+
+        normalized = normalize_transcript(transcript)
+        if not normalized:
+            return False
+
+        if pending_transcripts:
+            last_text, last_emotion = pending_transcripts[-1]
+            if _is_incremental_prefix_extension(last_text, normalized):
+                pending_transcripts[-1] = (normalized, emotion_tag or last_emotion)
+                logger.info("⏱️ Transcript updated for debounce (%d pending)", len(pending_transcripts))
+                return True
+            if _is_incremental_prefix_extension(normalized, last_text):
+                logger.info(
+                    "⏱️ Transcript ignored as shorter incremental duplicate (%d pending)",
+                    len(pending_transcripts),
+                )
+                return False
+
+        pending_transcripts.append((normalized, emotion_tag))
+        logger.info("⏱️ Transcript queued for debounce (%d pending)", len(pending_transcripts))
+        return True
 
     def is_likely_tts_self_echo(transcript: str, now_ts: float) -> bool:
         """Best-effort echo suppression for transcripts captured from speaker playback."""
@@ -2907,8 +3007,8 @@ async def run_orchestrator() -> None:
                 cut_in_tts_hold_request_id = 0
                 logger.info("🔓 Cut-in TTS hold released after successful transcript")
 
-            pending_transcripts.append((transcript, emotion_tag))
-            logger.info("⏱️ Transcript queued for debounce (%d pending)", len(pending_transcripts))
+            if not enqueue_pending_transcript(transcript, emotion_tag):
+                return
             
             # Cancel existing debounce task and start new one
             if debounce_task and not debounce_task.done():

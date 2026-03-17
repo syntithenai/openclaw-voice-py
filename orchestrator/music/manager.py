@@ -911,7 +911,7 @@ class MusicManager:
             if shuffle:
                 await self.pool.execute("random 1")
             
-            await self.play()
+            await self.play(0)
             total_ms = time.monotonic() * 1000 - start_ms
             logger.info(
                 f"🎤 Play artist '{artist}': {len(tracks)} tracks in {total_ms:.1f}ms "
@@ -943,7 +943,7 @@ class MusicManager:
                     await self.add_to_queue(track["file"])
             queue_ms = time.monotonic() * 1000 - queue_start
             
-            await self.play()
+            await self.play(0)
             total_ms = time.monotonic() * 1000 - start_ms
             logger.info(
                 f"💿 Play album '{album}': {len(tracks)} tracks in {total_ms:.1f}ms "
@@ -1005,7 +1005,7 @@ class MusicManager:
                 await self.pool.execute("random 1")
             
             play_start = time.monotonic() * 1000
-            await self.play()
+            await self.play(0)
             play_ms = time.monotonic() * 1000 - play_start
 
             status_after_play = await self.get_status()
@@ -1051,7 +1051,7 @@ class MusicManager:
             if "file" in track:
                 await self.clear_queue()
                 await self.add_to_queue(track["file"])
-                await self.play()
+                await self.play(0)
                 
                 artist = track.get("Artist", "Unknown")
                 title = track.get("Title", title)
@@ -1178,7 +1178,7 @@ class MusicManager:
                 logger.info("Queue empty - adding random tracks")
                 await self.add_random_tracks(random_count)
                 await self.pool.execute("random 1")  # Enable shuffle
-                await self.play()
+                await self.play(0)
                 return f"Playing {random_count} random tracks"
             elif state == "play":
                 # Already playing - pause
