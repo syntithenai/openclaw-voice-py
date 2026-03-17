@@ -26,6 +26,15 @@ except Exception:  # pragma: no cover - optional dependency check at runtime
 logger = logging.getLogger("orchestrator.gateway.providers")
 
 
+VOICE_OUTPUT_FORMAT_PROMPT = (
+    "For longer answers, markdown formatting is allowed in your final visible reply when it improves clarity. "
+    "Keep short spoken-style replies plain when formatting adds no value. "
+    "If a diagram would help, include Mermaid markup wrapped in <mermaidchart>...</mermaidchart> tags. "
+    "When returning Mermaid, always use those tags (do not return raw Mermaid outside tags). "
+    "Inside those tags, include only Mermaid source and no extra prose or code fences."
+)
+
+
 @dataclass
 class GatewayResponse:
     text: str
@@ -797,6 +806,7 @@ class OpenClawGateway(BaseGateway):
             "agentId": resolved_agent_id,
             "channel": "last",
             "deliver": True,
+            "extraSystemPrompt": VOICE_OUTPUT_FORMAT_PROMPT,
             "idempotencyKey": str(uuid4()),
         }
 

@@ -6,6 +6,7 @@ x-orchestrator-common: &orchestrator-common
   depends_on:
     - whisper
     - piper
+    - pyannote
   env_file:
     - .env.docker
   environment:
@@ -13,6 +14,7 @@ x-orchestrator-common: &orchestrator-common
     # Internal service endpoints for compose network
     - WHISPER_URL=http://whisper:10000
     - PIPER_URL=http://piper:10001
+    - RECORDER_PYANNOTE_URL=http://pyannote:10002
     - MPD_HOST=127.0.0.1
     - MPD_PORT=6600
     # Model/cache paths inside container
@@ -28,6 +30,7 @@ x-orchestrator-common: &orchestrator-common
     - ./docker/wakeword-models:/app/docker/wakeword-models
     - ./docker/emotion-models:/app/docker/emotion-models
     - ./docker/whisper-models:/app/docker/whisper-models
+    - ./docker/pyannote-models:/app/docker/pyannote-models
     - ./docker/piper-data:/app/docker/piper-data
     - ./.env:/app/.env:ro
     - ./.env.docker:/app/.env.docker:ro
@@ -91,6 +94,28 @@ services:
       - PIPER_CPU_FALLBACK=${PIPER_CPU_FALLBACK:-true}
     volumes:
       - ./docker/piper-data:/root/.local/share/piper
+
+  pyannote:
+    restart: unless-stopped
+    build:
+      context: ./docker/pyannote
+      dockerfile: Dockerfile
+    ports:
+      - "10002:10002"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYANNOTE_MODEL_ID=${RECORDER_PYANNOTE_MODEL:-pyannote/speaker-diarization-3.1}
+      - PYANNOTE_AUTH_TOKEN=${RECORDER_PYANNOTE_AUTH_TOKEN:-}
+      - PYANNOTE_BACKEND_PREFERENCE=${PYANNOTE_BACKEND_PREFERENCE:-auto}
+      - PYANNOTE_CPU_FALLBACK=${PYANNOTE_CPU_FALLBACK:-true}
+      - HF_HOME=/models
+    volumes:
+      - ./docker/pyannote-models:/models
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
 
   # Cross-platform-safe default orchestrator container.
   # Works on Linux/macOS/Windows, but direct host microphone/speaker mapping

@@ -34,3 +34,4 @@ orchestrator.log
 # SSL certificates (generated locally, never commit private keys)
 certs/*.pem
 benchmarks/
+docker/pyannote-models/speaker-diarization-3.1/

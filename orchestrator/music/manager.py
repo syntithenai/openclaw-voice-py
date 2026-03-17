@@ -34,6 +34,7 @@ class MusicManager:
         self.pipewire_stream_normalize_enabled = bool(pipewire_stream_normalize_enabled)
         self.pipewire_stream_target_percent = max(1, min(150, int(pipewire_stream_target_percent)))
         self._last_pipewire_normalize_ts = 0.0
+        self._loaded_playlist_name: str = ""
 
     async def _normalize_pipewire_mpd_stream_volume(self) -> None:
         """Best-effort: set PipeWire per-app stream volume for MPD to target percent.
@@ -377,15 +378,64 @@ class MusicManager:
             logger.error(f"Failed to get queue: {e}")
             return []
 
-    async def remove_from_queue_positions(self, positions: List[int]) -> str:
-        """Remove multiple queue positions (0-based), safely from highest to lowest."""
+    async def remove_from_queue_positions(
+        self,
+        positions: List[int],
+        song_ids: Optional[List[str]] = None,
+    ) -> str:
+        """Remove selected queue items.
+
+        Prefers stable MPD song IDs (`deleteid`) when available to avoid position drift.
+        If the currently playing item is removed, playback advances to the next item.
+        """
         try:
-            uniq = sorted({int(p) for p in positions if int(p) >= 0}, reverse=True)
-            if not uniq:
-                return "No queue items selected"
-            for pos in uniq:
-                await self.pool.execute(f"delete {pos}")
-            return f"Removed {len(uniq)} queue item(s)"
+            status_before = await self.pool.execute("status")
+            state_before = str(status_before.get("state", "stop")) if status_before else "stop"
+            try:
+                current_song_id = str(status_before.get("songid", "")).strip() if status_before else ""
+            except Exception:
+                current_song_id = ""
+            try:
+                current_pos = int(status_before.get("song", -1)) if status_before else -1
+            except Exception:
+                current_pos = -1
+
+            selected_song_ids = [str(s).strip() for s in (song_ids or []) if str(s).strip()]
+            removed_count = 0
+            removed_current = False
+
+            if selected_song_ids:
+                uniq_ids = sorted(set(selected_song_ids))
+                if not uniq_ids:
+                    return "No queue items selected"
+                removed_current = bool(current_song_id and current_song_id in uniq_ids)
+                for sid in uniq_ids:
+                    await self.pool.execute(f"deleteid {sid}")
+                    removed_count += 1
+            else:
+                uniq_positions = sorted({int(p) for p in positions if int(p) >= 0}, reverse=True)
+                if not uniq_positions:
+                    return "No queue items selected"
+                removed_current = current_pos in uniq_positions
+                for pos in uniq_positions:
+                    await self.pool.execute(f"delete {pos}")
+                    removed_count += 1
+
+            if removed_current and state_before == "play":
+                status_after = await self.pool.execute("status")
+                try:
+                    queue_len_after = int(status_after.get("playlistlength", 0)) if status_after else 0
+                except Exception:
+                    queue_len_after = 0
+                if queue_len_after > 0:
+                    next_pos = current_pos
+                    if next_pos < 0:
+                        next_pos = 0
+                    if next_pos >= queue_len_after:
+                        next_pos = queue_len_after - 1
+                    await self.pool.execute(f"play {next_pos}")
+
+            return f"Removed {removed_count} queue item(s)"
         except Exception as e:
             logger.error(f"Failed to remove queue items: {e}")
             return f"Error: {e}"
@@ -396,9 +446,20 @@ class MusicManager:
             cleaned = [str(f).strip() for f in files if str(f).strip()]
             if not cleaned:
                 return "No tracks selected"
+            added = 0
+            failed = 0
             for file_uri in cleaned:
-                await self.pool.execute(f'add "{self._quote(file_uri)}"')
-            return f"Added {len(cleaned)} track(s) to queue"
+                try:
+                    await self.pool.execute(f'add "{self._quote(file_uri)}"')
+                    added += 1
+                except Exception as exc:
+                    failed += 1
+                    logger.warning("Failed to add file to queue '%s': %s", file_uri, exc)
+            if added == 0:
+                return "Error: Failed to add selected tracks to queue"
+            if failed > 0:
+                return f"Added {added} track(s) to queue ({failed} failed)"
+            return f"Added {added} track(s) to queue"
         except Exception as e:
             logger.error(f"Failed to add files to queue: {e}")
             return f"Error: {e}"
@@ -447,13 +508,19 @@ class MusicManager:
     async def search_library_for_ui(self, query: str, limit: int = 300) -> List[Dict[str, str]]:
         """Search library and return normalized results for Web UI selection list."""
         q = str(query or "").strip()
-        if not q:
+        if len(q) < 3:
             return []
         try:
             rows: List[Dict[str, str]] = []
-            for call in (self.search_any, self.search_title, self.search_artist, self.search_album):
+            quoted = self._quote(q)
+            for cmd in (
+                f'search any "{quoted}"',
+                f'search title "{quoted}"',
+                f'search artist "{quoted}"',
+                f'search album "{quoted}"',
+            ):
                 try:
-                    part = await call(q)
+                    part = await self.pool.execute_list(cmd)
                     if part:
                         rows.extend(part)
                 except Exception:
@@ -461,7 +528,7 @@ class MusicManager:
 
             if not rows:
                 try:
-                    rows = await self.pool.execute_list(f'search file "{self._quote(q)}"')
+                    rows = await self.pool.execute_list(f'search file "{quoted}"')
                 except Exception:
                     rows = []
 
@@ -501,8 +568,14 @@ class MusicManager:
     async def load_playlist(self, name: str) -> str:
         """Load a saved playlist."""
         try:
-            await self.pool.execute(f'load "{name}"')
-            return f"Loaded playlist: {name}"
+            playlist_name = str(name or "").strip()
+            if not playlist_name:
+                return "Playlist name is required"
+
+            await self.pool.execute("clear")
+            await self.pool.execute(f'load "{self._quote(playlist_name)}"')
+            self._loaded_playlist_name = playlist_name
+            return f"Loaded playlist: {playlist_name}"
         except Exception as e:
             logger.error(f"Failed to load playlist: {e}")
             return f"Error: {e}"
@@ -510,8 +583,16 @@ class MusicManager:
     async def save_playlist(self, name: str) -> str:
         """Save current queue as a playlist."""
         try:
-            await self.pool.execute(f'save "{name}"')
-            return f"Saved playlist: {name}"
+            playlist_name = str(name or "").strip()
+            if not playlist_name:
+                return "Playlist name is required"
+            try:
+                await self.pool.execute(f'rm "{self._quote(playlist_name)}"')
+            except Exception:
+                pass
+            await self.pool.execute(f'save "{self._quote(playlist_name)}"')
+            self._loaded_playlist_name = playlist_name
+            return f"Saved playlist: {playlist_name}"
         except Exception as e:
             logger.error(f"Failed to save playlist: {e}")
             return f"Error: {e}"
@@ -632,11 +713,11 @@ class MusicManager:
             )
 
             if volume_after_play is not None and volume_after_play <= 0:
-                await self.set_volume(35)
+                await self.set_volume(100)
                 logger.warning(
-                    "MPD volume was 0 during genre playback; auto-raised to 35%% to avoid silent playback"
+                    "MPD volume was 0 during genre playback; auto-raised to 100%% to avoid silent playback"
                 )
-                return f"Playing {queue_len} {genre} tracks (volume was muted, set to 35%)"
+                return f"Playing {queue_len} {genre} tracks (volume was muted, set to 100%)"
 
             if not enabled_outputs:
                 return f"Playing {queue_len} {genre} tracks, but MPD has no enabled audio outputs"
@@ -814,18 +895,32 @@ class MusicManager:
         try:
             status = await self.get_status()
             track = await self.get_current_track()
+            try:
+                position = int(status.get("song", -1) or -1)
+            except (TypeError, ValueError):
+                position = -1
+            track_pos_raw = track.get("pos", track.get("Pos", -1)) if track else -1
+            try:
+                track_pos = int(track_pos_raw if track_pos_raw is not None else -1)
+            except (TypeError, ValueError):
+                track_pos = -1
+            if position >= 0 and (not track or track_pos != position):
+                current_items = await self.pool.execute_list(f"playlistinfo {position}")
+                if current_items:
+                    track = current_items[0]
             vol_raw = status.get("volume")
             return {
                 "state": status.get("state", "stop"),
                 "elapsed": float(status.get("elapsed", 0) or 0),
                 "duration": float(status.get("duration", status.get("time", "0").split(":")[0] if "time" in status else 0) or 0),
                 "queue_length": int(status.get("playlistlength", 0) or 0),
-                "position": int(status.get("song", -1) or -1),
+                "position": position,
                 "volume": int(vol_raw) if vol_raw is not None else None,
                 "title": track.get("title") or track.get("Title", ""),
                 "artist": track.get("artist") or track.get("Artist", ""),
                 "album": track.get("album") or track.get("Album", ""),
                 "file": track.get("file", ""),
+                "loaded_playlist": self._loaded_playlist_name,
                 "random": status.get("random", "0") == "1",
                 "repeat": status.get("repeat", "0") == "1",
             }

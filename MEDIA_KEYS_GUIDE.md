@@ -1,21 +1,21 @@
 # Media Key Detection Guide
 
-This guide explains how to use hardware media buttons (from USB/Bluetooth conference speakers, headsets, keyboards) to control music playback in OpenClaw Voice.
+This guide explains how to use hardware media buttons (from USB/Bluetooth conference speakers, headsets, keyboards) for wake/sleep controls while leaving volume on system audio controls.
 
 ## Overview
 
-The media key detection system uses the Linux `evdev` library to capture button presses from hardware devices and translates them into music control commands.
+The media key detection system uses the Linux `evdev` library to capture button presses from hardware devices and translates them into orchestrator actions.
 
 ### Supported Buttons
 
-- **Play/Pause** - Toggle playback
-- **Stop** - Stop playback
-- **Next** - Skip to next track
-- **Previous** - Go to previous track
-- **Volume Up** - Increase volume by 5%
-- **Volume Down** - Decrease volume by 5%
-- **Mute** - Set volume to 0
-- **Phone** - (Currently unused, but detected)
+- **Play/Pause** - Toggle wake/sleep
+- **Stop** - Optional MPD stop (when MPD media-key control is enabled)
+- **Next** - Same wake/sleep toggle behavior as play
+- **Previous** - Same wake/sleep toggle behavior as play
+- **Volume Up** - Increase system output volume
+- **Volume Down** - Decrease system output volume
+- **Mute** - Toggle microphone mute
+- **Phone** - Trigger wake
 
 ## Setup
 
@@ -73,7 +73,9 @@ Add these settings to your `.env` file:
 # Media Key Detection
 MEDIA_KEYS_ENABLED=true
 MEDIA_KEYS_DEVICE_FILTER=Burr-Brown  # Optional: substring to filter device names
-MEDIA_KEYS_CONTROL_MUSIC=true        # Allow media keys to control MPD
+MEDIA_KEYS_CONTROL_MUSIC=false       # Keep media keys from controlling MPD volume/playback
+MEDIA_KEYS_EXCLUSIVE_GRAB=false      # Let OS keep handling volume keys/LED state
+MEDIA_KEYS_PASSTHROUGH_KEYS=volume_up,volume_down,mute
 ```
 
 The `MEDIA_KEYS_DEVICE_FILTER` is optional but helpful if you have multiple devices. Use a substring from your device name (e.g., "Anker", "USB", "Conference", "Burr-Brown").
@@ -155,17 +157,17 @@ python3 test_media_keys.py
 3. Verify: `groups | grep input`
 4. Temporary workaround: Run with sudo
 
-### Buttons Detected But Music Doesn't Respond
+### Buttons Detected But Expected Action Doesn't Happen
 
 **Symptoms:**
 - Button presses logged
-- No music control happens
+- No expected wake/sleep or volume behavior happens
 
 **Solutions:**
-1. Check `MUSIC_ENABLED=true` in `.env`
-2. Check MPD is running: `mpd --version` or `docker ps | grep mpd`
-3. Check `MEDIA_KEYS_CONTROL_MUSIC=true` in `.env`
-4. Check orchestrator logs for music system initialization errors
+1. Check `MEDIA_KEYS_ENABLED=true` in `.env`
+2. Check `MEDIA_KEYS_EXCLUSIVE_GRAB` and `MEDIA_KEYS_PASSTHROUGH_KEYS` values
+3. If using exclusive grab, ensure `wpctl`, `pactl`, or `amixer` exists for system volume changes
+4. Check orchestrator logs for media-key detector initialization errors
 
 ## Architecture
 
@@ -178,13 +180,15 @@ python3 test_media_keys.py
 
 2. **Integration** (`orchestrator/main.py`)
    - Initializes detector when `MEDIA_KEYS_ENABLED=true`
-   - Connects button events to MusicManager actions
+    - Connects play/phone events to wake/sleep flow
+    - Routes volume events to OS volume behavior (not MPD volume)
    - Manages lifecycle (start/stop)
 
 3. **Configuration** (`orchestrator/config.py`)
    - `media_keys_enabled` - Enable/disable feature
    - `media_keys_device_filter` - Optional device name filter
-   - `media_keys_control_music` - Allow music control
+    - `media_keys_exclusive_grab` - Whether to exclusively grab input device
+    - `media_keys_passthrough_keys` - Keys re-injected to OS when grabbed
 
 ### Event Flow
 
@@ -199,9 +203,7 @@ MediaKeyDetector.detect()
     ↓
 Callback: on_media_key_press()
     ↓
-MusicManager.pause() / .next_track() / etc.
-    ↓
-MPD Command
+Wake/Sleep Handler or System Volume Command
     ↓
 Audio Output Changes
 ```
@@ -243,14 +245,7 @@ MEDIA_KEYS_DEVICE_FILTER=
 
 ### Adjust Volume Steps
 
-Edit the volume change amount in `orchestrator/main.py`:
-
-```python
-elif event.key == "volume_up":
-    asyncio.create_task(music_manager.increase_volume(10))  # Change 5 to 10
-elif event.key == "volume_down":
-    asyncio.create_task(music_manager.decrease_volume(10))
-```
+Volume-step behavior is handled through system mixers (`wpctl`/`pactl`/`amixer`) in `orchestrator/main.py` and currently uses 5% steps.
 
 ## Security Notes
 

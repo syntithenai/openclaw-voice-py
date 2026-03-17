@@ -31,7 +31,7 @@ from collections import deque
 from contextlib import redirect_stderr
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 from urllib.parse import urlsplit
 from urllib.request import urlretrieve
 
@@ -46,6 +46,7 @@ from orchestrator.wakeword.openwakeword import OpenWakeWordDetector
 from orchestrator.wakeword.precise import MycoftPreciseDetector
 from orchestrator.wakeword.picovoice import PicovoiceDetector
 from orchestrator.stt.whisper_client import WhisperClient
+from orchestrator.stt.pyannote_client import PyannoteClient
 from orchestrator.emotion.sensevoice import SenseVoice
 from orchestrator.gateway import build_gateway
 from orchestrator.gateway.message_extract import (
@@ -78,6 +79,7 @@ from orchestrator.metrics import AECStatus, WakeWordResult
 from orchestrator.services.mpd_manager import MPDManager
 from orchestrator.runtime.config_validation import validate_runtime_config
 from orchestrator.platform.hardware import is_raspberry_pi
+from orchestrator.tools.recorder import RecorderTool
 from orchestrator.vad.model_loader import ensure_silero_model
 import numpy as np
 
@@ -88,6 +90,244 @@ class TTSQueueItem:
     request_id: int
     kind: str  # "reply" | "notification"
     created_ts: float
+
+
+@dataclass(frozen=True)
+class GhostDecision:
+    accepted: bool
+    reason_codes: tuple[str, ...]
+    score: int
+    matched_priority_rule: str
+
+
+ACK_TOKENS = {
+    "yes",
+    "no",
+    "okay",
+    "ok",
+    "sure",
+    "thanks",
+    "thank you",
+    "right",
+    "yep",
+    "nope",
+    "correct",
+}
+
+GREETING_TOKENS = {
+    "hello",
+    "hi",
+    "hey",
+}
+
+GHOST_ARTIFACT_TOKENS = {
+    "hello",
+    "hi",
+    "thanks",
+    "thank you",
+    "hmm",
+    "sigh",
+    "sighs",
+    "you re welcome",
+    "you're welcome",
+    "youre welcome",
+    "subtitles by the amara org community",
+    "subtitles by amara org community",
+    "subtitles by the amara org",
+}
+
+
+def canonicalize_transcript_for_match(text: str) -> str:
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return ""
+    lowered = lowered.replace("’", "'")
+    lowered = re.sub(r"[^a-z0-9\s']+", " ", lowered)
+    lowered = re.sub(r"\s+", " ", lowered).strip()
+    return lowered
+
+
+def assistant_turn_is_question(text: str) -> bool:
+    s = (text or "").strip().lower()
+    if not s:
+        return False
+    if s.endswith("?"):
+        return True
+    return bool(
+        re.search(
+            r"\b(which|what|when|where|who|did you mean|do you mean|which one do you mean)\b",
+            s,
+        )
+    )
+
+
+def assistant_turn_expects_short_reply(text: str) -> bool:
+    s = (text or "").strip().lower()
+    if not s:
+        return False
+    if assistant_turn_is_question(s):
+        return True
+    return bool(
+        re.search(
+            r"\b(do you want|would you like|should i|can you confirm|which one|choose|pick one|confirm)\b",
+            s,
+        )
+    )
+
+
+def is_ack_token(canonical: str) -> bool:
+    return canonical in ACK_TOKENS
+
+
+def is_greeting_token(canonical: str) -> bool:
+    return canonical in GREETING_TOKENS
+
+
+def score_self_echo_similarity(transcript: str, recent_tts_texts: Sequence[str]) -> float:
+    canonical = canonicalize_transcript_for_match(transcript)
+    if not canonical:
+        return 0.0
+
+    tx_words = canonical.split()
+    tx_set = set(tx_words)
+    best_score = 0.0
+    for candidate_raw in recent_tts_texts:
+        candidate = canonicalize_transcript_for_match(candidate_raw)
+        if not candidate:
+            continue
+        if canonical == candidate:
+            return 1.0
+        if len(canonical) >= 8 and (canonical in candidate or candidate in canonical):
+            best_score = max(best_score, 0.92)
+
+        cand_words = candidate.split()
+        cand_set = set(cand_words)
+        if not tx_set or not cand_set:
+            continue
+        overlap = len(tx_set & cand_set) / float(max(len(tx_set), 1))
+        candidate_overlap = len(tx_set & cand_set) / float(max(len(cand_set), 1))
+        combined = (overlap * 0.65) + (candidate_overlap * 0.35)
+        best_score = max(best_score, combined)
+    return max(0.0, min(1.0, best_score))
+
+
+def decide_ghost_transcript(ctx: dict[str, Any]) -> GhostDecision:
+    transcript = str(ctx.get("transcript_text") or "").strip()
+    canonical = str(ctx.get("canonical_transcript") or "")
+    token_count = int(ctx.get("token_count") or 0)
+    has_alnum = bool(re.search(r"[a-zA-Z0-9]", transcript))
+    is_single_word = bool(ctx.get("is_single_word"))
+    is_short_transcript = bool(ctx.get("is_short_transcript"))
+
+    if not transcript:
+        return GhostDecision(False, ("empty_transcript",), -9, "hard_reject_empty")
+    if not has_alnum:
+        return GhostDecision(False, ("punctuation_only",), -9, "hard_reject_punctuation")
+
+    similarity = float(ctx.get("self_echo_similarity") or 0.0)
+    similarity_threshold = float(ctx.get("self_echo_similarity_threshold") or 0.75)
+    tts_playing = bool(ctx.get("tts_playing"))
+    ms_since_tts_end = float(ctx.get("ms_since_tts_end") or 999999.0)
+    playback_tail_ms = float(ctx.get("playback_tail_ms") or 1200)
+
+    if similarity >= similarity_threshold:
+        return GhostDecision(False, ("self_echo_high_similarity",), -8, "hard_reject_self_echo")
+
+    if tts_playing and canonical in {"you re welcome", "you're welcome", "youre welcome", "thanks", "thank you"}:
+        return GhostDecision(False, ("active_playback_echo_phrase",), -8, "hard_reject_playback_echo")
+
+    last_assistant_was_question = bool(ctx.get("last_assistant_was_question"))
+    last_assistant_expects_short_reply = bool(ctx.get("last_assistant_expects_short_reply"))
+    last_user_went_upstream = bool(ctx.get("last_user_went_upstream"))
+    last_upstream_response_was_question = bool(ctx.get("last_upstream_response_was_question"))
+    last_upstream_response_requested_confirmation = bool(ctx.get("last_upstream_response_requested_confirmation"))
+    upstream_context_is_fresh = bool(ctx.get("upstream_context_is_fresh"))
+
+    allow_codes: list[str] = []
+    if token_count <= 3 and last_assistant_was_question:
+        allow_codes.append("allow_assistant_question")
+    if token_count <= 3 and last_user_went_upstream and last_upstream_response_was_question and upstream_context_is_fresh:
+        allow_codes.append("allow_upstream_question")
+    if token_count <= 4 and last_upstream_response_requested_confirmation and upstream_context_is_fresh:
+        allow_codes.append("allow_upstream_clarification")
+    if is_ack_token(canonical) and last_assistant_expects_short_reply:
+        allow_codes.append("allow_direct_confirmation")
+
+    strong_allow = bool(allow_codes)
+
+    cut_in_active = bool(ctx.get("cut_in_active"))
+    ms_from_cut_in_start = float(ctx.get("ms_from_cut_in_start") or 999999.0)
+    cutin_early_ms = float(ctx.get("cutin_early_ms") or 500)
+    require_question_for_acks = bool(ctx.get("require_question_for_acks"))
+    single_word_enabled = bool(ctx.get("single_word_enabled"))
+
+    if canonical in GHOST_ARTIFACT_TOKENS and not strong_allow:
+        return GhostDecision(False, ("ghost_artifact_phrase",), -4, "strong_suppress_artifact")
+
+    if single_word_enabled and is_single_word and cut_in_active and ms_from_cut_in_start <= cutin_early_ms and not strong_allow:
+        return GhostDecision(False, ("cutin_early_single_word",), -3, "strong_suppress_cutin_blip")
+
+    if single_word_enabled and is_single_word and ms_since_tts_end <= playback_tail_ms and similarity >= 0.45 and not strong_allow:
+        return GhostDecision(False, ("playback_tail_blip",), -3, "strong_suppress_playback_tail")
+
+    if require_question_for_acks and is_ack_token(canonical):
+        has_question_context = last_assistant_was_question or (last_user_went_upstream and last_upstream_response_was_question and upstream_context_is_fresh)
+        if not has_question_context and not strong_allow:
+            return GhostDecision(False, ("ack_without_question_context",), -3, "strong_suppress_ack_no_question")
+
+    if is_greeting_token(canonical) and not strong_allow and not bool(ctx.get("has_fresh_prompt_context")):
+        return GhostDecision(False, ("standalone_greeting",), -3, "strong_suppress_greeting")
+
+    score = 0
+    if last_upstream_response_was_question and upstream_context_is_fresh:
+        score += 4
+    if last_assistant_was_question:
+        score += 3
+    if last_upstream_response_requested_confirmation and upstream_context_is_fresh:
+        score += 3
+    if last_user_went_upstream and upstream_context_is_fresh:
+        score += 2
+    if token_count >= 2 and token_count <= 3:
+        score += 2
+    if token_count >= 4:
+        score += 1
+
+    if similarity >= similarity_threshold:
+        score -= 5
+    if canonical in GHOST_ARTIFACT_TOKENS:
+        score -= 4
+    if is_single_word and is_ack_token(canonical) and not (last_assistant_was_question or last_upstream_response_was_question):
+        score -= 3
+    if single_word_enabled and is_single_word and cut_in_active and ms_from_cut_in_start <= cutin_early_ms:
+        score -= 3
+    if is_single_word and ms_since_tts_end <= playback_tail_ms and similarity >= 0.35:
+        score -= 2
+
+    if strong_allow and score <= 0:
+        return GhostDecision(True, tuple(allow_codes), score, "hard_allow_context")
+    if score >= 1:
+        return GhostDecision(True, tuple(allow_codes) if allow_codes else ("weighted_accept",), score, "weighted_accept")
+
+    if token_count >= 4:
+        return GhostDecision(True, ("default_accept_normal_length",), score, "default_accept")
+    if is_short_transcript:
+        return GhostDecision(False, ("default_suppress_short_without_support",), score, "default_suppress_short")
+    return GhostDecision(True, ("default_accept",), score, "default_accept")
+
+
+def _should_navigate_to_music_page(
+    transcript: str,
+    parsed_music: tuple[str, dict[str, Any] | str] | None,
+    is_music_query: bool,
+) -> bool:
+    if is_music_query:
+        return True
+    if parsed_music is not None:
+        return True
+    normalized = canonicalize_transcript_for_match(transcript)
+    if not normalized:
+        return False
+    return bool(re.search(r"\b(queue|playlist)\b", normalized))
 
 
 # Custom logging formatter with selective color highlighting for transcriptions
@@ -149,6 +389,13 @@ sys.stderr.reconfigure(line_buffering=True)
 
 async def run_orchestrator() -> None:
     config = VoiceConfig()
+    source_root = Path(__file__).resolve().parent.parent
+    workspace_root = Path(config.openclaw_workspace_dir).expanduser()
+    if not workspace_root.is_absolute():
+        workspace_root = (source_root / workspace_root).resolve()
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    os.environ["OPENCLAW_WORKSPACE_DIR"] = str(workspace_root)
+    os.environ.setdefault("OPENCLAW_WORKSPACE", str(workspace_root))
     
     # Smart defaults: enable ring buffer clearing on ARM systems to prevent ghost transcripts
     if is_raspberry_pi() and config.wake_clear_ring_buffer is False:
@@ -326,6 +573,23 @@ async def run_orchestrator() -> None:
     tts_last_played_request_id = 0  # Request ID of the last successfully completed TTS item
     last_gateway_send_ts: float | None = None  # Monotonic time of the last transcript sent to gateway
     last_thinking_phrase_ts: float | None = None  # Monotonic time of the last thinking phrase spoken
+    last_user_text = ""
+    last_user_accepted_ts: float | None = None
+    last_user_went_upstream = False
+    last_assistant_text = ""
+    last_assistant_source = ""
+    last_assistant_ts: float | None = None
+    last_assistant_was_question = False
+    last_assistant_expects_short_reply = False
+    last_upstream_assistant_text = ""
+    last_upstream_assistant_ts: float | None = None
+    last_upstream_response_was_question = False
+    last_upstream_response_requested_confirmation = False
+    ghost_suppressed_total = 0
+    ghost_suppressed_short_no_question = 0
+    ghost_suppressed_self_echo = 0
+    ghost_accepted_short_after_question = 0
+    ghost_accepted_short_after_upstream_question = 0
     warned_wake_resample = False
     warned_aec_stub = False
     wake_sleep_ts: float | None = None
@@ -465,7 +729,6 @@ async def run_orchestrator() -> None:
     if timers_feature_enabled:
         print("→ Initializing Tool System (timers/alarms)...", flush=True)
         logger.info("→ Initializing Tool System...")
-        from pathlib import Path
         from orchestrator.tools.router import ToolRouter
         from orchestrator.tools.monitor import ToolMonitor
         from orchestrator.tools.state import StateManager
@@ -473,8 +736,7 @@ async def run_orchestrator() -> None:
         from orchestrator.tools.alarm import AlarmManager
         from orchestrator.alerts import AlertGenerator
         
-        # Get workspace root and ensure timers directory exists
-        workspace_root = Path(__file__).resolve().parent.parent
+        # Ensure timers directory exists in configured workspace root
         timers_dir = workspace_root / config.tools_persist_dir
         timers_dir.mkdir(exist_ok=True)
         
@@ -611,6 +873,67 @@ async def run_orchestrator() -> None:
             music_router = None
             music_manager = None
     
+    recorder_tool = None
+    recording_blocks_tools = False
+    if config.recorder_enabled:
+        pyannote_client = None
+        if config.recorder_pyannote_enabled and config.recorder_pyannote_url:
+            pyannote_client = PyannoteClient(
+                base_url=config.recorder_pyannote_url,
+                model_id=config.recorder_pyannote_model,
+            )
+
+        async def _on_recorder_started() -> None:
+            nonlocal recording_blocks_tools, wake_state, wake_sleep_ts, last_wake_detected_ts, chunk_frames, chunk_start_ts, last_speech_ts
+            recording_blocks_tools = True
+            wake_state = WakeState.ASLEEP
+            wake_sleep_ts = time.monotonic()
+            last_wake_detected_ts = None
+            chunk_frames = []
+            chunk_start_ts = None
+            last_speech_ts = None
+            logger.info("🎙️ Recorder started: enforcing quiet mode")
+            if music_manager:
+                try:
+                    if await music_manager.is_playing():
+                        await music_manager.stop()
+                        logger.info("🎵 Recorder started: stopped active music playback")
+                except Exception as exc:
+                    logger.debug("Recorder start music stop failed: %s", exc)
+
+            if alarm_manager:
+                try:
+                    stopped = await alarm_manager.stop_alarm(None)
+                    if stopped > 0:
+                        logger.info("🔕 Recorder started: silenced %d ringing alarm(s)", stopped)
+                except Exception as exc:
+                    logger.debug("Recorder start alarm stop failed: %s", exc)
+
+        async def _on_recorder_stopped() -> None:
+            nonlocal recording_blocks_tools, wake_state, wake_sleep_ts, last_wake_detected_ts
+            recording_blocks_tools = False
+            wake_state = WakeState.AWAKE if not config.wake_word_enabled else WakeState.ASLEEP
+            wake_sleep_ts = time.monotonic()
+            last_wake_detected_ts = None
+            logger.info("🎙️ Recorder stopped: timer/alarm processing resumes")
+
+        print("→ Initializing Recorder tool...", flush=True)
+        logger.info("→ Initializing Recorder tool...")
+        recorder_tool = RecorderTool(
+            workspace_root=workspace_root,
+            output_dir=config.recorder_output_dir,
+            sample_rate=config.audio_sample_rate,
+            whisper_client=whisper_client,
+            pyannote_client=pyannote_client,
+            pyannote_enabled=config.recorder_pyannote_enabled,
+            pyannote_auth_token=config.recorder_pyannote_auth_token,
+            pyannote_model=config.recorder_pyannote_model,
+            on_recording_started=_on_recorder_started,
+            on_recording_stopped=_on_recorder_stopped,
+        )
+        logger.info("✓ Recorder tool ready (output_dir=%s)", workspace_root / config.recorder_output_dir)
+        print("✓ Recorder tool ready", flush=True)
+
     # Embedded realtime web UI service handle (initialized later)
     web_service = None
 
@@ -1073,8 +1396,10 @@ async def run_orchestrator() -> None:
                 timeout_ms=config.quick_answer_timeout_ms,
                 timers_enabled=timers_feature_enabled,
                 music_enabled=config.music_enabled,
+                recorder_enabled=config.recorder_enabled,
                 tool_router=tool_router,
                 music_router=music_router,
+                recorder_tool=recorder_tool,
             )
             logger.info("✓ Quick Answer LLM ready")
             print("✓ Quick Answer LLM ready", flush=True)
@@ -1505,10 +1830,14 @@ async def run_orchestrator() -> None:
                     except Exception as exc:
                         logger.warning("Web UI music_play_track pos=%d: %s", position, exc)
 
-            async def _ui_music_remove_selected(positions: list[int], client_id: str) -> None:
+            async def _ui_music_remove_selected(
+                positions: list[int],
+                client_id: str,
+                song_ids: list[str] | None = None,
+            ) -> None:
                 if music_manager:
                     try:
-                        await music_manager.remove_from_queue_positions(positions)
+                        await music_manager.remove_from_queue_positions(positions, song_ids=song_ids)
                         if web_service:
                             ms = await music_manager.get_ui_music_state()
                             q = await music_manager.get_ui_playlist()
@@ -1519,7 +1848,9 @@ async def run_orchestrator() -> None:
             async def _ui_music_add_files(files: list[str], client_id: str) -> None:
                 if music_manager:
                     try:
-                        await music_manager.add_files_to_queue(files)
+                        result = await music_manager.add_files_to_queue(files)
+                        if str(result).strip().lower().startswith("error:"):
+                            raise RuntimeError(result)
                         if web_service:
                             ms = await music_manager.get_ui_music_state()
                             q = await music_manager.get_ui_playlist()
@@ -1968,6 +2299,11 @@ async def run_orchestrator() -> None:
         """Send accumulated transcripts after debounce period."""
         nonlocal pending_transcripts, processing_request, debounce_task
         nonlocal music_paused_for_wake, music_auto_resume_timer
+        nonlocal last_user_text, last_user_accepted_ts, last_user_went_upstream
+        nonlocal last_assistant_text, last_assistant_source, last_assistant_ts
+        nonlocal last_assistant_was_question, last_assistant_expects_short_reply
+        nonlocal last_upstream_assistant_text, last_upstream_assistant_ts
+        nonlocal last_upstream_response_was_question, last_upstream_response_requested_confirmation
         
         # If already processing, let that task handle everything
         if processing_request:
@@ -2004,6 +2340,8 @@ async def run_orchestrator() -> None:
                 pending_transcripts.clear()
                 return
 
+            parsed_music: tuple[str, dict[str, Any] | str] | None = None
+
             # Belt-and-suspenders: if user explicitly asked to stop/pause music,
             # clear wake-pause auto-resume state immediately so music cannot
             # restart on the silence timer path.
@@ -2030,12 +2368,18 @@ async def run_orchestrator() -> None:
                     "source": "voice",
                     "request_id": current_request_id,
                 })
+                is_music_query = bool(music_router and music_router.is_music_related(combined_transcript))
+                page_to_navigate = "music" if _should_navigate_to_music_page(combined_transcript, parsed_music, is_music_query) else "home"
+                web_service.navigate_ui_page(page_to_navigate)
+
+            last_user_text = combined_transcript
+            last_user_accepted_ts = time.monotonic()
+            last_user_went_upstream = False
             
             # Try quick answer first if enabled
             should_send_to_gateway = True
             nonlocal last_gateway_send_ts, last_thinking_phrase_ts
             bypass_window_ms = config.quick_answer_bypass_window_ms
-            is_music_query = bool(music_router and music_router.is_music_related(combined_transcript))
             in_bypass_window = (
                 bypass_window_ms > 0
                 and last_gateway_send_ts is not None
@@ -2078,10 +2422,16 @@ async def run_orchestrator() -> None:
                                     "request_id": current_request_id,
                                     "segment_kind": "final",
                                 })
+                            last_assistant_text = quick_response
+                            last_assistant_source = "quick_answer"
+                            last_assistant_ts = time.monotonic()
+                            last_assistant_was_question = assistant_turn_is_question(quick_response)
+                            last_assistant_expects_short_reply = assistant_turn_expects_short_reply(quick_response)
                         else:
                             logger.info("→ QUICK ANSWER [req#%d]: Silent success (no TTS response)", current_request_id)
 
                         should_send_to_gateway = False
+                        last_user_went_upstream = False
                         # Clear all transcripts processed (including any that arrived during LLM call)
                         pending_transcripts.clear()
                         # Mirror both turns to the openclaw session so they appear in the web chat UI
@@ -2157,6 +2507,7 @@ async def run_orchestrator() -> None:
                 final_text = f"[{emotion_tag}] {combined_transcript}" if emotion_tag else combined_transcript
                 logger.info("→ GATEWAY: Sending debounced transcript (%d parts) to %s [req#%d]", transcript_count, gateway.provider, current_request_id)
                 last_gateway_send_ts = time.monotonic()
+                last_user_went_upstream = True
                 gw_start = time.monotonic()
                 try:
                     response_text = await gateway.send_message(
@@ -2181,6 +2532,15 @@ async def run_orchestrator() -> None:
                                 "request_id": current_request_id,
                                 "segment_kind": "final",
                             })
+                        last_assistant_text = response_text
+                        last_assistant_source = "gateway"
+                        last_assistant_ts = time.monotonic()
+                        last_assistant_was_question = assistant_turn_is_question(response_text)
+                        last_assistant_expects_short_reply = assistant_turn_expects_short_reply(response_text)
+                        last_upstream_assistant_text = response_text
+                        last_upstream_assistant_ts = last_assistant_ts
+                        last_upstream_response_was_question = last_assistant_was_question
+                        last_upstream_response_requested_confirmation = last_assistant_expects_short_reply
                     else:
                         # Agent executed command without returning text (e.g., "play jazz")
                         logger.info("← GATEWAY: No text response (agent executed action without speech response)")
@@ -2316,6 +2676,12 @@ async def run_orchestrator() -> None:
         nonlocal active_transcriptions, state, pending_transcripts, debounce_task
         nonlocal cut_in_tts_hold_active, cut_in_tts_hold_started_ts, cut_in_tts_hold_request_id
         nonlocal tts_playing, last_tts_text, last_tts_ts, current_tts_text
+        nonlocal wake_state, wake_sleep_ts, last_wake_detected_ts
+        nonlocal last_assistant_ts, last_assistant_was_question, last_assistant_expects_short_reply
+        nonlocal last_user_went_upstream, last_upstream_assistant_ts, last_upstream_response_was_question
+        nonlocal last_upstream_response_requested_confirmation
+        nonlocal ghost_suppressed_total, ghost_suppressed_short_no_question, ghost_suppressed_self_echo
+        nonlocal ghost_accepted_short_after_question, ghost_accepted_short_after_upstream_question
         active_transcriptions += 1
         state = VoiceState.SENDING
         try:
@@ -2341,72 +2707,113 @@ async def run_orchestrator() -> None:
                 )
                 return
 
-            canonical_transcript = canonicalize_transcript_for_match(transcript)
-            if canonical_transcript in {
-                "thank you",
-                "thanks",
-                "thankyou",
-                "thanks you",
-                "thank you very much",
-                "subtitles by the amara org community",
-                "subtitles by amara org community",
-                "subtitles by the amara org",
-                "sigh",
-                "sighs",
-                "sighing",
-                "deep sigh",
-                "heavy sigh",
-                "big sigh",
-                "long sigh",
-                "audible sigh",
-                "exhales",
-                "exhale",
-                "hmm",
-            }:
-                logger.warning(
-                    "⊘ Transcript filtered as low-signal noise: '%s'",
-                    transcript[:120],
-                )
-                return
-
-            # Guardrail: suppress likely self-echo transcripts captured from speaker
-            # output during playback and immediately after playback tails.
             now_ts = time.monotonic()
-            if is_likely_tts_self_echo(transcript, now_ts):
-                logger.warning(
-                    "⊘ Transcript filtered as likely TTS self-echo (tts_playing=%s, recent_tts_ms=%d): '%s'",
-                    tts_playing,
-                    int(max(0.0, (now_ts - last_tts_ts) * 1000)),
-                    transcript[:120],
-                )
+            canonical_transcript = canonicalize_transcript_for_match(transcript)
+            token_count = len([t for t in canonical_transcript.split() if t])
+            is_single_word = token_count == 1
+            is_short_transcript = token_count <= 3
+            ms_since_tts_end = max(0.0, (now_ts - last_tts_ts) * 1000)
+            ms_since_last_assistant_turn = (
+                max(0.0, (now_ts - last_assistant_ts) * 1000)
+                if last_assistant_ts is not None
+                else float("inf")
+            )
+            ms_since_upstream_assistant_turn = (
+                max(0.0, (now_ts - last_upstream_assistant_ts) * 1000)
+                if last_upstream_assistant_ts is not None
+                else float("inf")
+            )
+            upstream_context_is_fresh = bool(
+                last_user_went_upstream
+                and ms_since_upstream_assistant_turn <= float(config.ghost_filter_upstream_context_ms)
+            )
+
+            cut_in_active = cut_in_ts is not None
+            ms_from_cut_in_start = float("inf")
+            if cut_in_active:
+                reference_ts = chunk_started_ts if chunk_started_ts is not None else now_ts
+                ms_from_cut_in_start = max(0.0, (reference_ts - cut_in_ts) * 1000)
+
+            self_echo_similarity = score_self_echo_similarity(
+                transcript,
+                [last_tts_text, current_tts_text],
+            )
+
+            has_fresh_prompt_context = (
+                ms_since_last_assistant_turn <= float(config.ghost_filter_recent_assistant_ms)
+                and (last_assistant_was_question or last_assistant_expects_short_reply)
+            )
+
+            ghost_ctx: dict[str, Any] = {
+                "transcript_text": transcript,
+                "canonical_transcript": canonical_transcript,
+                "token_count": token_count,
+                "char_count": len(transcript),
+                "is_single_word": is_single_word,
+                "is_short_transcript": is_short_transcript,
+                "tts_playing": tts_playing,
+                "ms_since_tts_end": ms_since_tts_end,
+                "last_assistant_was_question": last_assistant_was_question,
+                "last_assistant_expects_short_reply": last_assistant_expects_short_reply,
+                "last_user_went_upstream": last_user_went_upstream,
+                "last_upstream_response_was_question": last_upstream_response_was_question,
+                "last_upstream_response_requested_confirmation": last_upstream_response_requested_confirmation,
+                "upstream_context_is_fresh": upstream_context_is_fresh,
+                "cut_in_active": cut_in_active,
+                "ms_from_cut_in_start": ms_from_cut_in_start,
+                "self_echo_similarity": self_echo_similarity,
+                "self_echo_similarity_threshold": float(config.ghost_filter_self_echo_similarity_threshold),
+                "single_word_enabled": bool(config.ghost_filter_single_word_enabled),
+                "require_question_for_acks": bool(config.ghost_filter_require_question_for_acks),
+                "playback_tail_ms": float(config.ghost_filter_playback_tail_ms),
+                "cutin_early_ms": float(config.ghost_filter_cutin_early_ms),
+                "has_fresh_prompt_context": has_fresh_prompt_context,
+            }
+
+            ghost_filter_active = bool(config.ghost_filter_enabled and not config.ghost_filter_kill_switch)
+            if ghost_filter_active:
+                decision = decide_ghost_transcript(ghost_ctx)
+                if not decision.accepted:
+                    ghost_suppressed_total += 1
+                    if "self_echo" in decision.matched_priority_rule:
+                        ghost_suppressed_self_echo += 1
+                    if "short" in decision.matched_priority_rule or "ack_no_question" in decision.matched_priority_rule:
+                        ghost_suppressed_short_no_question += 1
+                    if config.ghost_filter_debug_logging:
+                        logger.warning(
+                            "⊘ Ghost transcript suppressed: rule=%s score=%d reasons=%s text='%s' (tts_playing=%s ms_since_tts_end=%d ms_since_asst=%d cut_in_ms=%d sim=%.2f)",
+                            decision.matched_priority_rule,
+                            decision.score,
+                            ",".join(decision.reason_codes),
+                            transcript[:120],
+                            tts_playing,
+                            int(ms_since_tts_end),
+                            int(ms_since_last_assistant_turn if math.isfinite(ms_since_last_assistant_turn) else -1),
+                            int(ms_from_cut_in_start if math.isfinite(ms_from_cut_in_start) else -1),
+                            self_echo_similarity,
+                        )
+                    return
+                if is_short_transcript and last_assistant_was_question:
+                    ghost_accepted_short_after_question += 1
+                if is_short_transcript and last_user_went_upstream and last_upstream_response_was_question:
+                    ghost_accepted_short_after_upstream_question += 1
+
+            if recorder_tool and recorder_tool.is_recording():
+                if recorder_tool.should_stop_from_transcript(transcript):
+                    stop_result = await recorder_tool.stop_recording(
+                        reason="voice stop phrase",
+                        trim_tail_seconds=1.6,
+                    )
+                    if stop_result.response:
+                        await submit_tts(stop_result.response, request_id=current_request_id, kind="notification")
+                    logger.info("🎙️ Recorder stop phrase handled locally")
+                else:
+                    logger.info("🎙️ Recorder hotword window transcript ignored (no stop phrase)")
+                wake_state = WakeState.ASLEEP
+                wake_sleep_ts = now_ts
+                last_wake_detected_ts = None
                 return
             
-            # Filter single-syllable words during cut-in
-            if cut_in_ts is not None:
-                reference_ts = chunk_started_ts if chunk_started_ts is not None else time.monotonic()
-                elapsed_ms = int((reference_ts - cut_in_ts) * 1000)
-                words = transcript.split()
-                # Only apply filter if: single word AND within 500ms of cut-in
-                if len(words) == 1 and elapsed_ms <= 500:
-                    if count_syllables(words[0]) == 1:
-                        logger.warning(
-                            "⊘ Cut-in: Filtered out single-syllable word '%s' (elapsed=%dms)",
-                            words[0],
-                            elapsed_ms
-                        )
-                        return
-
-                # Guardrail: when TTS is currently playing and STT captures the common
-                # self-echo phrase "you're welcome", ignore it to avoid recursive
-                # gateway requests that interrupt in-flight TTS.
-                canonical = canonicalize_transcript_for_match(transcript)
-                if tts_playing and canonical in {"you're welcome", "youre welcome"}:
-                    logger.warning(
-                        "⊘ Cut-in: Ignored likely TTS self-echo transcript during playback: '%s'",
-                        transcript[:80],
-                    )
-                    return
-
             # Emotion detection phase
             emotion_tag = ""
             if config.emotion_enabled:
@@ -2917,6 +3324,8 @@ async def run_orchestrator() -> None:
         # Define callbacks for timer/alarm events
         async def on_timer_expired(timer_id: str, name: str):
             """Called when a timer expires."""
+            while recording_blocks_tools:
+                await asyncio.sleep(0.2)
             logger.info("⏰ TIMER EXPIRED: %s (%s)", name or timer_id, timer_id)
             # Play timer bell three times before speaking completion.
             bell_pcm = alert_gen.get_timer_alert_pcm()
@@ -2940,6 +3349,8 @@ async def run_orchestrator() -> None:
         
         async def on_alarm_triggered(alarm_id: str, name: str):
             """Called when an alarm first triggers."""
+            while recording_blocks_tools:
+                await asyncio.sleep(0.2)
             logger.info("⏰ ALARM TRIGGERED: %s (%s)", name or alarm_id, alarm_id)
             # Announce alarm
             if name:
@@ -2949,6 +3360,8 @@ async def run_orchestrator() -> None:
         
         async def on_alarm_ringing(alarm_id: str, name: str):
             """Called repeatedly while alarm is ringing (every few seconds)."""
+            if recording_blocks_tools:
+                return
             logger.info("🔔 ALARM RINGING: %s (%s)", name or alarm_id, alarm_id)
             # Play bell sound
             bell_pcm = alert_gen.get_alarm_alert_pcm()
@@ -2971,6 +3384,7 @@ async def run_orchestrator() -> None:
         tool_monitor.on_timer_expired = on_timer_expired
         tool_monitor.on_alarm_triggered = on_alarm_triggered
         tool_monitor.on_alarm_ringing = on_alarm_ringing
+        tool_monitor.defer_processing = lambda: bool(recording_blocks_tools)
         await tool_monitor.start()
         logger.info("✓ Tool monitor started (check_interval=%dms)", config.tools_monitor_interval_ms)
 
@@ -3160,6 +3574,9 @@ async def run_orchestrator() -> None:
                 last_audio_source_log_ts = now
 
             frame_count += 1
+
+            if recorder_tool and recorder_tool.is_recording():
+                recorder_tool.append_frame(frame)
 
             # Drop audio frames during the brief post-alarm-cut-in mute window
             if skip_audio_until and now < skip_audio_until:
@@ -3463,7 +3880,13 @@ async def run_orchestrator() -> None:
             # We use RMS baseline tracking for echo rejection instead
             ring_buffer.add_frame(frame)
 
-            if config.wake_word_enabled and (not continuous_mode) and wake_state == WakeState.ASLEEP:
+            recorder_hotword_mode = bool(
+                recorder_tool
+                and recorder_tool.is_recording()
+                and wake_detector is not None
+            )
+
+            if (recorder_hotword_mode or (config.wake_word_enabled and (not continuous_mode))) and wake_state == WakeState.ASLEEP:
                 # While sleeping during music playback, use voice cut-in only to duck
                 # volume briefly so the hotword can be heard more reliably.
                 if (
@@ -3937,6 +4360,16 @@ async def run_orchestrator() -> None:
                     chunk_start_ts = None
                     last_speech_ts = None
                     cut_in_triggered_ts = None
+
+                    if recorder_hotword_mode:
+                        wake_state = WakeState.ASLEEP
+                        wake_sleep_ts = now
+                        last_wake_detected_ts = None
+                        if wake_detector and hasattr(wake_detector, 'reset_state'):
+                            try:
+                                wake_detector.reset_state()
+                            except Exception:
+                                pass
 
             if config.wake_word_enabled and (not continuous_mode) and wake_state == WakeState.AWAKE:
                 if last_wake_detected_ts is None:

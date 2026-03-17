@@ -270,7 +270,7 @@ class MusicFastPathParser:
         music_keywords = [
             "play", "pause", "stop", "skip", "next", "previous", "back",
             "volume", "music", "song", "track", "album", "artist", "playlist",
-            "genre", "playing", "library", "scan", "update", "resume",
+            "playlists", "queue", "queued", "genre", "playing", "library", "scan", "update", "resume",
         ]
         
         return any(keyword in text for keyword in music_keywords)

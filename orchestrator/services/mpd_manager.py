@@ -25,7 +25,9 @@ The MPDManager will start the local 'mpd' command; ensure it's in PATH.
 
 import logging
 import os
+import re
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -43,6 +45,7 @@ class MPDManager:
         mpd_host: str = "127.0.0.1",
         music_directory: Optional[str] = None,
         state_directory: Optional[str] = None,
+        playlist_directory: Optional[str] = None,
     ):
         """
         Initialize MPD manager.
@@ -59,8 +62,85 @@ class MPDManager:
         self.mpd_host = mpd_host
         self.music_directory = music_directory
         self.state_directory = state_directory
+        self.playlist_directory = playlist_directory
         self.process: Optional[subprocess.Popen] = None
         self.pid_file: Optional[Path] = None
+        self._runtime_config_path: Optional[Path] = None
+
+    def _prepare_runtime_config(self) -> str:
+        """Create an effective mpd.conf with requested directory overrides."""
+        if not self.mpd_config_path:
+            return ""
+
+        config_path = Path(self.mpd_config_path)
+        if not config_path.exists():
+            return ""
+
+        try:
+            original = config_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            logger.warning("Unable to read MPD config for overrides (%s): %s", config_path, exc)
+            return self.mpd_config_path
+
+        state_dir = Path(self.state_directory).expanduser() if self.state_directory else None
+        playlist_dir = Path(self.playlist_directory).expanduser() if self.playlist_directory else None
+        music_dir = Path(self.music_directory).expanduser() if self.music_directory else None
+
+        if state_dir:
+            state_dir.mkdir(parents=True, exist_ok=True)
+        if playlist_dir:
+            playlist_dir.mkdir(parents=True, exist_ok=True)
+        if music_dir:
+            music_dir.mkdir(parents=True, exist_ok=True)
+
+        replacements: dict[str, str] = {}
+        if music_dir:
+            replacements["music_directory"] = str(music_dir)
+        if playlist_dir:
+            replacements["playlist_directory"] = str(playlist_dir)
+        if state_dir:
+            replacements.update(
+                {
+                    "db_file": str(state_dir / "database"),
+                    "log_file": str(state_dir / "mpd.log"),
+                    "pid_file": str(state_dir / "mpd.pid"),
+                    "state_file": str(state_dir / "state"),
+                    "sticker_file": str(state_dir / "sticker.sql"),
+                }
+            )
+
+        if not replacements:
+            return self.mpd_config_path
+
+        if self._runtime_config_path and self._runtime_config_path.exists():
+            try:
+                self._runtime_config_path.unlink()
+            except Exception:
+                pass
+            self._runtime_config_path = None
+
+        updated = original
+        for key, value in replacements.items():
+            pattern = rf"(?m)^\s*{re.escape(key)}\s+\"[^\"]*\"\s*$"
+            replacement = f'{key} "{value}"'
+            if re.search(pattern, updated):
+                updated = re.sub(pattern, replacement, updated)
+            else:
+                updated += f"\n{replacement}\n"
+
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            prefix="openclaw-mpd-",
+            suffix=".conf",
+            delete=False,
+        )
+        with tmp:
+            tmp.write(updated)
+
+        self._runtime_config_path = Path(tmp.name)
+        logger.info("Using generated MPD runtime config: %s", self._runtime_config_path)
+        return str(self._runtime_config_path)
 
     def _find_mpd_config(self) -> str:
         """Find mpd.conf in standard locations."""
@@ -106,9 +186,10 @@ class MPDManager:
             cmd = ["mpd"]
 
             # Add config file if found
-            if self.mpd_config_path:
-                logger.debug("Using MPD config: %s", self.mpd_config_path)
-                cmd.append(self.mpd_config_path)
+            effective_config_path = self._prepare_runtime_config()
+            if effective_config_path:
+                logger.debug("Using MPD config: %s", effective_config_path)
+                cmd.append(effective_config_path)
             else:
                 logger.debug("Using default MPD configuration (no config file specified)")
 
@@ -256,3 +337,9 @@ class MPDManager:
     def cleanup(self) -> None:
         """Clean up resources (stop process, remove temp files)."""
         self.stop()
+        if self._runtime_config_path and self._runtime_config_path.exists():
+            try:
+                self._runtime_config_path.unlink()
+            except Exception:
+                pass
+            self._runtime_config_path = None

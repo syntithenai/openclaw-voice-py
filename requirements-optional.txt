@@ -20,3 +20,6 @@ funasr
 torch==2.1.0
 torchaudio==2.1.0
 silero-vad==5.1.2
+
+# Recorder diarization (optional; requires Hugging Face token/acceptance)
+pyannote.audio

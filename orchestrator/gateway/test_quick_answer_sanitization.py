@@ -77,3 +77,11 @@ def test_classify_shopping_list_reason() -> None:
     decision, reason = classify_upstream_decision("add milk to my shopping list", timers_enabled=True)
     assert decision is True
     assert reason == "action_intent"
+
+
+def test_should_not_force_upstream_for_recorder_intent_when_enabled() -> None:
+    assert should_force_upstream("start recording", recorder_enabled=True) is False
+
+
+def test_should_force_upstream_for_recorder_intent_when_disabled() -> None:
+    assert should_force_upstream("start recording", recorder_enabled=False) is True

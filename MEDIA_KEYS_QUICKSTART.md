@@ -62,22 +62,22 @@ Then restart the orchestrator:
 
 | Button | Action |
 |--------|--------|
-| Play/Pause | Toggle music playback |
-| Next | Skip to next track |
-| Previous | Previous track |
-| Volume Up | Increase volume by 5% |
-| Volume Down | Decrease volume by 5% |
-| Mute | Set volume to 0 |
-| Stop | Stop playback |
-| Phone | (Detected but no action yet) |
+| Play/Pause | Toggle wake/sleep behavior |
+| Next | Same wake/sleep toggle behavior as play |
+| Previous | Same wake/sleep toggle behavior as play |
+| Volume Up | Adjust system output volume (OS/desktop) |
+| Volume Down | Adjust system output volume (OS/desktop) |
+| Mute | Toggle microphone mute state |
+| Stop | Optional MPD stop (when MPD media key control is enabled) |
+| Phone | Trigger wake behavior |
 
 ## Button Mapping
 
 The buttons will:
-- **Volume +/-** → Control MPD volume
-- **Play/Pause** → Toggle MPD playback
-- **Next/Previous** → Skip tracks in MPD
-- **Mute** → Set MPD volume to 0
+- **Volume +/-** → Control system volume (not MPD volume)
+- **Play/Pause** → Trigger wake/sleep flow
+- **Next/Previous** → Same wake/sleep flow for button parity
+- **Mute** → Toggle mic mute/unmute
 
 ## Troubleshooting
 

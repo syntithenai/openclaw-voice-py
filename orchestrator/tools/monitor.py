@@ -38,6 +38,16 @@ class ToolMonitor:
         self.on_timer_expired: Optional[Callable] = None
         self.on_alarm_triggered: Optional[Callable] = None
         self.on_alarm_ringing: Optional[Callable] = None
+        self.defer_processing: Optional[Callable[[], bool]] = None
+
+    def _should_defer(self) -> bool:
+        if self.defer_processing is None:
+            return False
+        try:
+            return bool(self.defer_processing())
+        except Exception as exc:
+            logger.debug("ToolMonitor: defer predicate failed (%s)", exc)
+            return False
     
     async def start(self):
         """Start monitoring."""
@@ -101,6 +111,9 @@ class ToolMonitor:
         
         for timer in active_timers:
             if timer.is_expired() and not timer.completed:
+                if self._should_defer():
+                    logger.debug("ToolMonitor: Deferring expired timer %s while processing is deferred", timer.id)
+                    continue
                 logger.info(f"ToolMonitor: Timer {timer.id} ({timer.label}) expired")
                 
                 # Invoke callback if set
@@ -130,6 +143,9 @@ class ToolMonitor:
         for alarm in alarms:
             # Check if alarm should trigger
             if alarm.should_trigger():
+                if self._should_defer():
+                    logger.debug("ToolMonitor: Deferring alarm trigger %s while processing is deferred", alarm.id)
+                    continue
                 logger.info(f"ToolMonitor: Alarm {alarm.id} ({alarm.label}) triggered")
                 
                 # Trigger alarm (starts ringing)
@@ -154,6 +170,9 @@ class ToolMonitor:
             
             # Check if alarm is ringing (for continuous sound loop)
             elif alarm.ringing:
+                if self._should_defer():
+                    logger.debug("ToolMonitor: Deferring alarm ringing callback for %s", alarm.id)
+                    continue
                 # Auto-stop alarm after 1 minute of ringing
                 max_ring_secs = 60.0
                 if alarm.triggered_at is not None and (time.time() - alarm.triggered_at) > max_ring_secs:

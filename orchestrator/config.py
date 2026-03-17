@@ -59,6 +59,11 @@ if _env_file_to_load.exists():
 class VoiceConfig(BaseSettings):
     model_config = ConfigDict(case_sensitive=False, extra="ignore")
 
+    openclaw_workspace_dir: str = Field(
+        str(_ROOT_DIR),
+        validation_alias=AliasChoices("OPENCLAW_WORKSPACE_DIR", "OPENCLAW_WORKSPACE"),
+    )
+
     @field_validator("audio_capture_device", "audio_playback_device", mode="before")
     @classmethod
     def _normalize_audio_device(cls, value):
@@ -213,6 +218,26 @@ class VoiceConfig(BaseSettings):
     quick_answer_mirror_enabled: bool = Field(False)  # Mirror QA turns to the openclaw session so they appear in web chat
     quick_answer_bypass_window_ms: int = Field(8000)  # After a transcript is sent to gateway, bypass quick answer for this many ms (0=disabled)
 
+    # STT ghost transcript suppression gate
+    ghost_filter_enabled: bool = Field(True)
+    ghost_filter_single_word_enabled: bool = Field(True)
+    ghost_filter_require_question_for_acks: bool = Field(True)
+    ghost_filter_playback_tail_ms: int = Field(1200)
+    ghost_filter_cutin_early_ms: int = Field(500)
+    ghost_filter_recent_assistant_ms: int = Field(12000)
+    ghost_filter_upstream_context_ms: int = Field(20000)
+    ghost_filter_self_echo_similarity_threshold: float = Field(0.75)
+    ghost_filter_debug_logging: bool = Field(True)
+    ghost_filter_kill_switch: bool = Field(False)
+
+    # Recorder Tool
+    recorder_enabled: bool = Field(False)  # Enable quick-answer recorder tool
+    recorder_output_dir: str = Field("recordings")  # Relative to OPENCLAW_WORKSPACE_DIR
+    recorder_pyannote_enabled: bool = Field(False)  # Enable pyannote diarization during recorder stop
+    recorder_pyannote_auth_token: str = Field("")  # Hugging Face token for pyannote pipeline
+    recorder_pyannote_model: str = Field("pyannote/speaker-diarization-3.1")
+    recorder_pyannote_url: str = Field("http://localhost:10002")  # Remote pyannote diarization service URL
+
     # Embedded realtime web UI / websocket bridge
     web_ui_enabled: bool = Field(False)  # Serve local UI + websocket bridge for continuous browser audio
     web_ui_host: str = Field("0.0.0.0")  # Bind address for embedded web service
@@ -244,6 +269,8 @@ class VoiceConfig(BaseSettings):
     mpd_port: int = Field(6600)  # MPD server port
     mpd_timeout: float = Field(5.0)  # Connection timeout in seconds
     mpd_pool_size: int = Field(3)  # Number of connections in pool
+    mpd_playlist_dir: str = Field("playlists")  # Relative to OPENCLAW_WORKSPACE_DIR
+    mpd_state_dir: str = Field(".mpd")  # Relative to OPENCLAW_WORKSPACE_DIR
     music_fast_path_enabled: bool = Field(True)  # Enable fast-path parsing for music commands
     music_sleep_during_playback: bool = Field(True)  # Put orchestrator to sleep while music is playing
     music_auto_resume_timeout_s: int = Field(5)  # Seconds of silence before auto-resuming music after wake
@@ -251,7 +278,7 @@ class VoiceConfig(BaseSettings):
     music_genre_queue_limit: int = Field(120)  # Max genre tracks enqueued per command to avoid long startup stalls
     music_tts_duck_enabled: bool = Field(True)  # Reduce music volume while TTS is speaking
     music_tts_duck_ratio: float = Field(0.45)  # Keep this fraction of current music volume during TTS
-    music_cut_in_duck_ratio: float = Field(0.35)  # Keep this fraction of current music volume during voice cut-in
+    music_cut_in_duck_ratio: float = Field(0.50)  # Keep this fraction of current music volume during voice cut-in
     music_cut_in_duck_timeout_ms: int = Field(2000)  # Restore cut-in ducking after this timeout if not paused
     music_pipewire_stream_normalize_enabled: bool = Field(True)  # Normalize PipeWire per-app stream volume for MPD on play/resume
     music_pipewire_stream_target_percent: int = Field(100)  # Target PipeWire sink-input volume for MPD stream (percent)
@@ -259,11 +286,13 @@ class VoiceConfig(BaseSettings):
     # Media Keys (Hardware button detection)
     media_keys_enabled: bool = Field(False)  # Enable hardware media key detection
     media_keys_device_filter: str = Field("")  # Optional device name filter (e.g., "Anker", "USB", "Conference")
-    media_keys_exclusive_grab: bool = Field(True)  # Grab input device exclusively (blocks OS media handling)
-    media_keys_passthrough_keys: str = Field("mute")  # Comma-separated logical keys to re-inject to OS when exclusive grab is enabled
-    media_keys_control_music: bool = Field(True)  # Allow media keys to control MPD playback
+    media_keys_exclusive_grab: bool = Field(False)  # Grab input device exclusively (usually leave false so OS volume/LED behavior works)
+    media_keys_passthrough_keys: str = Field("volume_up,volume_down,mute")  # Comma-separated logical keys to re-inject to OS when exclusive grab is enabled
+    media_keys_control_music: bool = Field(False)  # Allow media keys to control MPD playback
     media_keys_suppress_system_play: bool = Field(True)  # Pause desktop media players on wake/play-button events
     media_keys_play_scan_codes: str = Field("0xc00b6,0xc00cd")  # Comma-separated MSC_SCAN values that should be treated as play button
+    media_keys_volume_up_scan_codes: str = Field("0xc00e9")  # Optional MSC_SCAN values to map to volume-up button
+    media_keys_volume_down_scan_codes: str = Field("0xc00ea")  # Optional MSC_SCAN values to map to volume-down button
     media_keys_mute_scan_codes: str = Field("")  # Optional MSC_SCAN values to map to mute button
     media_keys_phone_scan_codes: str = Field("")  # Optional MSC_SCAN values to map to phone button
     media_keys_command_debounce_ms: int = Field(400)  # Ignore duplicate logical button commands within this window
@@ -434,6 +463,28 @@ class VoiceConfig(BaseSettings):
                 logger.warning("QUICK_ANSWER_MODEL not set - will default to 'gpt-3.5-turbo' (may not match LM Studio loaded model)")
             if self.quick_answer_timeout_ms <= 0:
                 errors.append(f"QUICK_ANSWER_TIMEOUT_MS={self.quick_answer_timeout_ms} must be > 0")
+
+        # Validate ghost transcript filter settings
+        if self.ghost_filter_playback_tail_ms < 0:
+            errors.append(
+                f"GHOST_FILTER_PLAYBACK_TAIL_MS={self.ghost_filter_playback_tail_ms} must be >= 0"
+            )
+        if self.ghost_filter_cutin_early_ms < 0:
+            errors.append(
+                f"GHOST_FILTER_CUTIN_EARLY_MS={self.ghost_filter_cutin_early_ms} must be >= 0"
+            )
+        if self.ghost_filter_recent_assistant_ms < 0:
+            errors.append(
+                f"GHOST_FILTER_RECENT_ASSISTANT_MS={self.ghost_filter_recent_assistant_ms} must be >= 0"
+            )
+        if self.ghost_filter_upstream_context_ms < 0:
+            errors.append(
+                f"GHOST_FILTER_UPSTREAM_CONTEXT_MS={self.ghost_filter_upstream_context_ms} must be >= 0"
+            )
+        if not (0.0 <= self.ghost_filter_self_echo_similarity_threshold <= 1.0):
+            errors.append(
+                "GHOST_FILTER_SELF_ECHO_SIMILARITY_THRESHOLD must be between 0.0 and 1.0"
+            )
 
         # Validate embedded web UI configuration
         if self.web_ui_enabled:

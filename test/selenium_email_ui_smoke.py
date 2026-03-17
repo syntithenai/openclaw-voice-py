@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import time
 
 from selenium import webdriver
@@ -136,6 +137,19 @@ def run_selenium_flow() -> None:
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1440,900")
+
+    configured_binary = os.getenv("SELENIUM_CHROME_BINARY")
+    candidate_binaries = [
+        configured_binary,
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+        "/opt/google/chrome/google-chrome",
+        "/snap/bin/chromium",
+    ]
+    for binary_path in candidate_binaries:
+        if binary_path and os.path.exists(binary_path):
+            options.binary_location = binary_path
+            break
 
     driver = webdriver.Chrome(options=options)
     try:

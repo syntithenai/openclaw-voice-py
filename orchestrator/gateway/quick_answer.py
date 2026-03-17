@@ -90,31 +90,43 @@ Current date and time: {current_datetime}
 {tool_usage_section}"""
 
 
-def build_tool_usage_section(timers_enabled: bool, music_enabled: bool) -> str:
+def build_tool_usage_section(timers_enabled: bool, music_enabled: bool, recorder_enabled: bool) -> str:
     """Build a prompt section that only mentions tool families that are actually available."""
     sections: list[str] = []
 
-    if timers_enabled or music_enabled:
+    if timers_enabled or music_enabled or recorder_enabled:
         sections.append("Tool Usage:")
-        if timers_enabled and music_enabled:
+        if timers_enabled and music_enabled and recorder_enabled:
+            sections.append("- When user requests timer, alarm, music control, or recording operations, use the provided tools.")
+            sections.append("- Only use tools for timer/alarm/music/recording requests - do not escalate these to upstream agent.")
+        elif timers_enabled and music_enabled:
             sections.append("- When user requests timer, alarm, or music control operations, use the provided tools.")
             sections.append("- Only use tools for timer/alarm/music requests - do not escalate these to upstream agent.")
+        elif timers_enabled and recorder_enabled:
+            sections.append("- When user requests timer, alarm, or recording operations, use the provided tools.")
+            sections.append("- Only use tools for timer/alarm/recording requests - do not escalate these to upstream agent.")
+        elif music_enabled and recorder_enabled:
+            sections.append("- When user requests music control or recording operations, use the provided tools.")
+            sections.append("- Only use tools for music/recording requests - do not escalate these to upstream agent.")
         elif timers_enabled:
             sections.append("- When user requests timer or alarm operations, use the provided tools.")
             sections.append("- Only use tools for timer/alarm requests - do not escalate these to upstream agent.")
         elif music_enabled:
             sections.append("- When user requests music control operations, use the provided tools.")
             sections.append("- Only use tools for music control requests - do not escalate these to upstream agent.")
+        elif recorder_enabled:
+            sections.append("- When user requests recording operations, use the provided tools.")
+            sections.append("- Only use tools for recording requests - do not escalate these to upstream agent.")
 
     sections.append("- For all other uncertain queries, use USE_UPSTREAM_AGENT")
     return "\n".join(sections)
 
 
-def build_system_prompt(current_datetime: str, timers_enabled: bool, music_enabled: bool) -> str:
+def build_system_prompt(current_datetime: str, timers_enabled: bool, music_enabled: bool, recorder_enabled: bool) -> str:
     """Build the system prompt for the current tool capabilities."""
     return QUICK_ANSWER_BASE_SYSTEM_PROMPT.format(
         current_datetime=current_datetime,
-        tool_usage_section=build_tool_usage_section(timers_enabled, music_enabled),
+        tool_usage_section=build_tool_usage_section(timers_enabled, music_enabled, recorder_enabled),
     )
 
 
@@ -187,6 +199,13 @@ ACTION_INTENT_PATTERNS = [
     r"\b(open|go to|navigate to|visit)\b\s+([\w-]+\.)+[a-z]{2,}\b",
 ]
 
+RECORDER_INTENT_PATTERNS = [
+    r"\b(start|begin)\s+(the\s+)?record(ing)?\b",
+    r"\b(stop|end|finish)\s+(the\s+)?record(ing)?\b",
+    r"\b(recorder\s+status|recording\s+status)\b",
+    r"\b(recorder\s+on|recorder\s+off)\b",
+]
+
 TIMER_ALARM_INTENT_PATTERNS = [
     r"\b(timer|timers|alarm|alarms|countdown)\b",
     r"\b(set|add|create|start|cancel|stop|list|show|delete|remove)\b.*\b(timer|alarm)\b",
@@ -196,6 +215,8 @@ TIMER_ALARM_INTENT_PATTERNS = [
 MUSIC_INTENT_PATTERNS = [
     r"\b(music|song|songs|track|tracks|playlist|album|artist)\b",
     r"\b(play|pause|resume|skip|next|previous|stop)\b.*\b(music|song|track|playlist)\b",
+    r"\b(queue|queued|playlist|playlists)\b",
+    r"\b(add|remove|change|replace|load|clear|shuffle)\b.*\b(queue|playlist|song|songs|track|tracks)\b",
 ]
 
 
@@ -204,6 +225,7 @@ def classify_upstream_decision(
     *,
     timers_enabled: bool = False,
     music_enabled: bool = False,
+    recorder_enabled: bool = False,
 ) -> tuple[bool, str]:
     """Classify whether a query should bypass quick answer and why."""
     query = user_query.strip().lower()
@@ -226,6 +248,12 @@ def classify_upstream_decision(
     if music_enabled and any(re.search(pattern, query) for pattern in MUSIC_INTENT_PATTERNS):
         return False, "music_local"
 
+    recorder_intent = any(re.search(pattern, query) for pattern in RECORDER_INTENT_PATTERNS)
+    if recorder_enabled and recorder_intent:
+        return False, "recorder_local"
+    if recorder_intent:
+        return True, "recording_action_disabled"
+
     if any(re.search(pattern, query) for pattern in ACTION_INTENT_PATTERNS):
         return True, "action_intent"
 
@@ -237,12 +265,14 @@ def should_force_upstream(
     *,
     timers_enabled: bool = False,
     music_enabled: bool = False,
+    recorder_enabled: bool = False,
 ) -> bool:
     """Return True for queries that should bypass quick answer and go upstream."""
     decision, _reason = classify_upstream_decision(
         user_query,
         timers_enabled=timers_enabled,
         music_enabled=music_enabled,
+        recorder_enabled=recorder_enabled,
     )
     return decision
 
@@ -595,13 +625,37 @@ MUSIC_TOOL_DEFINITIONS = [
 ]
 
 
-def build_tool_definitions(timers_enabled: bool, music_enabled: bool) -> list[dict]:
+RECORDER_TOOL_DEFINITIONS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "recorder",
+            "description": "Control continuous recording and post-processing (whisper transcription + optional pyannote diarization)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "Recorder action: start, stop, or status",
+                        "enum": ["start", "stop", "status"],
+                    }
+                },
+                "required": ["action"],
+            },
+        },
+    }
+]
+
+
+def build_tool_definitions(timers_enabled: bool, music_enabled: bool, recorder_enabled: bool) -> list[dict]:
     """Return only the tool definitions that are actually available."""
     tool_definitions: list[dict] = []
     if timers_enabled:
         tool_definitions.extend(TIMER_TOOL_DEFINITIONS)
     if music_enabled:
         tool_definitions.extend(MUSIC_TOOL_DEFINITIONS)
+    if recorder_enabled:
+        tool_definitions.extend(RECORDER_TOOL_DEFINITIONS)
     return tool_definitions
 
 
@@ -616,8 +670,11 @@ class QuickAnswerClient:
         timeout_ms: int = 5000,
         timers_enabled: bool = False,
         music_enabled: bool = False,
+        recorder_enabled: bool = False,
         tool_router = None,
         music_router = None,
+        recorder_tool = None,
+        web_service = None,
     ):
         """
         Initialize the quick answer client.
@@ -631,6 +688,7 @@ class QuickAnswerClient:
             music_enabled: Enable music tool support
             tool_router: ToolRouter instance for executing tool calls
             music_router: MusicRouter instance for executing music control calls
+            web_service: Web service for sending state updates after music tools
         """
         self.llm_url = llm_url
         self.model = model or "gpt-3.5-turbo"  # Default fallback
@@ -638,9 +696,12 @@ class QuickAnswerClient:
         self.timeout_s = timeout_ms / 1000.0
         self.tool_router = tool_router
         self.music_router = music_router
+        self.recorder_tool = recorder_tool
+        self.web_service = web_service
         self.timers_enabled = bool(timers_enabled and tool_router is not None)
         self.music_enabled = bool(music_enabled and music_router is not None)
-        self.tool_definitions = build_tool_definitions(self.timers_enabled, self.music_enabled)
+        self.recorder_enabled = bool(recorder_enabled and recorder_tool is not None)
+        self.tool_definitions = build_tool_definitions(self.timers_enabled, self.music_enabled, self.recorder_enabled)
         self._last_tool_steps: list[dict[str, str]] = []
 
     def has_tool_capabilities(self) -> bool:
@@ -675,7 +736,7 @@ class QuickAnswerClient:
 
         try:
             current_datetime = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
-            system_prompt = build_system_prompt(current_datetime, False, False)
+            system_prompt = build_system_prompt(current_datetime, False, False, False)
 
             history_msgs = build_history_messages(chat_history) if chat_history else []
             
@@ -764,12 +825,19 @@ class QuickAnswerClient:
             user_query,
             timers_enabled=self.timers_enabled,
             music_enabled=self.music_enabled,
+            recorder_enabled=self.recorder_enabled,
         )
         if should_use_upstream:
             logger.info("← QUICK ANSWER: Heuristic escalation to upstream (%s)", reason)
             return True, ""
-        if reason in ("timer_alarm_local", "music_local"):
+        if reason in ("timer_alarm_local", "music_local", "recorder_local"):
             logger.info("← QUICK ANSWER: Keeping request local via heuristic (%s)", reason)
+
+        if self.recorder_enabled and self.recorder_tool:
+            recorder_fast_result = await self.recorder_tool.try_handle_fast_path(user_query)
+            if recorder_fast_result is not None:
+                logger.info("← QUICK ANSWER: Recorder fast-path execution: %s", _preview(recorder_fast_result))
+                return False, sanitize_quick_answer_text(recorder_fast_result)
 
         # Try music fast-path first if enabled
         if self.music_enabled and self.music_router:
@@ -793,7 +861,7 @@ class QuickAnswerClient:
         try:
             self._last_tool_steps.clear()
             current_datetime = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
-            system_prompt = build_system_prompt(current_datetime, self.timers_enabled, self.music_enabled)
+            system_prompt = build_system_prompt(current_datetime, self.timers_enabled, self.music_enabled, self.recorder_enabled)
             music_like_query = bool(self.music_enabled and self.music_router and self.music_router.is_music_related(user_query))
 
             history_msgs = build_history_messages(chat_history) if chat_history else []
@@ -918,6 +986,16 @@ class QuickAnswerClient:
                             # Route to appropriate handler
                             if func_name.startswith("music_") and self.music_enabled and self.music_router:
                                 result = await self.music_router.handle_tool_call(func_name, args_dict)
+                                # Send immediate state update after music tool executes
+                                if self.web_service and self.music_router.manager:
+                                    try:
+                                        transport = await self.music_router.manager.get_ui_music_state()
+                                        queue = await self.music_router.manager.get_ui_playlist()
+                                        self.web_service.update_music_state(queue=queue, **transport)
+                                    except Exception:
+                                        pass
+                            elif func_name == "recorder" and self.recorder_enabled and self.recorder_tool:
+                                result = await self.recorder_tool.execute_tool(**args_dict)
                             elif self.timers_enabled and self.tool_router:
                                 result = await self.tool_router.execute_tool(func_name, args_dict)
                             else:
