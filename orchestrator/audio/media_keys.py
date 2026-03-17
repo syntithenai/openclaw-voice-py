@@ -325,9 +325,6 @@ class MediaKeyDetector:
         self._scan_debounce_s: float = 0.1  # 100ms - filters duplicate events from single press, allows rapid taps
         # Debounce emitted commands: {(device_name, logical_key): last_timestamp}
         self._command_last_seen_ts: Dict[tuple, float] = {}
-        # Also debounce same logical command globally across devices; some speakerphones
-        # emit duplicate events from AVRCP + USB HID for a single physical press.
-        self._global_command_last_seen_ts: Dict[str, float] = {}
         # For some AVRCP devices key-up can be delayed/missing; dispatch selected keys on key-down.
         self._avrcp_down_dispatch_ts: Dict[tuple, float] = {}
         self._avrcp_immediate_keys: Set[str] = {
@@ -422,18 +419,7 @@ class MediaKeyDetector:
             )
             return
 
-        global_last_seen = self._global_command_last_seen_ts.get(media_event.key, 0.0)
-        if self.command_debounce_s > 0 and (media_event.timestamp - global_last_seen) < self.command_debounce_s:
-            logger.info(
-                "Debounced cross-device media command: %s from %s (%.0fms window)",
-                media_event.key,
-                media_event.device_name,
-                self.command_debounce_s * 1000.0,
-            )
-            return
-
         self._command_last_seen_ts[debounce_key] = media_event.timestamp
-        self._global_command_last_seen_ts[media_event.key] = media_event.timestamp
 
         try:
             result = self.callback(media_event)

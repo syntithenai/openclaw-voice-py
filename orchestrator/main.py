@@ -1380,6 +1380,11 @@ async def run_orchestrator() -> None:
             async def _ui_mic_toggle(client_id: str) -> None:
                 nonlocal wake_state, state, wake_sleep_ts, last_wake_detected_ts, last_activity_ts
 
+                dismissed = await stop_ringing_alarms_immediately("web ui mic button")
+                if dismissed > 0:
+                    tts_stop_event.set()
+                    return
+
                 def _play_wake_feedback() -> None:
                     if not wake_click_sound:
                         return
@@ -1759,6 +1764,8 @@ async def run_orchestrator() -> None:
         alarm_playback_stop_event.set()
         try:
             stopped_count = await alarm_manager.stop_alarm(None)
+            # Keep stop signal asserted briefly so in-flight playback writes observe it.
+            await asyncio.sleep(0.12)
         finally:
             # Allow future alarms to ring after the current dismiss action.
             alarm_playback_stop_event.clear()
@@ -2980,6 +2987,8 @@ async def run_orchestrator() -> None:
     silero_zero_hits = 0
     alarm_cut_in_hits = 0
     last_alarm_cut_in_log_ts = 0.0
+    alarm_cut_in_floor = 0.0
+    alarm_cut_in_floor_initialized = False
     skip_audio_until = 0.0  # Timestamp until which audio frames are dropped (e.g. after alarm cut-in)
     speech_frame_count = 0
     min_speech_frames = max(1, int(config.vad_min_speech_ms / config.audio_frame_ms))
@@ -3707,20 +3716,38 @@ async def run_orchestrator() -> None:
 
             alarm_ringing_active = bool(alarm_manager and alarm_manager.ringing_alarms)
             if alarm_ringing_active and not tts_playing:
-                alarm_cut_in_candidate = bool(vad_result.speech_detected) and rms_raw >= config.vad_cut_in_rms
+                alarm_signal = rms_cutin if rms_cutin > 0.0 else rms_raw
+                if not alarm_cut_in_floor_initialized:
+                    alarm_cut_in_floor = alarm_signal
+                    alarm_cut_in_floor_initialized = True
+                else:
+                    alarm_cut_in_floor = (0.92 * alarm_cut_in_floor) + (0.08 * alarm_signal)
+
+                alarm_cut_in_threshold = min(config.vad_cut_in_rms, max(config.vad_min_rms * 2.0, 0.003))
+                alarm_rms_excess = max(0.0, alarm_signal - alarm_cut_in_floor)
+
+                alarm_cut_in_candidate = (
+                    (bool(vad_result.speech_detected) and rms_raw >= alarm_cut_in_threshold)
+                    or (rms_cutin >= alarm_cut_in_threshold)
+                    or (alarm_rms_excess >= max(0.0015, alarm_cut_in_threshold * 0.5))
+                )
                 if alarm_cut_in_candidate:
                     alarm_cut_in_hits += 1
                 else:
                     alarm_cut_in_hits = 0
 
-                alarm_cut_in = alarm_cut_in_hits >= config.vad_cut_in_frames
+                alarm_cut_in_required_hits = max(1, min(config.vad_cut_in_frames, 2))
+                alarm_cut_in = alarm_cut_in_hits >= alarm_cut_in_required_hits
                 if alarm_cut_in and now - last_alarm_cut_in_log_ts >= tts_speech_log_interval:
                     logger.info(
-                        "✋ Alarm cut-in triggered! (rms_raw=%.4f, vad=%s, hits=%d/%d)",
+                        "✋ Alarm cut-in triggered! (rms_raw=%.4f, rms_aec=%.4f, floor=%.4f, excess=%.4f, vad=%s, hits=%d/%d)",
                         rms_raw,
+                        rms_cutin,
+                        alarm_cut_in_floor,
+                        alarm_rms_excess,
                         vad_result.speech_detected,
                         alarm_cut_in_hits,
-                        config.vad_cut_in_frames,
+                        alarm_cut_in_required_hits,
                     )
                     print("✋ Alarm cut-in triggered → stopping alarm", flush=True)
                     last_alarm_cut_in_log_ts = now
@@ -3736,6 +3763,8 @@ async def run_orchestrator() -> None:
                         logger.info("✋ Dropping audio for 750ms to suppress alarm-cut-in transcript")
             else:
                 alarm_cut_in_hits = 0
+                alarm_cut_in_floor = 0.0
+                alarm_cut_in_floor_initialized = False
 
             if tts_playing:
                 if now - last_tts_meter_ts >= tts_meter_interval:

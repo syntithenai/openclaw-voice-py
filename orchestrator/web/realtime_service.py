@@ -928,6 +928,37 @@ function mkBubble(m){{
             try{{ return JSON.stringify(val, null, 2); }}catch(_){{ return String(val); }}
         }};
 
+        const normToolName=(name)=>String(name||'').trim().toLowerCase();
+        const isExecTool=(name)=>{{
+            const n=normToolName(name);
+            return n==='exec' || n.includes('run_in_terminal') || n.includes('run-terminal') || n.includes('terminal');
+        }};
+        const isWriteTool=(name)=>{{
+            const n=normToolName(name);
+            return n==='write' || n.includes('write_file') || n.includes('create_file') || n.includes('str_replace') || n.includes('insert');
+        }};
+        const isReadTool=(name)=>{{
+            const n=normToolName(name);
+            return n==='read' || n.includes('read_file');
+        }};
+        const basename=(p)=>{{
+            const s=String(p||'').trim();
+            if(!s) return '';
+            const parts=s.split(/[\\/]+/).filter(Boolean);
+            return parts.length?parts[parts.length-1]:s;
+        }};
+        const pickText=(val)=>{{
+            if(val===undefined||val===null) return '';
+            if(typeof val==='string') return val;
+            if(Array.isArray(val)) return val.map(pickText).filter(Boolean).join('\n');
+            if(typeof val==='object'){{
+                const direct=val.content!==undefined?val.content:(val.text!==undefined?val.text:(val.result!==undefined?val.result:(val.output!==undefined?val.output:undefined)));
+                if(direct!==undefined) return pickText(direct);
+                return toPretty(val);
+            }}
+            return String(val);
+        }};
+
         const summarizeRequest=(toolName, parsed)=>{{
             if(!parsed||typeof parsed!=='object') return '';
             const req=parsed.args!==undefined?parsed.args:(parsed.arguments!==undefined?parsed.arguments:parsed.input);
@@ -993,8 +1024,10 @@ function mkBubble(m){{
                             phases:[],
                             command:'',
                             files:[],
+                            fileContent:'',
                             metas:[],
                             isError:null,
+                            errorText:'',
                             requestPreview:'',
                             payloads:[],
                             results:[],
@@ -1020,6 +1053,11 @@ function mkBubble(m){{
                             const f=String(fp);
                             if(!g.files.includes(f)) g.files.push(f);
                         }}
+                        if(isWriteTool(toolName) && !g.fileContent){{
+                            const writeBody=req.content!==undefined?req.content:(req.text!==undefined?req.text:(req.file_text!==undefined?req.file_text:(req.new_str!==undefined?req.new_str:undefined)));
+                            const bodyTxt=pickText(writeBody).trim();
+                            if(bodyTxt) g.fileContent=bodyTxt;
+                        }}
                     }}
 
                     if(parsed && typeof parsed==='object'){{
@@ -1028,6 +1066,17 @@ function mkBubble(m){{
                             if(metaTxt && !g.metas.includes(metaTxt)) g.metas.push(metaTxt);
                         }}
                         if(parsed.isError!==undefined) g.isError=!!parsed.isError;
+                        if(phase==='error') g.isError=true;
+                        if(!g.errorText){{
+                            const errVal=parsed.error!==undefined?parsed.error:(parsed.stderr!==undefined?parsed.stderr:undefined);
+                            const errTxt=pickText(errVal).trim();
+                            if(errTxt) g.errorText=errTxt;
+                        }}
+                        if(isReadTool(toolName) && !g.fileContent){{
+                            const readBody=parsed.result!==undefined?parsed.result:(parsed.content!==undefined?parsed.content:(parsed.output!==undefined?parsed.output:undefined));
+                            const readTxt=pickText(readBody).trim();
+                            if(readTxt) g.fileContent=readTxt;
+                        }}
                     }}
 
                     const resultText=extractResult(parsed) || '';
@@ -1065,10 +1114,13 @@ function mkBubble(m){{
                 : '';
 
             const toolRows=[...toolGroups.values()].map(g=>{{
-                const success=(g.isError===false || g.phases.includes('result') || g.phases.includes('end'));
-                const failed=(g.isError===true);
+                const failed=(g.isError===true || g.phases.includes('error'));
+                const success=!failed && (g.isError===false || g.phases.includes('result') || g.phases.includes('end'));
                 const icon=failed?'✕':(success?'✓':'•');
                 const phaseLabel=g.phases.filter(Boolean).join(', ')||'update';
+                const isExec=isExecTool(g.name);
+                const isWrite=isWriteTool(g.name);
+                const isRead=isReadTool(g.name);
 
                 const summaryParts=[];
                 if(g.command) summaryParts.push('command: '+g.command);
@@ -1087,11 +1139,38 @@ function mkBubble(m){{
                 const resultInline=(resultJoined && resultJoined!=='(no result)')
                     ? '<div class="mt-1 text-[11px] text-gray-200 whitespace-pre-wrap break-words">'+esc(resultJoined)+'</div>'
                     : '';
+                const execCommand=(g.command||g.requestPreview||'(no command)');
+                const fileLabel=(g.files.length?basename(g.files[0]):'(no file)');
+                const contentLabel=(isWrite?'file content':'content');
+                const contentBlock=((isWrite||isRead) && g.fileContent)
+                    ? '<details class="mt-1 rounded border border-gray-700/70 bg-gray-900/40">'
+                        +'<summary class="px-1.5 py-1 cursor-pointer text-[10px] text-gray-300 hover:text-gray-100">'+contentLabel+'</summary>'
+                        +'<pre class="px-1.5 pb-1.5 whitespace-pre-wrap break-words text-[11px] text-gray-300">'+esc(g.fileContent)+'</pre>'
+                      +'</details>'
+                    : ((isWrite||isRead)
+                        ? '<details class="mt-1 rounded border border-gray-700/70 bg-gray-900/40">'
+                            +'<summary class="px-1.5 py-1 cursor-pointer text-[10px] text-gray-300 hover:text-gray-100">'+contentLabel+'</summary>'
+                            +'<pre class="px-1.5 pb-1.5 whitespace-pre-wrap break-words text-[11px] text-gray-300">(no content)</pre>'
+                          +'</details>'
+                        : '');
+                const errorInline=(failed && (g.errorText || (resultJoined && resultJoined!=='(no result)')))
+                    ? '<div class="mt-1 text-[11px] text-red-300 whitespace-pre-wrap break-words">'+esc(g.errorText || resultJoined)+'</div>'
+                    : '';
+
+                let bodyHtml='<div class="text-[11px] text-gray-300 mt-0.5">'+esc(summary)+'</div>'
+                    +resultInline;
+                if(isExec){{
+                    bodyHtml='<div class="mt-0.5 text-[11px] text-gray-300 whitespace-pre-wrap break-words">'+esc(execCommand)+'</div>'
+                        +errorInline;
+                }} else if(isWrite||isRead){{
+                    bodyHtml='<div class="mt-0.5 text-[11px] text-gray-300">'+esc(fileLabel)+'</div>'
+                        +contentBlock
+                        +errorInline;
+                }}
 
                 return '<div class="px-2 py-1 border-b border-gray-800/60 last:border-b-0">'
                     +'<div class="text-[11px] text-amber-300 flex items-center gap-1"><span class="w-3 text-center">'+icon+'</span><span class="font-mono">'+esc(g.name)+'</span><span class="text-[10px] text-gray-500">'+esc(phaseLabel)+'</span></div>'
-                    +'<div class="text-[11px] text-gray-300 mt-0.5">'+esc(summary)+'</div>'
-                    +resultInline
+                    +bodyHtml
                     +payloadBlock
                     +'</div>';
             }}).join('');
@@ -1114,12 +1193,15 @@ function mkBubble(m){{
                   +'</details>'
                 : '';
 
-            const timeline=document.createElement('div');
-            timeline.innerHTML='<details class="rounded-xl bg-gray-900/60 border border-gray-700 text-xs overflow-hidden" open>'
-                +'<summary class="px-3 py-1.5 cursor-pointer text-gray-200 hover:text-gray-100 select-none">Execution Sequence</summary>'
-                +'<div class="px-2 pb-2 pt-1">'+waitingRow+toolRows+lifecycleRows+interimBlock+'</div>'
-                +'</details>';
-            wrap.appendChild(timeline);
+            const executionSequenceContent=waitingRow+toolRows+lifecycleRows+interimBlock;
+            if(executionSequenceContent){{
+                const timeline=document.createElement('div');
+                timeline.innerHTML='<details class="rounded-xl bg-gray-900/60 border border-gray-700 text-xs overflow-hidden">'
+                    +'<summary class="px-3 py-1.5 cursor-pointer text-gray-200 hover:text-gray-100 select-none">Thinking</summary>'
+                    +'<div class="px-2 pb-2 pt-1">'+executionSequenceContent+'</div>'
+                    +'</details>';
+                wrap.appendChild(timeline);
+            }}
         }}
 
         d.appendChild(wrap);
