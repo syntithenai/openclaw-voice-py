@@ -1,4 +1,5 @@
 from orchestrator.gateway.quick_answer import (
+    build_tool_definitions,
     classify_upstream_decision,
     sanitize_quick_answer_text,
     should_force_upstream,
@@ -85,3 +86,28 @@ def test_should_not_force_upstream_for_recorder_intent_when_enabled() -> None:
 
 def test_should_force_upstream_for_recorder_intent_when_disabled() -> None:
     assert should_force_upstream("start recording", recorder_enabled=False) is True
+
+
+def test_should_not_force_upstream_for_new_session_when_enabled() -> None:
+    assert should_force_upstream("start a new session", new_session_enabled=True) is False
+
+
+def test_should_force_upstream_for_new_session_when_disabled() -> None:
+    assert should_force_upstream("start a new session", new_session_enabled=False) is True
+
+
+def test_classify_new_session_reason_when_enabled() -> None:
+    decision, reason = classify_upstream_decision("please start a new session", new_session_enabled=True)
+    assert decision is False
+    assert reason == "new_session_local"
+
+
+def test_tool_definitions_include_start_new_session_when_enabled() -> None:
+    tool_defs = build_tool_definitions(
+        timers_enabled=False,
+        music_enabled=False,
+        recorder_enabled=False,
+        new_session_enabled=True,
+    )
+    names = [tool.get("function", {}).get("name") for tool in tool_defs]
+    assert "start_new_session" in names

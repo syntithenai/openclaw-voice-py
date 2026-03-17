@@ -26,6 +26,7 @@ def _ctx(**overrides):
         "playback_tail_ms": 1200.0,
         "cutin_early_ms": 500.0,
         "has_fresh_prompt_context": False,
+        "has_inflight_user_request": False,
     }
     base.update(overrides)
     return base
@@ -104,3 +105,18 @@ def test_normal_multi_word_transcript_is_accepted_by_default():
         )
     )
     assert decision.accepted is True
+
+
+def test_short_non_ack_fragment_is_accepted_when_request_inflight():
+    decision = decide_ghost_transcript(
+        _ctx(
+            transcript_text="time.",
+            canonical_transcript="time",
+            token_count=1,
+            is_single_word=True,
+            is_short_transcript=True,
+            has_inflight_user_request=True,
+        )
+    )
+    assert decision.accepted is True
+    assert decision.matched_priority_rule == "continuation_allow_inflight"

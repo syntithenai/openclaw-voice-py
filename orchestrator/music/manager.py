@@ -11,8 +11,10 @@ Provides user-friendly methods that map to MPD commands:
 
 import asyncio
 import logging
+import sqlite3
 import shutil
 import time
+from collections import defaultdict, deque
 from typing import Dict, List, Optional
 from .mpd_client import MPDClientPool
 
@@ -35,6 +37,22 @@ class MusicManager:
         self.pipewire_stream_target_percent = max(1, min(150, int(pipewire_stream_target_percent)))
         self._last_pipewire_normalize_ts = 0.0
         self._loaded_playlist_name: str = ""
+        self._ui_search_cache: Dict[tuple[str, int], tuple[float, List[Dict[str, str]]]] = {}
+        self._ui_search_cache_ttl_s = 20.0
+        self._ui_search_cache_max_entries = 64
+        self._ui_prefix_cache: Dict[str, tuple[float, List[Dict[str, str]]]] = {}
+        self._search_metrics: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=200))
+        self._search_metrics_counts: dict[str, int] = defaultdict(int)
+
+        self._fts_conn: sqlite3.Connection | None = None
+        self._fts_ready = False
+        self._fts_building = False
+        self._fts_last_revision = ""
+        self._fts_last_revision_check_ts = 0.0
+        self._fts_revision_check_interval_s = 20.0
+        self._fts_batch_size = 1000
+        self._fts_last_indexed_count = 0
+        self._fts_rebuild_task: asyncio.Task | None = None
 
     async def _normalize_pipewire_mpd_stream_volume(self) -> None:
         """Best-effort: set PipeWire per-app stream volume for MPD to target percent.
@@ -370,10 +388,22 @@ class MusicManager:
             logger.error(f"Failed to add to queue: {e}")
             return f"Error: {e}"
     
-    async def get_queue(self) -> List[Dict[str, str]]:
-        """Get current queue contents."""
+    async def get_queue(self, limit: int = 500) -> List[Dict[str, str]]:
+        """Get current queue contents (limited to avoid overwhelming huge playlists).
+        
+        Args:
+            limit: Maximum number of items to fetch (default 500). Use None for unlimited.
+        
+        Returns:
+            List of queue items
+        """
         try:
-            return await self.pool.execute_list("playlistinfo")
+            # For huge queues, MPD closes connection on full playlistinfo
+            # So we always limit the response. Clients can paginate if needed.
+            if limit is None:
+                return await self.pool.execute_list("playlistinfo")
+            else:
+                return await self.pool.execute_list(f"playlistinfo 0:{limit-1}")
         except Exception as e:
             logger.error(f"Failed to get queue: {e}")
             return []
@@ -505,33 +535,244 @@ class MusicManager:
             logger.error(f"Failed to create playlist from queue positions: {e}")
             return f"Error: {e}"
 
+    def _ensure_fts_conn(self) -> sqlite3.Connection:
+        if self._fts_conn is None:
+            conn = sqlite3.connect(":memory:")
+            conn.execute("PRAGMA journal_mode=MEMORY")
+            conn.execute("PRAGMA synchronous=OFF")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS music_search_idx USING fts5(file, title, artist, album, searchable)"
+            )
+            self._fts_conn = conn
+        return self._fts_conn
+
+    async def _current_library_revision(self) -> str:
+        stats = await self.get_stats()
+        songs = str(stats.get("songs", "0"))
+        db_update = str(stats.get("db_update", "0"))
+        return f"{songs}:{db_update}"
+
+    def _fts_query_expr(self, query: str) -> str:
+        terms = [t.strip().replace('"', '""') for t in query.split() if t.strip()]
+        if not terms:
+            return "*"
+        return " ".join(f'"{term}"*' for term in terms)
+
+    async def _rebuild_fts_index(self) -> None:
+        if self._fts_building:
+            return
+        self._fts_building = True
+        try:
+            conn = self._ensure_fts_conn()
+            conn.execute("DELETE FROM music_search_idx")
+
+            inserted = 0
+            offset = 0
+            batch = max(100, int(self._fts_batch_size))
+            while True:
+                cmd = f'search file "" window {offset}:{offset + batch - 1}'
+                rows = await self.pool.execute_list(cmd)
+                if not rows:
+                    break
+
+                docs = []
+                for item in rows:
+                    file_uri = str(item.get("file", "")).strip()
+                    if not file_uri:
+                        continue
+                    title = str(item.get("title") or item.get("Title") or file_uri.split("/")[-1])
+                    artist = str(item.get("artist") or item.get("Artist") or "")
+                    album = str(item.get("album") or item.get("Album") or "")
+                    searchable = f"{title} {artist} {album} {file_uri}".strip().lower()
+                    docs.append((file_uri, title, artist, album, searchable))
+
+                if docs:
+                    conn.executemany(
+                        "INSERT INTO music_search_idx(file,title,artist,album,searchable) VALUES (?,?,?,?,?)",
+                        docs,
+                    )
+                    inserted += len(docs)
+
+                if len(rows) < batch:
+                    break
+                offset += batch
+
+            conn.commit()
+            self._fts_last_indexed_count = inserted
+            self._fts_last_revision = await self._current_library_revision()
+            self._fts_ready = inserted > 0
+            self._ui_prefix_cache.clear()
+            logger.info("🔎 Built music FTS index: %d rows (revision=%s)", inserted, self._fts_last_revision)
+        except Exception as exc:
+            logger.warning("Music FTS index build failed; falling back to MPD search: %s", exc)
+            self._fts_ready = False
+        finally:
+            self._fts_building = False
+
+    async def _maybe_refresh_fts_index(self) -> None:
+        now = time.monotonic()
+        if (now - self._fts_last_revision_check_ts) < self._fts_revision_check_interval_s:
+            return
+        self._fts_last_revision_check_ts = now
+
+        current_revision = await self._current_library_revision()
+        if not self._fts_ready or current_revision != self._fts_last_revision:
+            if self._fts_rebuild_task is None or self._fts_rebuild_task.done():
+                self._fts_rebuild_task = asyncio.create_task(self._rebuild_fts_index())
+
+    def _record_search_metric(self, source: str, query: str, elapsed_ms: float) -> None:
+        q_len = len(query.strip())
+        if q_len <= 4:
+            bucket = "len_3_4"
+        elif q_len <= 8:
+            bucket = "len_5_8"
+        else:
+            bucket = "len_9_plus"
+
+        key = f"{source}:{bucket}"
+        store = self._search_metrics[key]
+        store.append(float(elapsed_ms))
+        self._search_metrics_counts[key] += 1
+
+        if self._search_metrics_counts[key] % 20 == 0 and len(store) >= 5:
+            ordered = sorted(store)
+            p50 = ordered[int(0.50 * (len(ordered) - 1))]
+            p95 = ordered[int(0.95 * (len(ordered) - 1))]
+            logger.info(
+                "📊 Music search latency %s count=%d p50=%.1fms p95=%.1fms",
+                key,
+                self._search_metrics_counts[key],
+                p50,
+                p95,
+            )
+
     async def search_library_for_ui(self, query: str, limit: int = 300) -> List[Dict[str, str]]:
         """Search library and return normalized results for Web UI selection list."""
         q = str(query or "").strip()
         if len(q) < 3:
             return []
+        
+        start_ms = time.monotonic() * 1000
         try:
+            safe_limit = max(1, int(limit))
+            q_norm = " ".join(q.lower().split())
+            cache_key = (q_norm, safe_limit)
+            cached = self._ui_search_cache.get(cache_key)
+            if cached:
+                cached_ts, cached_rows = cached
+                if (time.monotonic() - cached_ts) <= self._ui_search_cache_ttl_s:
+                    elapsed = time.monotonic() * 1000 - start_ms
+                    logger.info(f"🔍 Music search (cache hit): '{q}' → {len(cached_rows)} results in {elapsed:.1f}ms")
+                    self._record_search_metric("exact_cache", q, elapsed)
+                    return [dict(row) for row in cached_rows]
+
+            prefix_rows: List[Dict[str, str]] | None = None
+            for prefix_len in range(len(q_norm) - 1, 2, -1):
+                prefix = q_norm[:prefix_len]
+                pref_cached = self._ui_prefix_cache.get(prefix)
+                if not pref_cached:
+                    continue
+                pref_ts, pref_rows = pref_cached
+                if (time.monotonic() - pref_ts) > self._ui_search_cache_ttl_s:
+                    continue
+
+                filtered: List[Dict[str, str]] = []
+                for row in pref_rows:
+                    hay = (
+                        f"{row.get('title', '')} {row.get('artist', '')} "
+                        f"{row.get('album', '')} {row.get('file', '')}"
+                    ).lower()
+                    if q_norm in hay:
+                        filtered.append(dict(row))
+                        if len(filtered) >= safe_limit:
+                            break
+                prefix_rows = filtered
+                break
+
+            if prefix_rows is not None:
+                elapsed = time.monotonic() * 1000 - start_ms
+                self._ui_search_cache[cache_key] = (time.monotonic(), [dict(row) for row in prefix_rows])
+                self._ui_prefix_cache[q_norm] = (time.monotonic(), [dict(row) for row in prefix_rows])
+                logger.info(f"🔍 Music search (prefix cache): '{q}' → {len(prefix_rows)} results in {elapsed:.1f}ms")
+                self._record_search_metric("prefix_cache", q, elapsed)
+                return prefix_rows
+
+            await self._maybe_refresh_fts_index()
+
+            if self._fts_ready and self._fts_conn is not None:
+                try:
+                    fts_start = time.monotonic() * 1000
+                    expr = self._fts_query_expr(q_norm)
+                    cursor = self._fts_conn.execute(
+                        "SELECT file,title,artist,album FROM music_search_idx WHERE music_search_idx MATCH ? LIMIT ?",
+                        (expr, safe_limit),
+                    )
+                    out = [
+                        {
+                            "file": str(file_uri or ""),
+                            "title": str(title or ""),
+                            "artist": str(artist or ""),
+                            "album": str(album or ""),
+                        }
+                        for (file_uri, title, artist, album) in cursor.fetchall()
+                        if str(file_uri or "").strip()
+                    ]
+                    if out:
+                        fts_elapsed = time.monotonic() * 1000 - fts_start
+                        total_elapsed = time.monotonic() * 1000 - start_ms
+                        self._ui_search_cache[cache_key] = (time.monotonic(), [dict(row) for row in out])
+                        self._ui_prefix_cache[q_norm] = (time.monotonic(), [dict(row) for row in out])
+                        logger.info(
+                            f"🔍 Music search (fts): '{q}' → {len(out)} results in {total_elapsed:.1f}ms "
+                            f"(FTS:{fts_elapsed:.1f}ms)"
+                        )
+                        self._record_search_metric("fts", q, total_elapsed)
+                        return out
+                except Exception as exc:
+                    logger.debug("FTS query failed, falling back to MPD: %s", exc)
+
+            mpd_start = time.monotonic() * 1000
             rows: List[Dict[str, str]] = []
             quoted = self._quote(q)
-            for cmd in (
-                f'search any "{quoted}"',
-                f'search title "{quoted}"',
-                f'search artist "{quoted}"',
-                f'search album "{quoted}"',
-            ):
+            window_clause = f"window 0:{safe_limit-1}"
+            search_any_cmd = f'search any "{quoted}"'
+            search_title_cmd = f'search title "{quoted}"'
+            search_artist_cmd = f'search artist "{quoted}"'
+            search_album_cmd = f'search album "{quoted}"'
+
+            try:
+                primary = await self.pool.execute_list(f'{search_any_cmd} {window_clause}')
+                if primary:
+                    rows.extend(primary)
+            except Exception:
+                pass
+
+            async def _safe_execute_list(command: str) -> List[Dict[str, str]]:
                 try:
-                    part = await self.pool.execute_list(cmd)
+                    return await self.pool.execute_list(command)
+                except Exception:
+                    return []
+
+            if len(rows) < safe_limit:
+                extras = await asyncio.gather(
+                    _safe_execute_list(f'{search_title_cmd} {window_clause}'),
+                    _safe_execute_list(f'{search_artist_cmd} {window_clause}'),
+                    _safe_execute_list(f'{search_album_cmd} {window_clause}'),
+                )
+                for part in extras:
                     if part:
                         rows.extend(part)
-                except Exception:
-                    pass
 
             if not rows:
                 try:
-                    rows = await self.pool.execute_list(f'search file "{quoted}"')
+                    rows = await self.pool.execute_list(f'search file "{quoted}" {window_clause}')
                 except Exception:
                     rows = []
+            
+            mpd_elapsed = time.monotonic() * 1000 - mpd_start
 
+            dedup_start = time.monotonic() * 1000
             out: List[Dict[str, str]] = []
             seen: set[str] = set()
             for item in rows:
@@ -547,8 +788,25 @@ class MusicManager:
                         "album": str(item.get("album") or item.get("Album") or ""),
                     }
                 )
-                if len(out) >= max(1, int(limit)):
+                if len(out) >= safe_limit:
                     break
+            
+            dedup_elapsed = time.monotonic() * 1000 - dedup_start
+            self._ui_search_cache[cache_key] = (time.monotonic(), [dict(row) for row in out])
+            self._ui_prefix_cache[q_norm] = (time.monotonic(), [dict(row) for row in out])
+            if len(self._ui_search_cache) > self._ui_search_cache_max_entries:
+                oldest_key = min(self._ui_search_cache, key=lambda key: self._ui_search_cache[key][0])
+                self._ui_search_cache.pop(oldest_key, None)
+            if len(self._ui_prefix_cache) > self._ui_search_cache_max_entries:
+                oldest_prefix_key = min(self._ui_prefix_cache, key=lambda key: self._ui_prefix_cache[key][0])
+                self._ui_prefix_cache.pop(oldest_prefix_key, None)
+
+            total_elapsed = time.monotonic() * 1000 - start_ms
+            logger.info(
+                f"🔍 Music search (fresh): '{q}' → {len(out)} results in {total_elapsed:.1f}ms "
+                f"(MPD:{mpd_elapsed:.1f}ms, dedup:{dedup_elapsed:.1f}ms, raw:{len(rows)} hits)"
+            )
+            self._record_search_metric("mpd", q, total_elapsed)
             return out
         except Exception as e:
             logger.error(f"Failed UI library search: {e}")
@@ -567,17 +825,30 @@ class MusicManager:
     
     async def load_playlist(self, name: str) -> str:
         """Load a saved playlist."""
+        start_ms = time.monotonic() * 1000
         try:
             playlist_name = str(name or "").strip()
             if not playlist_name:
                 return "Playlist name is required"
 
+            clear_start = time.monotonic() * 1000
             await self.pool.execute("clear")
+            clear_ms = time.monotonic() * 1000 - clear_start
+            
+            load_start = time.monotonic() * 1000
             await self.pool.execute(f'load "{self._quote(playlist_name)}"')
+            load_ms = time.monotonic() * 1000 - load_start
+            
             self._loaded_playlist_name = playlist_name
+            total_ms = time.monotonic() * 1000 - start_ms
+            logger.info(
+                f"📂 Load playlist '{playlist_name}': {total_ms:.1f}ms total "
+                f"(clear:{clear_ms:.1f}ms, load:{load_ms:.1f}ms)"
+            )
             return f"Loaded playlist: {playlist_name}"
         except Exception as e:
-            logger.error(f"Failed to load playlist: {e}")
+            elapsed = time.monotonic() * 1000 - start_ms
+            logger.error(f"Failed to load playlist '{name}' after {elapsed:.1f}ms: {e}")
             return f"Error: {e}"
     
     async def save_playlist(self, name: str) -> str:
@@ -619,80 +890,123 @@ class MusicManager:
         Returns:
             Success or error message
         """
+        start_ms = time.monotonic() * 1000
         try:
+            search_start = time.monotonic() * 1000
             tracks = await self.search_artist(artist)
+            search_ms = time.monotonic() * 1000 - search_start
+            
             if not tracks:
+                logger.info(f"🎤 Play artist '{artist}': no matches found (search:{search_ms:.1f}ms)")
                 return f"No tracks found for artist: {artist}"
             
             # Clear queue and add all tracks
+            queue_start = time.monotonic() * 1000
             await self.clear_queue()
             for track in tracks:
                 if "file" in track:
                     await self.add_to_queue(track["file"])
+            queue_ms = time.monotonic() * 1000 - queue_start
             
             if shuffle:
                 await self.pool.execute("random 1")
             
             await self.play()
+            total_ms = time.monotonic() * 1000 - start_ms
+            logger.info(
+                f"🎤 Play artist '{artist}': {len(tracks)} tracks in {total_ms:.1f}ms "
+                f"(search:{search_ms:.1f}ms, queue:{queue_ms:.1f}ms)"
+            )
             return f"Playing {len(tracks)} tracks by {artist}"
         except Exception as e:
-            logger.error(f"Failed to play artist: {e}")
+            elapsed = time.monotonic() * 1000 - start_ms
+            logger.error(f"Failed to play artist '{artist}' after {elapsed:.1f}ms: {e}")
             return f"Error: {e}"
     
     async def play_album(self, album: str) -> str:
         """Play all tracks from an album."""
+        start_ms = time.monotonic() * 1000
         try:
+            search_start = time.monotonic() * 1000
             tracks = await self.search_album(album)
+            search_ms = time.monotonic() * 1000 - search_start
+            
             if not tracks:
+                logger.info(f"💿 Play album '{album}': no matches found (search:{search_ms:.1f}ms)")
                 return f"No tracks found for album: {album}"
             
             # Clear queue and add all tracks
+            queue_start = time.monotonic() * 1000
             await self.clear_queue()
             for track in tracks:
                 if "file" in track:
                     await self.add_to_queue(track["file"])
+            queue_ms = time.monotonic() * 1000 - queue_start
             
             await self.play()
+            total_ms = time.monotonic() * 1000 - start_ms
+            logger.info(
+                f"💿 Play album '{album}': {len(tracks)} tracks in {total_ms:.1f}ms "
+                f"(search:{search_ms:.1f}ms, queue:{queue_ms:.1f}ms)"
+            )
             return f"Playing album: {album} ({len(tracks)} tracks)"
         except Exception as e:
-            logger.error(f"Failed to play album: {e}")
+            elapsed = time.monotonic() * 1000 - start_ms
+            logger.error(f"Failed to play album '{album}' after {elapsed:.1f}ms: {e}")
             return f"Error: {e}"
     
     async def play_genre(self, genre: str, shuffle: bool = True) -> str:
         """Play tracks from a genre."""
+        start_ms = time.monotonic() * 1000
         try:
             # Use server-side MPD query+enqueue to avoid client-side per-track loops
             # that can stall for very large genres.
+            clear_start = time.monotonic() * 1000
             await self.clear_queue()
+            clear_ms = time.monotonic() * 1000 - clear_start
 
             safe_genre = genre.replace('"', '\\"')
-            await self.pool.execute(f'searchadd genre "{safe_genre}"')
-
-            status_after_add = await self.get_status()
-            queue_len = int(status_after_add.get("playlistlength", 0)) if status_after_add else 0
+            search_start = time.monotonic() * 1000
+            genre_tracks = await self.pool.execute_list(f'search genre "{safe_genre}"')
+            search_ms = time.monotonic() * 1000 - search_start
+            
+            queue_len = len(genre_tracks)
 
             if queue_len == 0:
                 stats = await self.get_stats()
                 song_count = int(stats.get("songs", 0))
+                elapsed = time.monotonic() * 1000 - start_ms
                 if song_count == 0:
+                    logger.info(f"🎵 Play genre '{genre}': no library (search:{search_ms:.1f}ms, total:{elapsed:.1f}ms)")
                     return "No music in library. Say 'update library' to scan your music folder."
+                logger.info(f"🎵 Play genre '{genre}': no matches found (search:{search_ms:.1f}ms, total:{elapsed:.1f}ms)")
                 return f"No tracks found for genre: {genre}"
 
             # Apply queue cap to keep startup snappy for very broad genres.
             if queue_len > self.genre_queue_limit:
-                await self.pool.execute(f'delete {self.genre_queue_limit}:')
+                genre_tracks = genre_tracks[:self.genre_queue_limit]
                 queue_len = self.genre_queue_limit
                 logger.info(
-                    "Genre '%s' queue capped to %d tracks (originally > %d)",
+                    "Genre '%s' limited to %d tracks (search found > %d)",
                     genre,
                     queue_len,
-                    self.genre_queue_limit,
+                    len(genre_tracks),
                 )
+            
+            # Add limited tracks to queue
+            add_start = time.monotonic() * 1000
+            for track in genre_tracks:
+                file_uri = track.get("file", "")
+                if file_uri:
+                    await self.add_to_queue(file_uri)
+            add_ms = time.monotonic() * 1000 - add_start
             
             if shuffle:
                 await self.pool.execute("random 1")
             
+            play_start = time.monotonic() * 1000
             await self.play()
+            play_ms = time.monotonic() * 1000 - play_start
 
             status_after_play = await self.get_status()
             state_after_play = status_after_play.get("state", "unknown") if status_after_play else "unknown"
@@ -701,15 +1015,11 @@ class MusicManager:
                 volume_after_play = int(volume_after_play_raw) if volume_after_play_raw is not None else None
             except (TypeError, ValueError):
                 volume_after_play = None
-            enabled_outputs = await self.get_enabled_output_names()
-
+            
+            total_ms = time.monotonic() * 1000 - start_ms
             logger.info(
-                "Genre playback diagnostics: genre=%s queue=%d state=%s volume=%s outputs=%s",
-                genre,
-                queue_len,
-                state_after_play,
-                volume_after_play if volume_after_play is not None else "unknown",
-                ", ".join(enabled_outputs) if enabled_outputs else "none",
+                f"🎵 Play genre '{genre}': {queue_len} tracks in {total_ms:.1f}ms (clear:{clear_ms:.1f}ms, search:{search_ms:.1f}ms, add:{add_ms:.1f}ms, play:{play_ms:.1f}ms) | "
+                f"state={state_after_play} volume={volume_after_play if volume_after_play is not None else 'unknown'}"
             )
 
             if volume_after_play is not None and volume_after_play <= 0:
@@ -718,13 +1028,15 @@ class MusicManager:
                     "MPD volume was 0 during genre playback; auto-raised to 100%% to avoid silent playback"
                 )
                 return f"Playing {queue_len} {genre} tracks (volume was muted, set to 100%)"
-
+            
+            enabled_outputs = await self.get_enabled_output_names()
             if not enabled_outputs:
                 return f"Playing {queue_len} {genre} tracks, but MPD has no enabled audio outputs"
 
             return f"Playing {queue_len} {genre} tracks"
         except Exception as e:
-            logger.error(f"Failed to play genre: {e}")
+            elapsed = time.monotonic() * 1000 - start_ms
+            logger.error(f"Failed to play genre '{genre}' after {elapsed:.1f}ms: {e}")
             return f"Error: {e}"
     
     async def play_song(self, title: str) -> str:
@@ -931,7 +1243,8 @@ class MusicManager:
     async def get_ui_playlist(self, limit: int = 200) -> list:
         """Return a compact queue list for the web UI music page."""
         try:
-            queue = await self.get_queue()
+            # Fetch only as many items as we'll display to avoid connection timeouts on huge queues
+            queue = await self.get_queue(limit=limit)
             result = []
             for i, item in enumerate(queue[:limit]):
                 raw_dur = item.get("duration") or item.get("time") or item.get("Time") or 0

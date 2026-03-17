@@ -4,7 +4,7 @@ import re
 import httpx
 import random
 from datetime import datetime
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 
 logger = logging.getLogger("orchestrator.gateway.quick_answer")
@@ -90,11 +90,11 @@ Current date and time: {current_datetime}
 {tool_usage_section}"""
 
 
-def build_tool_usage_section(timers_enabled: bool, music_enabled: bool, recorder_enabled: bool) -> str:
+def build_tool_usage_section(timers_enabled: bool, music_enabled: bool, recorder_enabled: bool, new_session_enabled: bool) -> str:
     """Build a prompt section that only mentions tool families that are actually available."""
     sections: list[str] = []
 
-    if timers_enabled or music_enabled or recorder_enabled:
+    if timers_enabled or music_enabled or recorder_enabled or new_session_enabled:
         sections.append("Tool Usage:")
         if timers_enabled and music_enabled and recorder_enabled:
             sections.append("- When user requests timer, alarm, music control, or recording operations, use the provided tools.")
@@ -117,16 +117,25 @@ def build_tool_usage_section(timers_enabled: bool, music_enabled: bool, recorder
         elif recorder_enabled:
             sections.append("- When user requests recording operations, use the provided tools.")
             sections.append("- Only use tools for recording requests - do not escalate these to upstream agent.")
+        if new_session_enabled:
+            sections.append("- When user requests starting a new chat/session/conversation, use the provided session tool.")
+            sections.append("- Use the session tool for requests like 'start a new session' or 'new chat'.")
 
     sections.append("- For all other uncertain queries, use USE_UPSTREAM_AGENT")
     return "\n".join(sections)
 
 
-def build_system_prompt(current_datetime: str, timers_enabled: bool, music_enabled: bool, recorder_enabled: bool) -> str:
+def build_system_prompt(
+    current_datetime: str,
+    timers_enabled: bool,
+    music_enabled: bool,
+    recorder_enabled: bool,
+    new_session_enabled: bool,
+) -> str:
     """Build the system prompt for the current tool capabilities."""
     return QUICK_ANSWER_BASE_SYSTEM_PROMPT.format(
         current_datetime=current_datetime,
-        tool_usage_section=build_tool_usage_section(timers_enabled, music_enabled, recorder_enabled),
+        tool_usage_section=build_tool_usage_section(timers_enabled, music_enabled, recorder_enabled, new_session_enabled),
     )
 
 
@@ -206,6 +215,12 @@ RECORDER_INTENT_PATTERNS = [
     r"\b(recorder\s+on|recorder\s+off)\b",
 ]
 
+NEW_SESSION_INTENT_PATTERNS = [
+    r"\b(start|create|open|begin)\b.*\b(new|fresh)\b.*\b(session|chat|conversation)\b",
+    r"\b(new|fresh)\b.*\b(session|chat|conversation)\b",
+    r"\b(reset|clear)\b.*\b(session|chat|conversation)\b",
+]
+
 TIMER_ALARM_INTENT_PATTERNS = [
     r"\b(timer|timers|alarm|alarms|countdown)\b",
     r"\b(set|add|create|start|cancel|stop|list|show|delete|remove)\b.*\b(timer|alarm)\b",
@@ -226,6 +241,7 @@ def classify_upstream_decision(
     timers_enabled: bool = False,
     music_enabled: bool = False,
     recorder_enabled: bool = False,
+    new_session_enabled: bool = False,
 ) -> tuple[bool, str]:
     """Classify whether a query should bypass quick answer and why."""
     query = user_query.strip().lower()
@@ -254,6 +270,12 @@ def classify_upstream_decision(
     if recorder_intent:
         return True, "recording_action_disabled"
 
+    new_session_intent = any(re.search(pattern, query) for pattern in NEW_SESSION_INTENT_PATTERNS)
+    if new_session_enabled and new_session_intent:
+        return False, "new_session_local"
+    if new_session_intent:
+        return True, "new_session_action_disabled"
+
     if any(re.search(pattern, query) for pattern in ACTION_INTENT_PATTERNS):
         return True, "action_intent"
 
@@ -266,6 +288,7 @@ def should_force_upstream(
     timers_enabled: bool = False,
     music_enabled: bool = False,
     recorder_enabled: bool = False,
+    new_session_enabled: bool = False,
 ) -> bool:
     """Return True for queries that should bypass quick answer and go upstream."""
     decision, _reason = classify_upstream_decision(
@@ -273,6 +296,7 @@ def should_force_upstream(
         timers_enabled=timers_enabled,
         music_enabled=music_enabled,
         recorder_enabled=recorder_enabled,
+        new_session_enabled=new_session_enabled,
     )
     return decision
 
@@ -647,7 +671,27 @@ RECORDER_TOOL_DEFINITIONS = [
 ]
 
 
-def build_tool_definitions(timers_enabled: bool, music_enabled: bool, recorder_enabled: bool) -> list[dict]:
+SESSION_TOOL_DEFINITIONS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "start_new_session",
+            "description": "Start a brand new chat session, equivalent to pressing the New button in the chat UI",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    }
+]
+
+
+def build_tool_definitions(
+    timers_enabled: bool,
+    music_enabled: bool,
+    recorder_enabled: bool,
+    new_session_enabled: bool,
+) -> list[dict]:
     """Return only the tool definitions that are actually available."""
     tool_definitions: list[dict] = []
     if timers_enabled:
@@ -656,6 +700,8 @@ def build_tool_definitions(timers_enabled: bool, music_enabled: bool, recorder_e
         tool_definitions.extend(MUSIC_TOOL_DEFINITIONS)
     if recorder_enabled:
         tool_definitions.extend(RECORDER_TOOL_DEFINITIONS)
+    if new_session_enabled:
+        tool_definitions.extend(SESSION_TOOL_DEFINITIONS)
     return tool_definitions
 
 
@@ -675,6 +721,7 @@ class QuickAnswerClient:
         music_router = None,
         recorder_tool = None,
         web_service = None,
+        new_session_handler: Callable[[], Awaitable[str | None]] | None = None,
     ):
         """
         Initialize the quick answer client.
@@ -698,11 +745,29 @@ class QuickAnswerClient:
         self.music_router = music_router
         self.recorder_tool = recorder_tool
         self.web_service = web_service
+        self.new_session_handler = new_session_handler
         self.timers_enabled = bool(timers_enabled and tool_router is not None)
         self.music_enabled = bool(music_enabled and music_router is not None)
         self.recorder_enabled = bool(recorder_enabled and recorder_tool is not None)
-        self.tool_definitions = build_tool_definitions(self.timers_enabled, self.music_enabled, self.recorder_enabled)
+        self.new_session_enabled = bool(new_session_handler is not None)
+        self.tool_definitions = build_tool_definitions(
+            self.timers_enabled,
+            self.music_enabled,
+            self.recorder_enabled,
+            self.new_session_enabled,
+        )
         self._last_tool_steps: list[dict[str, str]] = []
+
+    def set_new_session_handler(self, handler: Callable[[], Awaitable[str | None]] | None) -> None:
+        """Update handler for quick-answer initiated new-session requests."""
+        self.new_session_handler = handler
+        self.new_session_enabled = bool(handler is not None)
+        self.tool_definitions = build_tool_definitions(
+            self.timers_enabled,
+            self.music_enabled,
+            self.recorder_enabled,
+            self.new_session_enabled,
+        )
 
     def has_tool_capabilities(self) -> bool:
         """Whether any tool family is enabled for quick-answer routing."""
@@ -713,6 +778,16 @@ class QuickAnswerClient:
         steps = list(self._last_tool_steps)
         self._last_tool_steps.clear()
         return steps
+
+    async def _sync_web_music_state(self) -> None:
+        if not (self.web_service and self.music_router and self.music_router.manager):
+            return
+        try:
+            transport = await self.music_router.manager.get_ui_music_state()
+            queue = await self.music_router.manager.get_ui_playlist()
+            self.web_service.update_music_state(queue=queue, **transport)
+        except Exception as update_exc:
+            logger.debug("Failed to update web music state: %s", update_exc)
         
     async def get_quick_answer(self, user_query: str, *, chat_history: list[dict] | None = None) -> tuple[bool, str]:
         """
@@ -736,7 +811,7 @@ class QuickAnswerClient:
 
         try:
             current_datetime = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
-            system_prompt = build_system_prompt(current_datetime, False, False, False)
+            system_prompt = build_system_prompt(current_datetime, False, False, False, False)
 
             history_msgs = build_history_messages(chat_history) if chat_history else []
             
@@ -826,12 +901,21 @@ class QuickAnswerClient:
             timers_enabled=self.timers_enabled,
             music_enabled=self.music_enabled,
             recorder_enabled=self.recorder_enabled,
+            new_session_enabled=self.new_session_enabled,
         )
         if should_use_upstream:
             logger.info("← QUICK ANSWER: Heuristic escalation to upstream (%s)", reason)
             return True, ""
-        if reason in ("timer_alarm_local", "music_local", "recorder_local"):
+        if reason in ("timer_alarm_local", "music_local", "recorder_local", "new_session_local"):
             logger.info("← QUICK ANSWER: Keeping request local via heuristic (%s)", reason)
+
+        if self.new_session_enabled and self.new_session_handler:
+            new_session_intent = any(re.search(pattern, user_query.lower()) for pattern in NEW_SESSION_INTENT_PATTERNS)
+            if new_session_intent:
+                result = await self.new_session_handler()
+                spoken = sanitize_quick_answer_text(result or "Started a new session.")
+                logger.info("← QUICK ANSWER: New-session fast-path execution: %s", _preview(spoken))
+                return False, spoken
 
         if self.recorder_enabled and self.recorder_tool:
             recorder_fast_result = await self.recorder_tool.try_handle_fast_path(user_query)
@@ -843,6 +927,7 @@ class QuickAnswerClient:
         if self.music_enabled and self.music_router:
             music_result = await self.music_router.handle_request(user_query, use_fast_path=True)
             if music_result is not None:
+                await self._sync_web_music_state()
                 logger.info("← QUICK ANSWER: Music fast-path execution: %s", _preview(music_result))
                 return False, sanitize_quick_answer_text(music_result)
         
@@ -861,7 +946,13 @@ class QuickAnswerClient:
         try:
             self._last_tool_steps.clear()
             current_datetime = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
-            system_prompt = build_system_prompt(current_datetime, self.timers_enabled, self.music_enabled, self.recorder_enabled)
+            system_prompt = build_system_prompt(
+                current_datetime,
+                self.timers_enabled,
+                self.music_enabled,
+                self.recorder_enabled,
+                self.new_session_enabled,
+            )
             music_like_query = bool(self.music_enabled and self.music_router and self.music_router.is_music_related(user_query))
 
             history_msgs = build_history_messages(chat_history) if chat_history else []
@@ -986,16 +1077,11 @@ class QuickAnswerClient:
                             # Route to appropriate handler
                             if func_name.startswith("music_") and self.music_enabled and self.music_router:
                                 result = await self.music_router.handle_tool_call(func_name, args_dict)
-                                # Send immediate state update after music tool executes
-                                if self.web_service and self.music_router.manager:
-                                    try:
-                                        transport = await self.music_router.manager.get_ui_music_state()
-                                        queue = await self.music_router.manager.get_ui_playlist()
-                                        self.web_service.update_music_state(queue=queue, **transport)
-                                    except Exception:
-                                        pass
+                                await self._sync_web_music_state()
                             elif func_name == "recorder" and self.recorder_enabled and self.recorder_tool:
                                 result = await self.recorder_tool.execute_tool(**args_dict)
+                            elif func_name == "start_new_session" and self.new_session_enabled and self.new_session_handler:
+                                result = await self.new_session_handler()
                             elif self.timers_enabled and self.tool_router:
                                 result = await self.tool_router.execute_tool(func_name, args_dict)
                             else:

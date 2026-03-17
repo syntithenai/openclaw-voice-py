@@ -160,6 +160,7 @@ const PREF_CONTINUOUS = 'openclaw.ui.continuousMode';
 const PREF_CHAT_FOLLOW = 'openclaw.ui.chatFollowLatest';
 const CHAT_CACHE_VERSION = 1;
 const PENDING_ACTION_TIMEOUT_MS = 8000;
+const MUSIC_LOAD_PLAYLIST_TIMEOUT_MS = 30000;
 const INLINE_ERROR_TTL_MS = 7000;
 const MUSIC_LIBRARY_SEARCH_MIN_LEN = 3;
 
@@ -174,6 +175,7 @@ const S = {{
         musicQueueFilter:'', musicQueueSelectionByIds:{{}}, musicQueueLastCheckedId:null,
         musicAddMode:false, musicAddQuery:'', musicAddSelection:{{}}, musicAddLastCheckedFile:'', musicAddHasSearched:false,
         musicAddSearchPending:false, musicAddPendingQuery:'',
+        musicAddSearchLimit:200,
         musicNewPlaylistName:'',
         musicPlaylistModalOpen:false, musicPlaylistModalMode:'', musicPlaylistModalName:'',
         timers:[], page:'home',
@@ -183,6 +185,7 @@ const S = {{
     ttsMuted:true, browserAudioEnabled:true, continuousMode:false,
     pendingChatSends:new Set(), nextClientMsgId:1,
     nextMusicActionId:1, pendingMusicActions:{{}},
+    musicLoadRetryPending:null, musicLoadRetryAttempted:false,
     nextTimerActionId:1, pendingTimerActions:{{}},
     nextSettingActionId:1, pendingSettingActions:{{}},
     settingActionErrors:{{}}, timerActionErrors:{{}},
@@ -227,14 +230,20 @@ function canSearchMusicLibrary(query){{
 }}
 
 function submitMusicLibrarySearch(){{
+    submitMusicLibrarySearchWithLimit(undefined);
+}}
+
+function submitMusicLibrarySearchWithLimit(limitOverride){{
     const query = String(S.musicAddQuery||'').trim();
     if(!canSearchMusicLibrary(query)) return;
+    const nextLimit = Math.max(1, Number(limitOverride||S.musicAddSearchLimit||200) || 200);
     S.musicAddHasSearched = true;
     S.musicAddSearchPending = true;
     S.musicAddPendingQuery = query;
+    S.musicAddSearchLimit = nextLimit;
     S.musicLibraryResults = [];
     if(S.page==='music' && S.musicAddMode) renderMusicPage(document.getElementById('main'));
-    sendAction({{type:'music_search_library', query}});
+    sendAction({{type:'music_search_library', query, limit: nextLimit}});
 }}
 
 function getChatCacheKey(){{
@@ -298,9 +307,13 @@ function hydrateChatCache(){{
     }} catch(_) {{}}
 }}
 
-function applyServerChatState(chat, chatThreads, activeChatId){{
+function applyServerChatState(chat, chatThreads, activeChatId, replaceThreads=false){{
     if(Array.isArray(chat)) S.chat = chat.map(normalizeChatMessage).filter(Boolean);
-    if(Array.isArray(chatThreads)) S.chatThreads = mergeChatThreads(chatThreads, S.chatThreads);
+    if(Array.isArray(chatThreads)){{
+        S.chatThreads = replaceThreads
+            ? chatThreads.map(normalizeChatThread).filter(Boolean).sort((a,b)=>Number(b.updated_ts||0)-Number(a.updated_ts||0))
+            : mergeChatThreads(chatThreads, S.chatThreads);
+    }}
     if(activeChatId) S.activeChatId = String(activeChatId);
     if(!S.selectedChatId) S.selectedChatId = 'active';
     const selected = String(S.selectedChatId||'active');
@@ -619,6 +632,7 @@ document.addEventListener('click', e => {{
         S.musicAddHasSearched = false;
         S.musicAddSearchPending = false;
         S.musicAddPendingQuery = '';
+        S.musicAddSearchLimit = 200;
         sendAction({{type:'music_list_playlists'}});
         renderMusicPage(document.getElementById('main'));
         return;
@@ -627,6 +641,12 @@ document.addEventListener('click', e => {{
     const addSearchBtn = e.target.closest('[data-action="music-add-search-submit"]');
     if (addSearchBtn && !addSearchBtn.disabled) {{
         submitMusicLibrarySearch();
+        return;
+    }}
+
+    const addSearchMoreBtn = e.target.closest('[data-action="music-add-search-more"]');
+    if (addSearchMoreBtn && !addSearchMoreBtn.disabled) {{
+        submitMusicLibrarySearchWithLimit((Number(S.musicAddSearchLimit)||200) + 200);
         return;
     }}
 
@@ -813,8 +833,21 @@ document.addEventListener('input', e => {{
     const t = e.target;
     if(!t) return;
     if(t.id==='musicQueueSearch'){{
+        const start = (typeof t.selectionStart === 'number') ? t.selectionStart : null;
+        const end = (typeof t.selectionEnd === 'number') ? t.selectionEnd : null;
         S.musicQueueFilter = String(t.value||'');
         renderMusicPage(document.getElementById('main'));
+        setTimeout(() => {{
+            const el = document.getElementById('musicQueueSearch');
+            if(!el) return;
+            if(el !== document.activeElement) el.focus();
+            if(start !== null && end !== null && typeof el.setSelectionRange === 'function') {{
+                const maxLen = String(el.value||'').length;
+                const nextStart = Math.max(0, Math.min(start, maxLen));
+                const nextEnd = Math.max(0, Math.min(end, maxLen));
+                try {{ el.setSelectionRange(nextStart, nextEnd); }} catch(_) {{}}
+            }}
+        }}, 0);
         return;
     }}
     if(t.id==='musicAddSearch'){{
@@ -1811,7 +1844,7 @@ function renderMusicPage(main){{
         const canSearch=canSearchMusicLibrary(S.musicAddQuery);
         const searchPending=!!S.musicAddSearchPending;
         const addPending=Object.values(S.pendingMusicActions||{{}}).some(item=>String((item&&item.type)||'')==='music_add_files');
-    const addRows=(S.musicLibraryResults||[]).map(item=>{{
+        const addRows=(S.musicLibraryResults||[]).map(item=>{{
       const file=String(item.file||'');
       const checked=!!S.musicAddSelection[file];
       return '<tr class="hover:bg-gray-800">'
@@ -1822,6 +1855,8 @@ function renderMusicPage(main){{
       +'</tr>';
     }}).join('');
     const addSelectedCount=Object.keys(S.musicAddSelection||{{}}).filter(k=>S.musicAddSelection[k]).length;
+    const searchLimit=Math.max(1, Number(S.musicAddSearchLimit||200) || 200);
+    const canLoadMore=!!(S.musicAddHasSearched && !searchPending && (S.musicLibraryResults||[]).length>=searchLimit);
     main.innerHTML='<div class="max-w-5xl mx-auto px-2 py-4 space-y-3">'
       +'<div class="flex items-center justify-between gap-2 flex-wrap px-2">'
         +'<h2 class="font-semibold text-lg">Add Songs</h2>'
@@ -1832,11 +1867,12 @@ function renderMusicPage(main){{
       +'</div>'
       +'<div class="px-2">'
                 +'<div class="flex items-center gap-2">'
-                    +'<input id="musicAddSearch" data-action="music-add-search" value="'+esc(S.musicAddQuery||'')+'" placeholder="Search library by title, artist, album" class="flex-1 rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
+                    +'<input type="search" id="musicAddSearch" data-action="music-add-search" value="'+esc(S.musicAddQuery||'')+'" placeholder="Search library by title, artist, album" class="flex-1 rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
                                         +'<button id="musicAddSearchSubmit" data-action="music-add-search-submit" class="px-3 py-2 rounded-lg text-sm bg-blue-700 hover:bg-blue-600 transition-colors" '+((canSearch && !searchPending) ? '' : 'disabled style="opacity:.5;cursor:not-allowed"')+'>'+(searchPending?'Searching…':'Search')+'</button>'
                 +'</div>'
                                 +(canSearch ? '' : '<p id="musicAddMinHint" class="text-xs text-gray-500 mt-1">Enter at least '+MUSIC_LIBRARY_SEARCH_MIN_LEN+' letters to search</p>')
       +'</div>'
+    +(canLoadMore ? '<div class="px-2 -mt-1"><button data-action="music-add-search-more" class="px-3 py-1 rounded-lg text-xs bg-gray-700 hover:bg-gray-600 transition-colors">Load More</button></div>' : '')
       +(addRows
                 ? '<div class="px-2 flex items-center justify-end gap-1 text-xs text-gray-400">'
                         +'<button data-action="music-add-select-all" class="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 transition-colors">Select All</button>'
@@ -1896,7 +1932,7 @@ function renderMusicPage(main){{
           +'</div>'
         +'</div>'
         +'<div class="px-2">'
-          +'<input id="musicQueueSearch" data-action="music-queue-search" value="'+esc(S.musicQueueFilter||'')+'" placeholder="Filter queue: title, artist, album" class="w-full rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
+          +'<input type="search" id="musicQueueSearch" data-action="music-queue-search" value="'+esc(S.musicQueueFilter||'')+'" placeholder="Filter queue: title, artist, album" class="w-full rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
         +'</div>'
         +(S.musicActionError? '<div class="px-2 text-xs text-red-300">⚠ '+esc(S.musicActionError)+'</div>' : '')
         +(rows
@@ -1935,8 +1971,15 @@ function esc(s){{ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').re
 function wsUrl(){{ return (location.protocol==='https:'?'wss':'ws')+'://'+location.hostname+':'+WS_PORT+'/ws'; }}
 function sendAction(payload){{ if(S.ws&&S.ws.readyState===WebSocket.OPEN) S.ws.send(JSON.stringify(payload)); }}
 function sendMusicAction(actionType, extraPayload={{}}){{
+    if(!(S.ws&&S.ws.readyState===WebSocket.OPEN)){{
+        recordInlineError('music','', 'Not connected; retry in a moment');
+        if(S.page==='music') renderMusicPage(document.getElementById('main'));
+        applyMusicHeader();
+        return null;
+    }}
     const actionId='m'+(S.nextMusicActionId++);
-    S.pendingMusicActions[actionId]={{type:actionType, ts:Date.now()}};
+    const timeoutMs=(actionType==='music_load_playlist') ? MUSIC_LOAD_PLAYLIST_TIMEOUT_MS : PENDING_ACTION_TIMEOUT_MS;
+    S.pendingMusicActions[actionId]={{type:actionType, ts:Date.now(), timeoutMs, payload:Object.assign({{}}, extraPayload||{{}})}};
     sendAction(Object.assign({{type:actionType, action_id:actionId}}, extraPayload||{{}}));
     if(S.page==='music') renderMusicPage(document.getElementById('main'));
     applyMusicHeader();
@@ -1984,7 +2027,8 @@ function expirePendingActions(){{
     Object.keys(S.pendingMusicActions||{{}}).forEach((actionId)=>{{
         const item=S.pendingMusicActions[actionId];
         if(!item) return;
-        if((now-Number(item.ts||0))>PENDING_ACTION_TIMEOUT_MS){{
+        const timeoutMs=Math.max(1000, Number(item.timeoutMs||PENDING_ACTION_TIMEOUT_MS));
+        if((now-Number(item.ts||0))>timeoutMs){{
             delete S.pendingMusicActions[actionId];
             recordInlineError('music','', 'Music action timed out');
             touchMusic=true;
@@ -2034,6 +2078,43 @@ function expirePendingActions(){{
     if(touchMusic){{ applyMusicHeader(); if(S.page==='music') renderMusicPage(document.getElementById('main')); }}
     if(touchTimer) renderTimerBar();
     if(touchSettings) applyMicControlToggles();
+}}
+
+function clearPendingActionsOnDisconnect(){{
+    const hadMusic = Object.keys(S.pendingMusicActions||{{}}).length > 0;
+    const hadTimer = Object.keys(S.pendingTimerActions||{{}}).length > 0;
+    const hadSetting = Object.keys(S.pendingSettingActions||{{}}).length > 0;
+    if(!hadMusic && !hadTimer && !hadSetting) return;
+
+    let retryPlaylistName='';
+    let retryPlaylistTs=0;
+    Object.keys(S.pendingMusicActions||{{}}).forEach((actionId)=>{{
+        const item=S.pendingMusicActions[actionId];
+        if(!item || String(item.type||'')!=='music_load_playlist') return;
+        const name=String(((item.payload||{{}}).name)||'').trim();
+        if(!name) return;
+        const ts=Number(item.ts||0);
+        if(!retryPlaylistName || ts > retryPlaylistTs){{
+            retryPlaylistName=name;
+            retryPlaylistTs=ts;
+        }}
+    }});
+    if(retryPlaylistName){{
+        S.musicLoadRetryPending = retryPlaylistName;
+        S.musicLoadRetryAttempted = false;
+    }}
+
+    S.pendingMusicActions = {{}};
+    S.pendingTimerActions = {{}};
+    S.pendingSettingActions = {{}};
+
+    if(hadMusic){{
+        recordInlineError('music','', retryPlaylistName ? 'Connection reset; retrying playlist load…' : 'Connection reset; please retry music action');
+        applyMusicHeader();
+        if(S.page==='music') renderMusicPage(document.getElementById('main'));
+    }}
+    if(hadTimer) renderTimerBar();
+    if(hadSetting) applyMicControlToggles();
 }}
 
 function formatCaptureError(err){{
@@ -2159,6 +2240,17 @@ function connectWs(){{
             if(S.browserAudioEnabled) ensureBrowserCapture().catch((err)=>reportCaptureFailure(err,'connect'));
             S.ws.send(JSON.stringify({{type:'ui_ready'}}));
                 pushUiPrefsToServer();
+            if(S.musicLoadRetryPending && !S.musicLoadRetryAttempted){{
+                const retryName=String(S.musicLoadRetryPending||'').trim();
+                if(retryName){{
+                    S.musicLoadRetryAttempted=true;
+                    setTimeout(()=>{{
+                        if(!S.ws || S.ws.readyState!==WebSocket.OPEN) return;
+                        const actionId=sendMusicAction('music_load_playlist', {{name: retryName}});
+                        if(actionId) S.musicLoadRetryPending=null;
+                    }}, 120);
+                }}
+            }}
     }};
     S.ws.onclose=(evt)=>{{
         S.wsConnected=false;
@@ -2168,6 +2260,7 @@ function connectWs(){{
         updateWsDebugBanner();
         updateMicInteractivity();
         stopWsPingTimer();
+        clearPendingActionsOnDisconnect();
         S.ws=null;
         if (evt && evt.code === 4001) return;
         if(S.wsManualDisconnect) return;
@@ -2245,7 +2338,7 @@ function handleMsg(msg){{
             break;
         case 'chat_reset':
             S.chat=[];
-            applyServerChatState([], msg.chat_threads, msg.active_chat_id);
+            applyServerChatState([], msg.chat_threads, msg.active_chat_id, true);
             S.selectedChatId='active';
             persistChatCache();
             if(S.page==='home') renderPage();
@@ -2289,6 +2382,22 @@ function handleMsg(msg){{
                 S.lastMusicRev=rev;
             }}
             applyMusic(msg.music||msg);
+            if(S.music && S.music.loaded_playlist){{
+                const loadedNow=String(S.music.loaded_playlist||'').trim().toLowerCase();
+                Object.keys(S.pendingMusicActions||{{}}).forEach((actionId)=>{{
+                    const item=S.pendingMusicActions[actionId];
+                    if(!item || String(item.type||'')!=='music_load_playlist') return;
+                    const expected=String(((item.payload||{{}}).name)||'').trim().toLowerCase();
+                    if(expected && loadedNow && expected===loadedNow) delete S.pendingMusicActions[actionId];
+                }});
+                if(S.musicLoadRetryPending){{
+                    const expectedRetry=String(S.musicLoadRetryPending||'').trim().toLowerCase();
+                    if(expectedRetry && loadedNow && expectedRetry===loadedNow){{
+                        S.musicLoadRetryPending=null;
+                        S.musicLoadRetryAttempted=false;
+                    }}
+                }}
+            }}
             if(msg.queue!==undefined) S.musicQueue=msg.queue;
             else if(msg.music&&msg.music.queue!==undefined) S.musicQueue=msg.music.queue;
             syncMusicFromQueue();
@@ -2305,6 +2414,10 @@ function handleMsg(msg){{
             break;
         case 'music_action_ack':
             if(msg.action_id) delete S.pendingMusicActions[String(msg.action_id)];
+            if(String(msg.action||'')==='music_load_playlist'){{
+                S.musicLoadRetryPending=null;
+                S.musicLoadRetryAttempted=false;
+            }}
             S.musicActionError='';
             S.musicActionErrorTs=0;
             if(S.page==='music') renderMusicPage(document.getElementById('main'));
@@ -2326,6 +2439,10 @@ function handleMsg(msg){{
             }}
             S.musicAddSearchPending = false;
             S.musicAddPendingQuery = '';
+            if(msg.limit!==undefined){{
+                const responseLimit = Math.max(1, Number(msg.limit) || 200);
+                S.musicAddSearchLimit = responseLimit;
+            }}
             if(Array.isArray(msg.results)){{
                 S.musicLibraryResults = msg.results;
                 S.musicAddSelection = {{}};
@@ -2736,7 +2853,7 @@ class EmbeddedVoiceWebService:
         self._on_music_load_playlist: Callable[[str, str], Awaitable[None]] | None = None
         self._on_music_save_playlist: Callable[[str, str], Awaitable[None]] | None = None
         self._on_music_delete_playlist: Callable[[str, str], Awaitable[None]] | None = None
-        self._on_music_search_library: Callable[[str, str], Awaitable[list[dict[str, Any]]]] | None = None
+        self._on_music_search_library: Callable[[str, int, str], Awaitable[list[dict[str, Any]]]] | None = None
         self._on_music_list_playlists: Callable[[str], Awaitable[list[str]]] | None = None
         self._on_get_music_state: Callable[[], Awaitable[tuple[dict[str, Any], list[dict[str, Any]]]]] | None = None
         self._on_timer_cancel: Callable[[str, str], Awaitable[None]] | None = None
@@ -3068,7 +3185,7 @@ class EmbeddedVoiceWebService:
         on_music_load_playlist: Callable[[str, str], Awaitable[None]] | None = None,
         on_music_save_playlist: Callable[[str, str], Awaitable[None]] | None = None,
         on_music_delete_playlist: Callable[[str, str], Awaitable[None]] | None = None,
-        on_music_search_library: Callable[[str, str], Awaitable[list[dict[str, Any]]]] | None = None,
+        on_music_search_library: Callable[[str, int, str], Awaitable[list[dict[str, Any]]]] | None = None,
         on_music_list_playlists: Callable[[str], Awaitable[list[str]]] | None = None,
         on_get_music_state: Callable[[], Awaitable[tuple[dict[str, Any], list[dict[str, Any]]]]] | None = None,
         on_timer_cancel: Callable[[str, str], Awaitable[None]] | None = None,
@@ -3467,12 +3584,14 @@ class EmbeddedVoiceWebService:
 
         if msg_type == "music_search_library" and self._on_music_search_library:
             query = str(payload.get("query", "")).strip()
+            requested_limit = max(1, min(2000, int(payload.get("limit", 200) or 200)))
             try:
-                rows = await self._on_music_search_library(query, client_id)
+                rows = await self._on_music_search_library(query, requested_limit, client_id)
                 if websocket is not None:
                     await websocket.send(json.dumps({
                         "type": "music_library_results",
                         "query": query,
+                        "limit": requested_limit,
                         "results": rows or [],
                     }))
             except Exception as exc:

@@ -40,6 +40,7 @@ from orchestrator.state import VoiceState, WakeState
 from orchestrator.audio.capture import AudioCapture
 from orchestrator.audio.duplex import DuplexAudioIO
 from orchestrator.audio.buffer import RingBuffer
+from orchestrator.audio.volume_adjuster import CutInTracker, MicVolumeAdjuster
 from orchestrator.vad.silero import SileroVAD
 from orchestrator.vad.webrtc_vad import WebRTCVAD
 from orchestrator.wakeword.openwakeword import OpenWakeWordDetector
@@ -260,6 +261,7 @@ def decide_ghost_transcript(ctx: dict[str, Any]) -> GhostDecision:
     cutin_early_ms = float(ctx.get("cutin_early_ms") or 500)
     require_question_for_acks = bool(ctx.get("require_question_for_acks"))
     single_word_enabled = bool(ctx.get("single_word_enabled"))
+    has_inflight_user_request = bool(ctx.get("has_inflight_user_request"))
 
     if canonical in GHOST_ARTIFACT_TOKENS and not strong_allow:
         return GhostDecision(False, ("ghost_artifact_phrase",), -4, "strong_suppress_artifact")
@@ -307,6 +309,9 @@ def decide_ghost_transcript(ctx: dict[str, Any]) -> GhostDecision:
         return GhostDecision(True, tuple(allow_codes), score, "hard_allow_context")
     if score >= 1:
         return GhostDecision(True, tuple(allow_codes) if allow_codes else ("weighted_accept",), score, "weighted_accept")
+
+    if is_short_transcript and has_inflight_user_request and not is_ack_token(canonical) and not is_greeting_token(canonical):
+        return GhostDecision(True, ("allow_inflight_short_continuation",), score, "continuation_allow_inflight")
 
     if token_count >= 4:
         return GhostDecision(True, ("default_accept_normal_length",), score, "default_accept")
@@ -573,6 +578,7 @@ async def run_orchestrator() -> None:
     tts_last_played_request_id = 0  # Request ID of the last successfully completed TTS item
     last_gateway_send_ts: float | None = None  # Monotonic time of the last transcript sent to gateway
     last_thinking_phrase_ts: float | None = None  # Monotonic time of the last thinking phrase spoken
+    suppress_gateway_messages_for_new_session = False
     last_user_text = ""
     last_user_accepted_ts: float | None = None
     last_user_went_upstream = False
@@ -585,6 +591,38 @@ async def run_orchestrator() -> None:
     last_upstream_assistant_ts: float | None = None
     last_upstream_response_was_question = False
     last_upstream_response_requested_confirmation = False
+    
+    # Dynamic volume adjustment
+    cut_in_tracker = CutInTracker(
+        enabled=config.auto_adjust_output_volume_on_repeated_cutin,
+        window_ms=config.auto_adjust_cutin_window_ms,
+        count_threshold=config.auto_adjust_cutin_count_threshold,
+        reduction_ratio=config.auto_adjust_output_volume_reduction_ratio,
+        restoration_timeout_ms=config.auto_adjust_output_volume_restoration_timeout_ms,
+    )
+    mic_volume_adjuster = MicVolumeAdjuster(
+        enabled=config.auto_adjust_mic_volume_enabled,
+        target_rms=config.auto_adjust_mic_target_rms,
+        adjustment_ratio=config.auto_adjust_mic_adjustment_ratio,
+        exclude_devices=[d.strip() for d in config.auto_adjust_mic_exclude_devices.split(',') if d.strip()],
+        gain_min=config.auto_adjust_mic_gain_min,
+        gain_max=config.auto_adjust_mic_gain_max,
+    )
+    if config.auto_adjust_output_volume_on_repeated_cutin:
+        logger.info(
+            "🔊 Dynamic output volume adjustment ENABLED (cut-in tracker: %d in %dms → %.0f%% reduction)",
+            config.auto_adjust_cutin_count_threshold,
+            config.auto_adjust_cutin_window_ms,
+            (1 - config.auto_adjust_output_volume_reduction_ratio) * 100,
+        )
+    if config.auto_adjust_mic_volume_enabled:
+        logger.info(
+            "🎤 Dynamic mic volume adjustment ENABLED (target RMS: %.4f, gain range: %.2f–%.2f)",
+            config.auto_adjust_mic_target_rms,
+            config.auto_adjust_mic_gain_min,
+            config.auto_adjust_mic_gain_max,
+        )
+    
     ghost_suppressed_total = 0
     ghost_suppressed_short_no_question = 0
     ghost_suppressed_self_echo = 0
@@ -1650,6 +1688,48 @@ async def run_orchestrator() -> None:
     processing_request = False  # Flag to prevent concurrent gateway requests
     web_service = None
 
+    async def _start_new_session(*, source: str, client_id: str | None = None) -> str:
+        nonlocal pending_transcripts, debounce_task, processing_request, current_request_id
+        nonlocal suppress_gateway_messages_for_new_session
+        if client_id:
+            logger.info("🆕 New session requested by %s (client=%s)", source, client_id)
+        else:
+            logger.info("🆕 New session requested by %s", source)
+        try:
+            pending_transcripts.clear()
+            if debounce_task and not debounce_task.done():
+                debounce_task.cancel()
+            debounce_task = None
+            processing_request = False
+            current_request_id += 1
+            if config.new_session_suppress_welcome_message:
+                suppress_gateway_messages_for_new_session = True
+            _tts_clear_all(f"{source} new session")
+            tts_stop_event.set()
+
+            try:
+                await gateway.send_message(
+                    "/reset",
+                    session_id=session_id,
+                    agent_id=agent_id,
+                    metadata={"source": source},
+                )
+                logger.info("✓ Gateway session reset via /reset")
+            except Exception as exc:
+                logger.warning("Gateway /reset failed (continuing with local reset): %s", exc)
+
+            if web_service:
+                web_service.start_new_chat()
+
+            return "Started a new session."
+        finally:
+            tts_stop_event.clear()
+
+    if quick_answer_client:
+        quick_answer_client.set_new_session_handler(
+            lambda: _start_new_session(source="quick_answer", client_id=None)
+        )
+
     if config.web_ui_enabled:
         print("→ Starting Embedded Voice Web UI...", flush=True)
         logger.info("→ Starting Embedded Voice Web UI service")
@@ -1879,13 +1959,22 @@ async def run_orchestrator() -> None:
                     except Exception as exc:
                         logger.warning("Web UI music_delete_playlist '%s': %s", name, exc)
 
-            async def _ui_music_search_library(query: str, client_id: str) -> list[dict[str, Any]]:
+            async def _ui_music_search_library(query: str, limit: int, client_id: str) -> list[dict[str, Any]]:
                 if not music_manager:
                     return []
                 try:
-                    return await music_manager.search_library_for_ui(query, limit=400)
+                    api_start_ms = time.time() * 1000
+                    safe_limit = max(1, min(2000, int(limit or 200)))
+                    results = await music_manager.search_library_for_ui(query, limit=safe_limit)
+                    api_elapsed = time.time() * 1000 - api_start_ms
+                    logger.info(
+                        f"🌐 Web API music_search_library (client {client_id}, limit={safe_limit}): "
+                        f"{len(results)} rows in {api_elapsed:.1f}ms"
+                    )
+                    return results
                 except Exception as exc:
-                    logger.warning("Web UI music_search_library '%s': %s", query, exc)
+                    elapsed = time.time() * 1000 - api_start_ms
+                    logger.warning(f"Web UI music_search_library '{query}' after {elapsed:.1f}ms: {exc}")
                     return []
 
             async def _ui_music_list_playlists(client_id: str) -> list[str]:
@@ -1912,32 +2001,7 @@ async def run_orchestrator() -> None:
                         logger.warning("Web UI alarm_cancel id=%s: %s", alarm_id, exc)
 
             async def _ui_chat_new(client_id: str) -> None:
-                nonlocal pending_transcripts, debounce_task, processing_request
-                logger.info("🆕 Web UI new chat requested by client %s", client_id)
-                try:
-                    pending_transcripts.clear()
-                    if debounce_task and not debounce_task.done():
-                        debounce_task.cancel()
-                    debounce_task = None
-                    processing_request = False
-                    _tts_clear_all("web ui new chat")
-                    tts_stop_event.set()
-
-                    try:
-                        await gateway.send_message(
-                            "/reset",
-                            session_id=session_id,
-                            agent_id=agent_id,
-                            metadata={"source": "web_ui"},
-                        )
-                        logger.info("✓ Gateway session reset via /reset")
-                    except Exception as exc:
-                        logger.warning("Gateway /reset failed (continuing with local reset): %s", exc)
-
-                    if web_service:
-                        web_service.start_new_chat()
-                finally:
-                    tts_stop_event.clear()
+                await _start_new_session(source="web_ui", client_id=client_id)
 
             async def _ui_chat_text(text: str, client_id: str) -> None:
                 nonlocal pending_transcripts, debounce_task
@@ -2304,6 +2368,7 @@ async def run_orchestrator() -> None:
         nonlocal last_assistant_was_question, last_assistant_expects_short_reply
         nonlocal last_upstream_assistant_text, last_upstream_assistant_ts
         nonlocal last_upstream_response_was_question, last_upstream_response_requested_confirmation
+        nonlocal suppress_gateway_messages_for_new_session
         
         # If already processing, let that task handle everything
         if processing_request:
@@ -2361,6 +2426,7 @@ async def run_orchestrator() -> None:
             current_request_id += 1
             logger.info("📍 New user message [req#%d]", current_request_id)
             print(f"\033[93m→ USER: {combined_transcript}\033[0m", flush=True)
+            suppress_gateway_messages_for_new_session = False
             if web_service:
                 web_service.append_chat_message({
                     "role": "user",
@@ -2682,6 +2748,7 @@ async def run_orchestrator() -> None:
         nonlocal last_upstream_response_requested_confirmation
         nonlocal ghost_suppressed_total, ghost_suppressed_short_no_question, ghost_suppressed_self_echo
         nonlocal ghost_accepted_short_after_question, ghost_accepted_short_after_upstream_question
+        nonlocal processing_request
         active_transcriptions += 1
         state = VoiceState.SENDING
         try:
@@ -2768,6 +2835,7 @@ async def run_orchestrator() -> None:
                 "playback_tail_ms": float(config.ghost_filter_playback_tail_ms),
                 "cutin_early_ms": float(config.ghost_filter_cutin_early_ms),
                 "has_fresh_prompt_context": has_fresh_prompt_context,
+                "has_inflight_user_request": bool(processing_request or len(pending_transcripts) > 0),
             }
 
             ghost_filter_active = bool(config.ghost_filter_enabled and not config.ghost_filter_kill_switch)
@@ -2904,11 +2972,16 @@ async def run_orchestrator() -> None:
 
                     # Playback phase
                     effective_tts_gain = max(0.05, float(tts_gain * config.tts_relative_gain))
+                    # Apply dynamic volume reduction if cut-in tracker indicates it
+                    vol_multiplier = cut_in_tracker.get_output_volume_multiplier()
+                    if vol_multiplier < 1.0:
+                        effective_tts_gain *= vol_multiplier
                     logger.info(
-                        "→ TTS PLAY: Starting playback (base_gain=%.2f, relative=%.2f, effective=%.2f)",
+                        "→ TTS PLAY: Starting playback (base_gain=%.2f, relative=%.2f, effective=%.2f, cut_in_vol_mult=%.2f)",
                         tts_gain,
                         config.tts_relative_gain,
                         effective_tts_gain,
+                        vol_multiplier,
                     )
                     # Reset Silero RNN state to prevent carryover from previous speech
                     if cut_in_silero is not None:
@@ -3076,6 +3149,11 @@ async def run_orchestrator() -> None:
             if not buffer.strip():
                 buffer = ""
                 return
+
+            if suppress_gateway_messages_for_new_session:
+                logger.info("🔇 Suppressed buffered gateway output after new-session reset")
+                buffer = ""
+                return
             
             # Filter out NO_REPLY markers
             text_to_send = strip_gateway_control_markers(buffer).strip()
@@ -3117,6 +3195,8 @@ async def run_orchestrator() -> None:
                         payload_obj = None
 
                     if payload_obj is not None and web_service:
+                        if suppress_gateway_messages_for_new_session:
+                            continue
                         step_msg, interim_msg, consumed = _extract_structured_event(payload_obj, current_request_id)
                         if step_msg:
                             web_service.append_chat_message(step_msg)
@@ -3127,6 +3207,10 @@ async def run_orchestrator() -> None:
 
                     text = strip_gateway_control_markers(extract_text_from_gateway_message(message))
                     if not text:
+                        continue
+
+                    if suppress_gateway_messages_for_new_session:
+                        logger.info("🔇 Suppressed gateway text after new-session reset: '%s'", text[:80])
                         continue
 
                     logger.info("🔤 Received: '%s'", text)
@@ -3241,6 +3325,8 @@ async def run_orchestrator() -> None:
                 async for step in gateway.listen_steps():
                     reconnect_delay_s = 1.0
                     if not isinstance(step, dict) or not web_service:
+                        continue
+                    if suppress_gateway_messages_for_new_session:
                         continue
 
                     name = str(step.get("name") or "event").strip() or "event"
@@ -4094,6 +4180,24 @@ async def run_orchestrator() -> None:
             speech_hit = bool(vad_result.speech_detected) and rms >= config.vad_min_rms
             if speech_hit:
                 speech_frame_count += 1
+                # Adjust microphone gain based on speech RMS if enabled and device is not excluded
+                if mic_volume_adjuster.should_process_device(config.audio_capture_device):
+                    new_gain, mic_msg = mic_volume_adjuster.adjust_gain(rms, now)
+                    if mic_msg:
+                        logger.info(mic_msg)
+                    # Apply the adjusted gain to the frame if it has changed
+                    if abs(new_gain - 1.0) > 0.001:
+                        try:
+                            # Apply gain adjustment to samples
+                            adjusted_samples = (samples * new_gain).astype(np.int16)
+                            # Clamp to valid int16 range
+                            adjusted_samples = np.clip(adjusted_samples, -32768, 32767)
+                            frame = adjusted_samples.astype(np.int16).tobytes()
+                            processed_frame = frame  # Update for downstream processing
+                            # Recalculate RMS with adjusted frame
+                            rms = float(np.sqrt(np.mean(adjusted_samples.astype(np.float32) ** 2)) / 32768.0)
+                        except Exception as exc:
+                            logger.debug("Failed to apply mic gain adjustment: %s", exc)
             else:
                 speech_frame_count = 0
 
@@ -4265,6 +4369,11 @@ async def run_orchestrator() -> None:
                     dismissed_by_cut_in = await stop_ringing_alarms_immediately("voice cut-in")
                     if dismissed_by_cut_in > 0:
                         logger.info("✋ Voice cut-in dismissed active alarm ringing")
+                    
+                    # Track repeated cut-in events and adjust output volume
+                    should_reduce_vol, vol_msg = cut_in_tracker.on_cut_in(now)
+                    if should_reduce_vol and vol_msg:
+                        logger.info(vol_msg)
 
                     if not chunk_frames:
                         cut_in_triggered_ts = now

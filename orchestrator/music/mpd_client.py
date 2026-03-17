@@ -146,12 +146,12 @@ class MPDConnection:
                 self._connected = False
                 raise
     
-    async def send_command_list(self, response_list: bool = True) -> List[Dict[str, str]]:
+    async def send_command_list(self, send_cmd: str = "") -> List[Dict[str, str]]:
         """
-        Read response for list commands that return multiple items.
+        Send command and read response for list commands that return multiple items.
         
         Args:
-            response_list: Whether command returns list_item blocks
+            send_cmd: MPD protocol command to send (if empty, just reads response)
         
         Returns:
             List of dictionaries, one per item
@@ -161,6 +161,14 @@ class MPDConnection:
                 raise ConnectionError("Not connected to MPD")
             
             try:
+                # Send command if provided
+                if send_cmd:
+                    self._writer.write(f"{send_cmd}\n".encode('utf-8'))
+                    await asyncio.wait_for(
+                        self._writer.drain(),
+                        timeout=self.timeout
+                    )
+                
                 items = []
                 current_item = {}
                 
@@ -171,7 +179,8 @@ class MPDConnection:
                     )
                     
                     if not line:
-                        raise ConnectionError("Connection closed by MPD")
+                        self._connected = False
+                        raise ConnectionError("Connection closed by MPD during list read")
                     
                     line = line.decode('utf-8').strip()
                     
@@ -202,10 +211,13 @@ class MPDConnection:
                 logger.error("Timeout waiting for MPD list response")
                 self._connected = False
                 raise ConnectionError("MPD command timeout")
-            except Exception as e:
-                logger.error(f"Error reading MPD list response: {e}")
-                self._connected = False
+            except ConnectionError:
+                # Connection errors are already handled
                 raise
+            except Exception as e:
+                logger.error(f"Error in MPD list response: {e}")
+                self._connected = False
+                raise ConnectionError(f"MPD list response error: {e}")
 
 
 class MPDClientPool:
@@ -282,10 +294,11 @@ class MPDClientPool:
         
         # Check if connection is still valid, reconnect if needed
         if not conn.is_connected:
-            logger.info("Reconnecting to MPD...")
+            logger.debug("Reconnecting to stale MPD connection...")
             if not await conn.connect():
-                # Put back in queue and raise error
-                await self._available.put(conn)
+                # Don't put failed connections back into pool - they're bad
+                # This prevents a cascade of reconnection failures
+                logger.warning("Failed to reconnect to MPD, connection discarded")
                 raise ConnectionError("Failed to reconnect to MPD")
         
         try:
@@ -312,6 +325,7 @@ class MPDClientPool:
             except ConnectionError:
                 # Stale/half-open connection — reconnect and retry once
                 await conn.close()
+                await asyncio.sleep(0.1)  # Brief backoff before reconnect
                 if not await conn.connect():
                     raise ConnectionError("Failed to reconnect to MPD")
                 return await conn.send_command(command)
@@ -329,14 +343,13 @@ class MPDClientPool:
         """
         async with self.get_connection() as conn:
             try:
-                conn._writer.write(f"{command}\n".encode('utf-8'))
-                await asyncio.wait_for(conn._writer.drain(), timeout=conn.timeout)
-                return await conn.send_command_list()
-            except ConnectionError:
+                return await conn.send_command_list(send_cmd=command)
+            except ConnectionError as e:
                 # Stale/half-open connection — reconnect and retry once
+                logger.debug(f"List command failed ({e}), reconnecting and retrying...")
                 await conn.close()
+                await asyncio.sleep(0.1)  # Brief backoff before reconnect
                 if not await conn.connect():
                     raise ConnectionError("Failed to reconnect to MPD")
-                conn._writer.write(f"{command}\n".encode('utf-8'))
-                await asyncio.wait_for(conn._writer.drain(), timeout=conn.timeout)
-                return await conn.send_command_list()
+                await asyncio.sleep(0.1)  # Brief delay before retry
+                return await conn.send_command_list(send_cmd=command)

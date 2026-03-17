@@ -92,6 +92,19 @@ class VoiceConfig(BaseSettings):
     audio_output_gain: float = Field(1.0)  # Software gain multiplier for TTS/output audio
     tts_relative_gain: float = Field(0.75)  # Additional trim for TTS only (relative to music/background)
 
+    # Automatic audio level adjustment
+    auto_adjust_output_volume_on_repeated_cutin: bool = Field(False)
+    auto_adjust_cutin_window_ms: int = Field(5000)
+    auto_adjust_cutin_count_threshold: int = Field(2)
+    auto_adjust_output_volume_reduction_ratio: float = Field(0.85)
+    auto_adjust_output_volume_restoration_timeout_ms: int = Field(30000)
+    auto_adjust_mic_volume_enabled: bool = Field(False)
+    auto_adjust_mic_target_rms: float = Field(0.04)
+    auto_adjust_mic_adjustment_ratio: float = Field(0.05)
+    auto_adjust_mic_exclude_devices: str = Field("")
+    auto_adjust_mic_gain_min: float = Field(0.5)
+    auto_adjust_mic_gain_max: float = Field(3.0)
+
     # VAD
     vad_type: str = Field("webrtc")
     vad_confidence: float = Field(0.5)
@@ -217,6 +230,7 @@ class VoiceConfig(BaseSettings):
     quick_answer_timeout_ms: int = Field(5000)  # Timeout for quick answer requests
     quick_answer_mirror_enabled: bool = Field(False)  # Mirror QA turns to the openclaw session so they appear in web chat
     quick_answer_bypass_window_ms: int = Field(8000)  # After a transcript is sent to gateway, bypass quick answer for this many ms (0=disabled)
+    new_session_suppress_welcome_message: bool = Field(True)  # Suppress gateway assistant output emitted immediately after /reset
 
     # STT ghost transcript suppression gate
     ghost_filter_enabled: bool = Field(True)
@@ -405,6 +419,37 @@ class VoiceConfig(BaseSettings):
             errors.append(f"AUDIO_OUTPUT_GAIN={self.audio_output_gain} is unusual (typical range: 0.1-5.0)")
         if self.tts_relative_gain < 0.1 or self.tts_relative_gain > 2.0:
             errors.append(f"TTS_RELATIVE_GAIN={self.tts_relative_gain} is unusual (typical range: 0.1-2.0)")
+
+        if self.auto_adjust_cutin_window_ms < 0:
+            errors.append(
+                f"AUTO_ADJUST_CUTIN_WINDOW_MS={self.auto_adjust_cutin_window_ms} must be >= 0"
+            )
+        if self.auto_adjust_cutin_count_threshold < 1:
+            errors.append(
+                f"AUTO_ADJUST_CUTIN_COUNT_THRESHOLD={self.auto_adjust_cutin_count_threshold} must be >= 1"
+            )
+        if not (0.0 <= self.auto_adjust_output_volume_reduction_ratio <= 1.0):
+            errors.append(
+                "AUTO_ADJUST_OUTPUT_VOLUME_REDUCTION_RATIO must be between 0.0 and 1.0"
+            )
+        if self.auto_adjust_output_volume_restoration_timeout_ms < 0:
+            errors.append(
+                "AUTO_ADJUST_OUTPUT_VOLUME_RESTORATION_TIMEOUT_MS must be >= 0"
+            )
+        if self.auto_adjust_mic_target_rms < 0:
+            errors.append(f"AUTO_ADJUST_MIC_TARGET_RMS={self.auto_adjust_mic_target_rms} must be >= 0")
+        if not (0.0 <= self.auto_adjust_mic_adjustment_ratio <= 1.0):
+            errors.append(
+                "AUTO_ADJUST_MIC_ADJUSTMENT_RATIO must be between 0.0 and 1.0"
+            )
+        if self.auto_adjust_mic_gain_min <= 0:
+            errors.append(
+                f"AUTO_ADJUST_MIC_GAIN_MIN={self.auto_adjust_mic_gain_min} must be > 0"
+            )
+        if self.auto_adjust_mic_gain_max < self.auto_adjust_mic_gain_min:
+            errors.append(
+                "AUTO_ADJUST_MIC_GAIN_MAX must be >= AUTO_ADJUST_MIC_GAIN_MIN"
+            )
 
         if self.media_keys_command_debounce_ms < 0:
             errors.append(
