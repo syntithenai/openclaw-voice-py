@@ -1920,6 +1920,17 @@ async def run_orchestrator() -> None:
                     except Exception as exc:
                         logger.warning("Web UI music_play_track pos=%d: %s", position, exc)
 
+            async def _ui_music_clear_queue(client_id: str) -> None:
+                if music_manager:
+                    try:
+                        await music_manager.clear_queue()
+                        if web_service:
+                            ms = await music_manager.get_ui_music_state()
+                            q = await music_manager.get_ui_playlist()
+                            web_service.update_music_state(queue=q, **ms)
+                    except Exception as exc:
+                        logger.warning("Web UI music_clear_queue: %s", exc)
+
             async def _ui_music_remove_selected(
                 positions: list[int],
                 client_id: str,
@@ -2040,6 +2051,7 @@ async def run_orchestrator() -> None:
                 on_music_toggle=_ui_music_toggle,
                 on_music_stop=_ui_music_stop,
                 on_music_play_track=_ui_music_play_track,
+                on_music_clear_queue=_ui_music_clear_queue,
                 on_music_remove_selected=_ui_music_remove_selected,
                 on_music_add_files=_ui_music_add_files,
                 on_music_create_playlist=_ui_music_create_playlist,
@@ -2061,6 +2073,7 @@ async def run_orchestrator() -> None:
                 last_music_transport_hash = ""
                 last_music_queue_hash = ""
                 last_schedule_hash = ""
+                last_schedule_shape_hash = ""
                 music_failures = 0
                 timer_failures = 0
                 music_poll = config.web_ui_music_poll_ms / 1000.0
@@ -2104,8 +2117,7 @@ async def run_orchestrator() -> None:
                                     music_failures,
                                     exc,
                                 )
-                    if timer_manager and (now - timer_tick) >= timer_poll:
-                        timer_tick = now
+                    if timer_manager:
                         try:
                             timers = timer_manager.list_ui_timers()
                             alarms = alarm_manager.list_ui_alarms() if alarm_manager else []
@@ -2126,8 +2138,22 @@ async def run_orchestrator() -> None:
                                 )
                                 for e in entries
                             ])
-                            if sh != last_schedule_hash:
+                            shape_hash = str([
+                                (
+                                    e.get("kind", "timer"),
+                                    e.get("id"),
+                                    bool(e.get("ringing", False)),
+                                    bool(e.get("enabled", True)),
+                                    bool(e.get("triggered", False)),
+                                )
+                                for e in entries
+                            ])
+                            immediate_shape_change = shape_hash != last_schedule_shape_hash
+                            periodic_refresh_due = (now - timer_tick) >= timer_poll
+                            if immediate_shape_change or (periodic_refresh_due and sh != last_schedule_hash):
                                 last_schedule_hash = sh
+                                last_schedule_shape_hash = shape_hash
+                                timer_tick = now
                                 web_service.update_timers_state(entries)
                             timer_failures = 0
                         except Exception as exc:

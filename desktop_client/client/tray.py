@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import io
 import os
 import threading
+from contextlib import suppress
+from pathlib import Path
 from typing import Any
 
 from .config import derive_ws_url
@@ -23,8 +26,11 @@ class DesktopTrayApp:
         self._last_status_line = "OpenClaw Voice Desktop Client"
         self._fallback_opened = False
         self._control_root = None  # tk.Tk reference for deiconify
+        self._mic_glyph = None
 
     def run(self) -> None:
+        self._prefer_clickable_linux_backend()
+
         import pystray
         from PIL import Image, ImageDraw
 
@@ -32,15 +38,19 @@ class DesktopTrayApp:
         self._pil_image = (Image, ImageDraw)
 
         menu = pystray.Menu(
-            pystray.MenuItem("Open Controls", self._open_control_window, default=True),
-            pystray.MenuItem("Toggle Microphone", self._toggle_mic),
+            pystray.MenuItem("Open Web UI", self._open_web_ui),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Access Web UI", self._open_web_ui),
-            pystray.MenuItem("Mute TTS", self._toggle_tts, checked=lambda _: self.controller.state.tts_muted),
+            pystray.MenuItem(
+                "Mute TTS",
+                self._toggle_tts,
+                checked=lambda _: self.controller.state.tts_muted,
+                radio=False,
+            ),
             pystray.MenuItem(
                 "Continuous Mode",
                 self._toggle_continuous,
                 checked=lambda _: self.controller.state.continuous_mode,
+                radio=False,
             ),
             pystray.MenuItem("Settings", self._open_settings),
             pystray.Menu.SEPARATOR,
@@ -55,15 +65,37 @@ class DesktopTrayApp:
         )
         self._icon = icon
 
-        # Run tray detached and keep a stable foreground control surface on Linux.
-        # This avoids silent exits when tray backend terminates unexpectedly.
-        icon.run_detached()
-        self._run_fallback_window(do_auto_open=self._should_open_controls_on_start())
+        supports_menu = bool(getattr(icon.__class__, "HAS_MENU", True))
+        if not supports_menu:
+            self._last_status_line = "Tray backend has no click/menu support. Using control window."
+            try:
+                icon.run_detached()
+            except Exception:
+                pass
+            self._run_fallback_window(do_auto_open=True)
+            return
 
-    def _should_open_controls_on_start(self) -> bool:
-        session = str(os.environ.get("XDG_SESSION_TYPE", "")).strip().lower()
-        desktop = str(os.environ.get("XDG_CURRENT_DESKTOP", "")).strip().lower()
-        return session == "wayland" and "gnome" in desktop
+        # Keep tray loop as the primary event loop for reliable left/right click
+        # behavior across Linux backends.
+        try:
+            icon.run()
+        except Exception:
+            self._run_fallback_window(do_auto_open=True)
+
+    def _prefer_clickable_linux_backend(self) -> None:
+        if os.name != "posix":
+            return
+        if os.environ.get("PYSTRAY_BACKEND"):
+            return
+
+        for backend_name, module_name in (("gtk", "pystray._gtk"), ("appindicator", "pystray._appindicator")):
+            try:
+                __import__(module_name)
+                os.environ["PYSTRAY_BACKEND"] = backend_name
+                self._last_status_line = f"Tray backend selected: {backend_name}"
+                return
+            except Exception:
+                continue
 
     def _open_control_window(self, *_) -> None:
         """Open/raise the control window (left-click default action)."""
@@ -75,7 +107,10 @@ class DesktopTrayApp:
             except Exception:
                 pass
             return
-        threading.Thread(target=self._run_fallback_window, kwargs={"do_auto_open": True}, daemon=True).start()
+
+        # tkinter should run on the calling thread to avoid intermittent
+        # event-loop issues when opening from tray callbacks.
+        self._run_fallback_window(do_auto_open=True)
 
     def _on_state_changed(self, state: ClientState) -> None:
         icon = self._icon
@@ -96,7 +131,22 @@ class DesktopTrayApp:
             pass
 
     def _run_fallback_window(self, do_auto_open: bool = True) -> None:
-        import tkinter as tk
+        try:
+            import tkinter as tk
+        except Exception:
+            self._last_status_line = "Control window unavailable (tkinter not installed)."
+            icon = self._icon
+            if icon is not None:
+                with suppress(Exception):
+                    icon.title = self._last_status_line
+            return
+
+        if self._fallback_opened:
+            root = self._control_root
+            if root is not None:
+                with suppress(Exception):
+                    root.after(0, lambda: (root.deiconify(), root.lift()))
+            return
 
         self._fallback_opened = True
         root = tk.Tk()
@@ -112,7 +162,7 @@ class DesktopTrayApp:
 
         tk.Label(
             frame,
-            text="Tray icon unavailable in this session.\nUse this control window.",
+            text="System tray controls are unavailable right now.\nUse this control window.",
             justify="left",
             anchor="w",
         ).pack(anchor="w")
@@ -158,36 +208,50 @@ class DesktopTrayApp:
             if state.wake_state == "awake":
                 color = (50, 185, 95, 255)
 
-        W = (242, 242, 246, 255)  # near-white glyph colour
-
         # ── Dark background disk ────────────────────────────────────────────────
         d.ellipse((6, 6, 58, 58), fill=(36, 36, 46, 255))
 
         # ── Coloured VU ring ────────────────────────────────────────────────────
         d.ellipse((6, 6, 58, 58), outline=color, width=max(2, stroke))
 
-        # ── Mic capsule body (pill shape built from primitives) ─────────────────
-        # Capsule: x 26-38, y 10-34  (12 wide, 24 tall)
-        cx, cy_top, cy_bot = 32, 10, 34
-        cap_l, cap_r = 26, 38
-        d.rectangle((cap_l, cy_top + 6, cap_r, cy_bot), fill=W)   # body rect
-        d.ellipse((cap_l, cy_top, cap_r, cy_top + 12), fill=W)     # top dome
-
-        # ── Horizontal stand bar ────────────────────────────────────────────────
-        d.rectangle((23, 48, 41, 51), fill=W)
-
-        # ── Vertical stem (centre) ──────────────────────────────────────────────
-        d.rectangle((30, 38, 34, 49), fill=W)
-
-        # ── U-shaped arm (arc below capsule) ────────────────────────────────────
-        # Arc bounding box: left of the capsule to right of capsule, height ~16
-        d.arc((20, 32, 44, 48), start=0, end=180, fill=W, width=3)
+        # ── Microphone glyph from bundled SVG ──────────────────────────────────
+        glyph = self._load_mic_glyph()
+        if glyph is not None:
+            im.alpha_composite(glyph, (14, 14))
+        else:
+            W = (242, 242, 246, 255)
+            d.rounded_rectangle((21, 10, 43, 36), radius=11, fill=W)
+            d.rectangle((24, 24, 40, 26), fill=(36, 36, 46, 255))
+            d.arc((16, 26, 48, 50), start=0, end=180, fill=W, width=4)
+            d.rectangle((30, 40, 34, 50), fill=W)
+            d.rounded_rectangle((22, 50, 42, 54), radius=2, fill=W)
 
         # ── Strike-through diagonal when disconnected ───────────────────────────
         if not state.connected:
             d.line((16, 48, 48, 16), fill=(240, 200, 80, 255), width=4)
 
         return im
+
+    def _load_mic_glyph(self):
+        if self._mic_glyph is not None:
+            return self._mic_glyph
+
+        Image, _ = self._pil_image
+        svg_path = Path(__file__).resolve().parent / "assets" / "microphone.svg"
+        if not svg_path.exists():
+            return None
+
+        try:
+            import cairosvg
+
+            svg_text = svg_path.read_text(encoding="utf-8")
+            themed = svg_text.replace("currentColor", "#f2f2f6")
+            png_bytes = cairosvg.svg2png(bytestring=themed.encode("utf-8"), output_width=36, output_height=36)
+            glyph = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+            self._mic_glyph = glyph
+            return glyph
+        except Exception:
+            return None
 
     def _toggle_mic(self, *_: Any) -> None:
         self.controller.trigger_mic_toggle()
@@ -204,24 +268,37 @@ class DesktopTrayApp:
     def _open_settings(self, *_: Any) -> None:
         cfg = self.controller.config
         initial = {
-            "DESKTOP_WEB_UI_URL": cfg.web_ui_url,
+            "DESKTOP_GATEWAY_URL": cfg.web_ui_url,
         }
 
         def on_save(values: dict[str, str]) -> None:
-            cfg.web_ui_url = values.get("DESKTOP_WEB_UI_URL", cfg.web_ui_url)
+            cfg.web_ui_url = values.get("DESKTOP_GATEWAY_URL", cfg.web_ui_url)
             cfg.ws_url = derive_ws_url(cfg.web_ui_url)
-
             write_desktop_env(
                 cfg.desktop_env_path,
                 {
-                    "DESKTOP_WEB_UI_URL": cfg.web_ui_url,
+                    "DESKTOP_GATEWAY_URL": cfg.web_ui_url,
                     "DESKTOP_DEFAULT_TTS_MUTED": str(self.controller.state.tts_muted).lower(),
                     "DESKTOP_DEFAULT_CONTINUOUS_MODE": str(self.controller.state.continuous_mode).lower(),
                     "DESKTOP_RECONNECT_DELAY_S": str(cfg.reconnect_delay_s),
                 },
             )
 
-        threading.Thread(target=lambda: SettingsDialog(initial, on_save).show(), daemon=True).start()
+        backend = os.environ.get("PYSTRAY_BACKEND", "")
+        if backend in ("gtk", "appindicator"):
+            # GTK main loop is on this thread — use native GTK dialog directly.
+            from .settings_gtk import show_settings_dialog_gtk
+            show_settings_dialog_gtk(initial, on_save)
+        else:
+            def _open() -> None:
+                try:
+                    SettingsDialog(initial, on_save).show()
+                except Exception:
+                    self._last_status_line = "Settings UI unavailable."
+                    if self._icon is not None:
+                        with suppress(Exception):
+                            self._icon.title = self._last_status_line
+            threading.Thread(target=_open, daemon=True).start()
 
     def _quit(self, *_: Any) -> None:
         if self._icon is not None:

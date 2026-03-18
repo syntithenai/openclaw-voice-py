@@ -21,7 +21,7 @@ class FakeTransport:
 
 def test_left_click_triggers_mic_toggle(tmp_path: Path) -> None:
     env = tmp_path / ".env"
-    env.write_text("DESKTOP_WEB_UI_URL=http://127.0.0.1:18910\n", encoding="utf-8")
+    env.write_text("DESKTOP_GATEWAY_URL=https://localhost\n", encoding="utf-8")
     cfg = load_config(env)
     transport = FakeTransport()
     controller = TrayController(cfg, transport)
@@ -33,7 +33,7 @@ def test_left_click_triggers_mic_toggle(tmp_path: Path) -> None:
 
 def test_toggle_actions_send_expected_payloads(tmp_path: Path) -> None:
     env = tmp_path / ".env"
-    env.write_text("DESKTOP_WEB_UI_URL=http://127.0.0.1:18910\n", encoding="utf-8")
+    env.write_text("DESKTOP_GATEWAY_URL=https://localhost\n", encoding="utf-8")
     cfg = load_config(env)
     transport = FakeTransport()
     controller = TrayController(cfg, transport)
@@ -49,7 +49,7 @@ def test_toggle_actions_send_expected_payloads(tmp_path: Path) -> None:
 
 def test_state_snapshot_updates_ui_state(tmp_path: Path) -> None:
     env = tmp_path / ".env"
-    env.write_text("DESKTOP_WEB_UI_URL=http://127.0.0.1:18910\n", encoding="utf-8")
+    env.write_text("DESKTOP_GATEWAY_URL=https://localhost\n", encoding="utf-8")
     cfg = load_config(env)
     transport = FakeTransport()
     controller = TrayController(cfg, transport)
@@ -91,7 +91,7 @@ def test_vu_border_mapping_matches_web_ui_formula() -> None:
 def test_settings_validation() -> None:
     ok, msg = validate_settings(
         {
-            "DESKTOP_WEB_UI_URL": "http://127.0.0.1:18910",
+            "DESKTOP_GATEWAY_URL": "https://localhost",
         }
     )
     assert ok is True
@@ -99,15 +99,15 @@ def test_settings_validation() -> None:
 
     bad_ok, bad_msg = validate_settings(
         {
-            "DESKTOP_WEB_UI_URL": "file:///tmp/index.html",
+            "DESKTOP_GATEWAY_URL": "http://localhost",
         }
     )
     assert bad_ok is False
-    assert "Web UI URL" in bad_msg
+    assert "Gateway URL" in bad_msg
 
 
 def test_web_url_derives_ws_url(tmp_path: Path) -> None:
     env = tmp_path / ".env"
-    env.write_text("DESKTOP_WEB_UI_URL=http://192.168.1.20:19999\n", encoding="utf-8")
+    env.write_text("DESKTOP_GATEWAY_URL=https://192.168.1.20:19999\n", encoding="utf-8")
     cfg = load_config(env)
-    assert cfg.ws_url == "ws://192.168.1.20:20000/ws"
+    assert cfg.ws_url == "wss://192.168.1.20:20000/ws"

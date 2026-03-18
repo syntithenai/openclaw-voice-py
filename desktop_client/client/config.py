@@ -62,13 +62,18 @@ def load_config(desktop_env_path: Path | None = None) -> DesktopClientConfig:
             return str(root_env[key])
         return fallback
 
-    ui_port = get("WEB_UI_PORT", "18910")
     ws_port = get("WEB_UI_WS_PORT", "18911")
-    web_ui_url = get("DESKTOP_WEB_UI_URL", f"http://127.0.0.1:{ui_port}")
+    gateway_url = get("DESKTOP_GATEWAY_URL", "")
+    web_ui_url = gateway_url or get("DESKTOP_WEB_UI_URL", "https://localhost")
     desktop_ws_url = get("DESKTOP_WS_URL", "")
     has_explicit_desktop_web_ui = (
+        "DESKTOP_GATEWAY_URL" in os.environ
+        or ("DESKTOP_GATEWAY_URL" in local_env and local_env["DESKTOP_GATEWAY_URL"] is not None)
+        or ("DESKTOP_GATEWAY_URL" in root_env and root_env["DESKTOP_GATEWAY_URL"] is not None)
+        or
         "DESKTOP_WEB_UI_URL" in os.environ
         or ("DESKTOP_WEB_UI_URL" in local_env and local_env["DESKTOP_WEB_UI_URL"] is not None)
+        or ("DESKTOP_WEB_UI_URL" in root_env and root_env["DESKTOP_WEB_UI_URL"] is not None)
     )
     if desktop_ws_url:
         ws_url = desktop_ws_url

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import tkinter as tk
-from tkinter import messagebox
+from typing import Any
 from urllib.parse import urlparse
 
 
@@ -16,12 +15,14 @@ def _is_http_url(value: str) -> bool:
 
 
 def validate_settings(values: dict[str, str]) -> tuple[bool, str]:
-    web_ui = str(values.get("DESKTOP_WEB_UI_URL", "")).strip()
+    web_ui = str(values.get("DESKTOP_GATEWAY_URL", "")).strip()
 
     if not web_ui:
-        return False, "Web UI URL is required."
+        return False, "Gateway URL is required."
     if not _is_http_url(web_ui):
-        return False, "Web UI URL must be a valid http/https URL."
+        return False, "Gateway URL must be a valid https URL."
+    if not web_ui.lower().startswith("https://"):
+        return False, "Gateway URL must use https://"
     return True, ""
 
 
@@ -29,18 +30,26 @@ class SettingsDialog:
     def __init__(self, initial_values: dict[str, str], on_save) -> None:
         self._initial_values = dict(initial_values)
         self._on_save = on_save
-        self._root: tk.Tk | None = None
-        self._entries: dict[str, tk.Entry] = {}
+        self._root: Any | None = None
+        self._entries: dict[str, Any] = {}
+        self._messagebox: Any | None = None
 
     def show(self) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+        except Exception as exc:
+            raise RuntimeError("Tkinter is not available in this Python environment") from exc
+
         root = tk.Tk()
         root.title("OpenClaw Desktop Client Settings")
         root.geometry("640x160")
         root.resizable(False, False)
         self._root = root
+        self._messagebox = messagebox
 
         fields = [
-            ("DESKTOP_WEB_UI_URL", "OpenClaw Voice Web UI URL"),
+            ("DESKTOP_GATEWAY_URL", "Gateway URL (HTTPS)"),
         ]
 
         frame = tk.Frame(root, padx=12, pady=12)
@@ -68,7 +77,8 @@ class SettingsDialog:
         values = {k: e.get().strip() for k, e in self._entries.items()}
         ok, message = validate_settings(values)
         if not ok:
-            messagebox.showerror("Invalid settings", message)
+            if self._messagebox is not None:
+                self._messagebox.showerror("Invalid settings", message)
             return
         self._on_save(values)
         self._root.destroy()

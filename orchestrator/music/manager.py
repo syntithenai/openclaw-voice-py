@@ -11,6 +11,7 @@ Provides user-friendly methods that map to MPD commands:
 
 import asyncio
 import logging
+import os
 import sqlite3
 import shutil
 import time
@@ -478,13 +479,29 @@ class MusicManager:
                 return "No tracks selected"
             added = 0
             failed = 0
-            for file_uri in cleaned:
+            first_new_song_id: Optional[str] = None
+            # Insert in reverse at position 0 so the first selected file ends up first in queue.
+            for file_uri in reversed(cleaned):
                 try:
-                    await self.pool.execute(f'add "{self._quote(file_uri)}"')
+                    result = await self.pool.execute(f'addid "{self._quote(file_uri)}" 0')
+                    song_id = str(result.get("Id") or result.get("id") or "").strip()
+                    if song_id:
+                        first_new_song_id = song_id
                     added += 1
                 except Exception as exc:
                     failed += 1
                     logger.warning("Failed to add file to queue '%s': %s", file_uri, exc)
+
+            if first_new_song_id:
+                try:
+                    await self.pool.execute(f"playid {first_new_song_id}")
+                except Exception as exc:
+                    logger.warning("Failed to jump to first newly added track (id=%s): %s", first_new_song_id, exc)
+            elif added > 0:
+                try:
+                    await self.pool.execute("play 0")
+                except Exception as exc:
+                    logger.warning("Failed to jump to top queue item after add: %s", exc)
             if added == 0:
                 return "Error: Failed to add selected tracks to queue"
             if failed > 0:
@@ -537,13 +554,25 @@ class MusicManager:
 
     def _ensure_fts_conn(self) -> sqlite3.Connection:
         if self._fts_conn is None:
-            conn = sqlite3.connect(":memory:")
-            conn.execute("PRAGMA journal_mode=MEMORY")
-            conn.execute("PRAGMA synchronous=OFF")
+            workspace_dir = os.getenv("OPENCLAW_WORKSPACE_DIR", os.path.join(os.getcwd(), ".openclaw"))
+            mpd_dir = os.path.join(workspace_dir, ".mpd")
+            os.makedirs(mpd_dir, exist_ok=True)
+            db_path = os.path.join(mpd_dir, "music_search_idx.sqlite3")
+            conn = sqlite3.connect(db_path)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA temp_store=MEMORY")
             conn.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS music_search_idx USING fts5(file, title, artist, album, searchable)"
             )
+            try:
+                existing_rows = int(conn.execute("SELECT COUNT(*) FROM music_search_idx").fetchone()[0])
+            except Exception:
+                existing_rows = 0
+            if existing_rows > 0:
+                self._fts_ready = True
+                self._fts_last_indexed_count = existing_rows
+                logger.info("🔎 Using existing music FTS index: %d rows", existing_rows)
             self._fts_conn = conn
         return self._fts_conn
 
@@ -566,17 +595,19 @@ class MusicManager:
         try:
             conn = self._ensure_fts_conn()
             conn.execute("DELETE FROM music_search_idx")
+            conn.commit()
 
             inserted = 0
             offset = 0
             batch = max(100, int(self._fts_batch_size))
+            pending: List[tuple] = []
+            commit_every = batch * 10
             while True:
-                cmd = f'search file "" window {offset}:{offset + batch - 1}'
+                cmd = f'search file "" window {offset}:{offset + batch}'
                 rows = await self.pool.execute_list(cmd)
                 if not rows:
                     break
 
-                docs = []
                 for item in rows:
                     file_uri = str(item.get("file", "")).strip()
                     if not file_uri:
@@ -585,18 +616,27 @@ class MusicManager:
                     artist = str(item.get("artist") or item.get("Artist") or "")
                     album = str(item.get("album") or item.get("Album") or "")
                     searchable = f"{title} {artist} {album} {file_uri}".strip().lower()
-                    docs.append((file_uri, title, artist, album, searchable))
+                    pending.append((file_uri, title, artist, album, searchable))
 
-                if docs:
+                if len(pending) >= commit_every:
                     conn.executemany(
                         "INSERT INTO music_search_idx(file,title,artist,album,searchable) VALUES (?,?,?,?,?)",
-                        docs,
+                        pending,
                     )
-                    inserted += len(docs)
+                    inserted += len(pending)
+                    pending = []
+                    conn.commit()
 
                 if len(rows) < batch:
                     break
                 offset += batch
+
+            if pending:
+                conn.executemany(
+                    "INSERT INTO music_search_idx(file,title,artist,album,searchable) VALUES (?,?,?,?,?)",
+                    pending,
+                )
+                inserted += len(pending)
 
             conn.commit()
             self._fts_last_indexed_count = inserted
@@ -735,7 +775,7 @@ class MusicManager:
             mpd_start = time.monotonic() * 1000
             rows: List[Dict[str, str]] = []
             quoted = self._quote(q)
-            window_clause = f"window 0:{safe_limit-1}"
+            window_clause = f"window 0:{safe_limit}"
             search_any_cmd = f'search any "{quoted}"'
             search_title_cmd = f'search title "{quoted}"'
             search_artist_cmd = f'search artist "{quoted}"'
@@ -1240,7 +1280,7 @@ class MusicManager:
             logger.error(f"Failed to get UI music state: {e}")
             return {"state": "error", "queue_length": 0}
 
-    async def get_ui_playlist(self, limit: int = 200) -> list:
+    async def get_ui_playlist(self, limit: int = 1000) -> list:
         """Return a compact queue list for the web UI music page."""
         try:
             # Fetch only as many items as we'll display to avoid connection timeouts on huge queues

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import websockets
+from orchestrator.gateway.message_extract import strip_gateway_control_markers
 from orchestrator.web.http_server import start_http_servers
 
 logger = logging.getLogger("orchestrator.web.realtime")
@@ -544,6 +545,14 @@ function updateScrollDownButton(){{
     const wrap=document.getElementById('scrollDownWrap');
     const upWrap=document.getElementById('scrollUpWrap');
     if(!wrap && !upWrap) return;
+
+    if(wrap){{
+        const desktop=window.matchMedia('(min-width: 768px)').matches;
+        const alignToChatPane=S.page==='home' && desktop && !!S.chatSidebarOpen;
+        wrap.style.marginLeft=alignToChatPane ? '18rem' : '';
+        wrap.style.width=alignToChatPane ? 'calc(100% - 18rem)' : '';
+    }}
+
     const area=document.getElementById('chatArea');
     if(!area || S.page!=='home'){{
         if(wrap){{
@@ -571,6 +580,15 @@ function updateScrollDownButton(){{
     }}
 }}
 
+function updateMusicQueueScrollUpButton(){{
+    const wrap=document.getElementById('musicQueueScrollUpWrap');
+    if(!wrap) return;
+    const pageTop=window.scrollY || document.documentElement.scrollTop || 0;
+    const shouldShow=(S.page==='music') && pageTop > 120;
+    wrap.classList.toggle('hidden', !shouldShow);
+    wrap.classList.toggle('flex', shouldShow);
+}}
+
 function requestScrollToBottomBurst(){{
     S.scrollToBottomPending=true;
     S.autoScrollUntilTs=Date.now()+12000;
@@ -587,6 +605,8 @@ function updateNavActiveState(){{
     }});
 }}
 window.addEventListener('hashchange',()=>{{ S.page=getPage(); renderPage(); updateNavActiveState(); closeMenu(); }});
+window.addEventListener('resize',()=>{{ updateScrollDownButton(); updateMusicQueueScrollUpButton(); }});
+window.addEventListener('scroll',()=>{{ updateScrollDownButton(); updateMusicQueueScrollUpButton(); }}, {{passive:true}});
 
 function closeMenu(){{ document.getElementById('menuDropdown').classList.add('hidden'); }}
 function closeMicControlMenu(){{ const m=document.getElementById('micControlDropdown'); if(m) m.classList.add('hidden'); }}
@@ -757,6 +777,18 @@ document.addEventListener('click', e => {{
         S.musicQueueSelectionByIds={{}};
         S.musicQueueLastCheckedId=null;
         renderMusicPage(document.getElementById('main'));
+        return;
+    }}
+
+    const musicScrollTopBtn = e.target.closest('[data-action="music-scroll-top"]');
+    if (musicScrollTopBtn) {{
+        window.scrollTo({{top:0, behavior:'smooth'}});
+        return;
+    }}
+
+    const clearQueueBtn = e.target.closest('[data-action="music-clear-queue"]');
+    if (clearQueueBtn) {{
+        sendMusicAction('music_clear_queue');
         return;
     }}
 
@@ -1119,6 +1151,7 @@ function renderPage(){{
     const dock=document.getElementById('chatComposerDock');
     if(S.page==='music'){{
         if(dock) dock.classList.add('hidden');
+        S.musicAddMode = false;
         renderMusicPage(main);
         sendAction({{type:'music_list_playlists'}});
     }} else {{
@@ -2067,6 +2100,41 @@ function mkBubble(m){{
 
 function renderMusicPage(main){{
   main.dataset.page='music';
+    const prevActiveEl=document.activeElement;
+    const hadQueueSearchFocus=!!(prevActiveEl && prevActiveEl.id==='musicQueueSearch');
+    const prevQueueSearchStart=(hadQueueSearchFocus && typeof prevActiveEl.selectionStart==='number') ? prevActiveEl.selectionStart : null;
+    const prevQueueSearchEnd=(hadQueueSearchFocus && typeof prevActiveEl.selectionEnd==='number') ? prevActiveEl.selectionEnd : null;
+
+    const hadAddSearchFocus=!!(prevActiveEl && prevActiveEl.id==='musicAddSearch');
+    const prevAddSearchStart=(hadAddSearchFocus && typeof prevActiveEl.selectionStart==='number') ? prevActiveEl.selectionStart : null;
+    const prevAddSearchEnd=(hadAddSearchFocus && typeof prevActiveEl.selectionEnd==='number') ? prevActiveEl.selectionEnd : null;
+
+    function restoreQueueSearchFocus(){{
+        if(!hadQueueSearchFocus) return;
+        const el=document.getElementById('musicQueueSearch');
+        if(!el) return;
+        if(el!==document.activeElement) el.focus();
+        if(prevQueueSearchStart!==null && prevQueueSearchEnd!==null && typeof el.setSelectionRange==='function'){{
+            const maxLen=String(el.value||'').length;
+            const nextStart=Math.max(0, Math.min(prevQueueSearchStart, maxLen));
+            const nextEnd=Math.max(0, Math.min(prevQueueSearchEnd, maxLen));
+            try{{ el.setSelectionRange(nextStart, nextEnd); }}catch(_e){{}}
+        }}
+    }}
+
+    function restoreAddSearchFocus(){{
+        if(!hadAddSearchFocus) return;
+        const el=document.getElementById('musicAddSearch');
+        if(!el) return;
+        if(el!==document.activeElement) el.focus();
+        if(prevAddSearchStart!==null && prevAddSearchEnd!==null && typeof el.setSelectionRange==='function'){{
+            const maxLen=String(el.value||'').length;
+            const nextStart=Math.max(0, Math.min(prevAddSearchStart, maxLen));
+            const nextEnd=Math.max(0, Math.min(prevAddSearchEnd, maxLen));
+            try{{ el.setSelectionRange(nextStart, nextEnd); }}catch(_e){{}}
+        }}
+    }}
+
     const m=S.music, q=S.musicQueue||[];
     m.state=normalizeMusicState(m.state);
     const pendingMusicCount=Object.keys(S.pendingMusicActions||{{}}).length;
@@ -2172,6 +2240,7 @@ function renderMusicPage(main){{
         +'<div class="flex items-center justify-between gap-2 flex-wrap px-2">'
           +'<h2 class="font-semibold text-lg">Queue <span class="text-gray-400 font-normal text-sm ml-1">'+m.queue_length+' tracks</span></h2>'
           +'<div class="flex items-center gap-2">'
+            +'<button data-action="music-clear-queue" class="px-3 py-1 rounded-lg text-sm bg-red-900 hover:bg-red-800 transition-colors">Clear Queue</button>'
             +'<button data-action="music-add-open" class="px-3 py-1 rounded-lg text-sm bg-blue-700 hover:bg-blue-600 transition-colors">Add Songs</button>'
                         +'<button data-action="music-open-save-playlist" class="px-3 py-1 rounded-lg text-sm bg-emerald-700 hover:bg-emerald-600 transition-colors">Save Playlist</button>'
                         +'<button data-action="music-toggle" class="px-4 py-2 rounded-lg text-base font-semibold bg-gray-700 hover:bg-gray-600 transition-colors" '+(pendingMusicCount? 'disabled style="opacity:.5;cursor:not-allowed"' : '')+'>'+(pendingMusicCount?'\u2026 Pending':(m.state==='play'?'\u23f9 Stop':'\u25b6 Play'))+'</button>'
@@ -2182,7 +2251,10 @@ function renderMusicPage(main){{
         +'</div>'
         +(S.musicActionError? '<div class="px-2 text-xs text-red-300">⚠ '+esc(S.musicActionError)+'</div>' : '')
         +(rows
-            ? '<div class="px-2 min-h-10 flex items-center justify-between gap-2">'
+                        ? '<div id="musicQueueScrollUpWrap" class="hidden justify-center px-2">'
+                                +'<button data-action="music-scroll-top" type="button" class="px-3 py-1.5 rounded-lg text-xs bg-gray-800 hover:bg-gray-700 transition-colors">Scroll up</button>'
+                            +'</div>'
+                            +'<div class="px-2 min-h-10 flex items-center justify-between gap-2">'
                 +'<div class="flex items-center gap-2">'
                     +'<button data-action="music-remove-selected" class="px-3 py-1.5 rounded-lg text-sm bg-red-800 hover:bg-red-700 transition-colors" '+(selectedCount? '' : 'disabled style="opacity:.5;cursor:not-allowed"')+'>Remove Selected ('+selectedCount+')</button>'
                     +'<button data-action="music-open-create-selected" class="px-3 py-1.5 rounded-lg text-sm bg-emerald-700 hover:bg-emerald-600 transition-colors" '+(selectedCount? '' : 'disabled style="opacity:.5;cursor:not-allowed"')+'>Create Playlist from Selected</button>'
@@ -2209,6 +2281,9 @@ function renderMusicPage(main){{
           +'</div>'
         : '')
   +'</div>';
+    restoreQueueSearchFocus();
+    restoreAddSearchFocus();
+        updateMusicQueueScrollUpButton();
 }}
 
 function fmtDur(s){{ if(!s) return '\u2014'; const t=Math.round(Number(s)); return Math.floor(t/60)+':'+String(t%60).padStart(2,'0'); }}
@@ -3105,6 +3180,7 @@ class EmbeddedVoiceWebService:
         self._on_music_stop: Callable[[str], Awaitable[None]] | None = None
         self._on_music_play_track: Callable[[int, str], Awaitable[None]] | None = None
         self._on_music_remove_selected: Callable[[list[int], str, list[str] | None], Awaitable[None]] | None = None
+        self._on_music_clear_queue: Callable[[str], Awaitable[None]] | None = None
         self._on_music_add_files: Callable[[list[str], str], Awaitable[None]] | None = None
         self._on_music_create_playlist: Callable[[str, list[int], str], Awaitable[None]] | None = None
         self._on_music_load_playlist: Callable[[str, str], Awaitable[None]] | None = None
@@ -3231,7 +3307,8 @@ class EmbeddedVoiceWebService:
                 self._chat_threads = self._sorted_chat_threads(threads)[: self._chat_thread_limit]
             active = data.get("active_messages")
             if isinstance(active, list):
-                self._chat_messages = active[-self.chat_history_limit:]
+                # Deduplicate messages when loading from persisted state
+                self._chat_messages = self._deduplicate_messages(active[-self.chat_history_limit:])
             seq = data.get("chat_seq")
             if isinstance(seq, int):
                 self._chat_seq = seq
@@ -3268,6 +3345,19 @@ class EmbeddedVoiceWebService:
             reverse=True,
         )
 
+    def _deduplicate_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Remove duplicate messages by ID, keeping first occurrence."""
+        seen_ids: set[int | str] = set()
+        deduplicated: list[dict[str, Any]] = []
+        for msg in messages:
+            msg_id = msg.get("id")
+            if msg_id is not None and msg_id in seen_ids:
+                continue  # Skip duplicate
+            if msg_id is not None:
+                seen_ids.add(msg_id)
+            deduplicated.append(msg)
+        return deduplicated
+
     def _schedule_chat_state_persist(self) -> None:
         if not self._chat_state_persistable():
             return
@@ -3291,9 +3381,16 @@ class EmbeddedVoiceWebService:
             self._chat_persist_timer = None
         try:
             self._chat_persist_path.parent.mkdir(parents=True, exist_ok=True)
+            # Deduplicate messages in threads before persisting
+            clean_threads = []
+            for thread in self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]:
+                clean_thread = dict(thread)
+                if "messages" in clean_thread:
+                    clean_thread["messages"] = self._deduplicate_messages(clean_thread.get("messages", []))
+                clean_threads.append(clean_thread)
             payload = {
-                "threads": self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit],
-                "active_messages": self._chat_messages,
+                "threads": clean_threads,
+                "active_messages": self._deduplicate_messages(self._chat_messages),
                 "chat_seq": self._chat_seq,
                 "saved_ts": time.time(),
             }
@@ -3316,7 +3413,7 @@ class EmbeddedVoiceWebService:
             logger.debug("Could not persist chat state to disk", exc_info=True)
 
     def update_chat_history(self, messages: list[dict[str, Any]]) -> None:
-        self._chat_messages = list(messages[-self.chat_history_limit:])
+        self._chat_messages = self._deduplicate_messages(list(messages[-self.chat_history_limit:]))
         self._schedule_chat_state_persist()
 
     def _derive_chat_title(self, messages: list[dict[str, Any]]) -> str:
@@ -3415,7 +3512,10 @@ class EmbeddedVoiceWebService:
 
         self._archive_active_chat_if_needed()
         loaded = selected_thread.get("messages")
-        self._chat_messages = list(loaded[-self.chat_history_limit:]) if isinstance(loaded, list) else []
+        # Deduplicate messages by ID when loading from thread
+        self._chat_messages = self._deduplicate_messages(
+            list(loaded[-self.chat_history_limit:]) if isinstance(loaded, list) else []
+        )
         self._active_chat_id = target_id
         self._active_chat_source_thread_id = target_id
 
@@ -3480,8 +3580,23 @@ class EmbeddedVoiceWebService:
         self._chat_seq += 1
         now_ts = time.time()
         msg = dict(message)
+        role = str(msg.get("role") or "").strip().lower()
+        if role == "assistant":
+            cleaned_text = strip_gateway_control_markers(str(msg.get("text") or "")).strip()
+            if not cleaned_text:
+                return
+            msg["text"] = cleaned_text
         msg.setdefault("id", self._chat_seq)
         msg.setdefault("ts", now_ts)
+        
+        # Prevent duplicate messages: check if message with same ID already exists
+        msg_id = msg.get("id")
+        if msg_id is not None:
+            for existing in self._chat_messages:
+                if existing.get("id") == msg_id:
+                    # Message already exists, skip appending to prevent duplication
+                    return
+        
         self._chat_messages.append(msg)
         if len(self._chat_messages) > self.chat_history_limit:
             self._chat_messages = self._chat_messages[-self.chat_history_limit:]
@@ -3626,6 +3741,7 @@ class EmbeddedVoiceWebService:
         on_music_stop: Callable[[str], Awaitable[None]] | None = None,
         on_music_play_track: Callable[[int, str], Awaitable[None]] | None = None,
         on_music_remove_selected: Callable[[list[int], str, list[str] | None], Awaitable[None]] | None = None,
+        on_music_clear_queue: Callable[[str], Awaitable[None]] | None = None,
         on_music_add_files: Callable[[list[str], str], Awaitable[None]] | None = None,
         on_music_create_playlist: Callable[[str, list[int], str], Awaitable[None]] | None = None,
         on_music_load_playlist: Callable[[str, str], Awaitable[None]] | None = None,
@@ -3652,6 +3768,8 @@ class EmbeddedVoiceWebService:
             self._on_music_play_track = on_music_play_track
         if on_music_remove_selected is not None:
             self._on_music_remove_selected = on_music_remove_selected
+        if on_music_clear_queue is not None:
+            self._on_music_clear_queue = on_music_clear_queue
         if on_music_add_files is not None:
             self._on_music_add_files = on_music_add_files
         if on_music_create_playlist is not None:
@@ -3945,6 +4063,22 @@ class EmbeddedVoiceWebService:
                     await websocket.send(json.dumps({
                         "type": "music_action_error",
                         "action": "music_remove_selected",
+                        "action_id": str(action_id),
+                        "error": str(exc),
+                    }))
+            return
+
+        if msg_type == "music_clear_queue" and self._on_music_clear_queue:
+            action_id = payload.get("action_id")
+            try:
+                await _send_music_action_ack("music_clear_queue", action_id)
+                await self._on_music_clear_queue(client_id)
+            except Exception as exc:
+                logger.warning("music_clear_queue handler error: %s", exc)
+                if websocket is not None and action_id:
+                    await websocket.send(json.dumps({
+                        "type": "music_action_error",
+                        "action": "music_clear_queue",
                         "action_id": str(action_id),
                         "error": str(exc),
                     }))
