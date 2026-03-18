@@ -479,29 +479,13 @@ class MusicManager:
                 return "No tracks selected"
             added = 0
             failed = 0
-            first_new_song_id: Optional[str] = None
-            # Insert in reverse at position 0 so the first selected file ends up first in queue.
-            for file_uri in reversed(cleaned):
+            for file_uri in cleaned:
                 try:
-                    result = await self.pool.execute(f'addid "{self._quote(file_uri)}" 0')
-                    song_id = str(result.get("Id") or result.get("id") or "").strip()
-                    if song_id:
-                        first_new_song_id = song_id
+                    await self.pool.execute(f'add "{self._quote(file_uri)}"')
                     added += 1
                 except Exception as exc:
                     failed += 1
                     logger.warning("Failed to add file to queue '%s': %s", file_uri, exc)
-
-            if first_new_song_id:
-                try:
-                    await self.pool.execute(f"playid {first_new_song_id}")
-                except Exception as exc:
-                    logger.warning("Failed to jump to first newly added track (id=%s): %s", first_new_song_id, exc)
-            elif added > 0:
-                try:
-                    await self.pool.execute("play 0")
-                except Exception as exc:
-                    logger.warning("Failed to jump to top queue item after add: %s", exc)
             if added == 0:
                 return "Error: Failed to add selected tracks to queue"
             if failed > 0:
@@ -1280,7 +1264,7 @@ class MusicManager:
             logger.error(f"Failed to get UI music state: {e}")
             return {"state": "error", "queue_length": 0}
 
-    async def get_ui_playlist(self, limit: int = 1000) -> list:
+    async def get_ui_playlist(self, limit: int = 200) -> list:
         """Return a compact queue list for the web UI music page."""
         try:
             # Fetch only as many items as we'll display to avoid connection timeouts on huge queues
