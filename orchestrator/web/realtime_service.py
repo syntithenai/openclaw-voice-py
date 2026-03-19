@@ -1218,11 +1218,5 @@ class EmbeddedVoiceWebService:
     # ------------------------------------------------------------------
 
     def _start_http_server(self) -> None:
-        html = _build_ui_html(
-            self.ws_port,
-            self.mic_starts_disabled,
-            self.audio_authority,
-            self._instance_id,
-        )
         ssl_context = self._ensure_ssl_context()
-        start_http_servers(self, html, ssl_context)
+        start_http_servers(self, ssl_context)
