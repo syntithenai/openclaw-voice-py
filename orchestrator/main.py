@@ -1876,14 +1876,41 @@ async def run_orchestrator() -> None:
                         mic_enabled=True,
                     )
 
+            async def _ui_refresh_music_state(source: str) -> None:
+                if not music_manager or not web_service:
+                    return
+                try:
+                    ms = await music_manager.get_ui_music_state()
+                except Exception as exc:
+                    logger.warning("Web UI %s transport refresh failed: %s", source, exc)
+                    return
+
+                try:
+                    q = await music_manager.get_ui_playlist()
+                except Exception as exc:
+                    logger.warning("Web UI %s queue refresh failed; keeping prior queue: %s", source, exc)
+                    web_service.update_music_transport(**ms)
+                    return
+
+                web_service.update_music_state(queue=q, **ms)
+
+            async def _ui_get_music_state_snapshot() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+                if not music_manager:
+                    return {"state": "stop", "queue_length": 0}, []
+
+                transport = await music_manager.get_ui_music_state()
+                try:
+                    queue = await music_manager.get_ui_playlist()
+                except Exception as exc:
+                    logger.warning("Web UI snapshot queue fetch failed; reusing last queue: %s", exc)
+                    queue = list(getattr(web_service, "_music_queue", []) if web_service else [])
+                return transport, queue
+
             async def _ui_music_toggle(client_id: str) -> None:
                 if music_manager:
                     try:
                         await music_manager.toggle_playback()
-                        if web_service:
-                            ms = await music_manager.get_ui_music_state()
-                            q = await music_manager.get_ui_playlist()
-                            web_service.update_music_state(queue=q, **ms)
+                        await _ui_refresh_music_state("music_toggle")
                     except Exception as exc:
                         logger.warning("Web UI music_toggle: %s", exc)
 
@@ -1891,10 +1918,7 @@ async def run_orchestrator() -> None:
                 if music_manager:
                     try:
                         await music_manager.stop()
-                        if web_service:
-                            ms = await music_manager.get_ui_music_state()
-                            q = await music_manager.get_ui_playlist()
-                            web_service.update_music_state(queue=q, **ms)
+                        await _ui_refresh_music_state("music_stop")
                     except Exception as exc:
                         logger.warning("Web UI music_stop: %s", exc)
 
@@ -1902,10 +1926,7 @@ async def run_orchestrator() -> None:
                 if music_manager:
                     try:
                         await music_manager.play(position)
-                        if web_service:
-                            ms = await music_manager.get_ui_music_state()
-                            q = await music_manager.get_ui_playlist()
-                            web_service.update_music_state(queue=q, **ms)
+                        await _ui_refresh_music_state("music_play_track")
                     except Exception as exc:
                         logger.warning("Web UI music_play_track pos=%d: %s", position, exc)
 
@@ -1913,10 +1934,7 @@ async def run_orchestrator() -> None:
                 if music_manager:
                     try:
                         await music_manager.seek_to(seconds)
-                        if web_service:
-                            ms = await music_manager.get_ui_music_state()
-                            q = await music_manager.get_ui_playlist()
-                            web_service.update_music_state(queue=q, **ms)
+                        await _ui_refresh_music_state("music_seek")
                     except Exception as exc:
                         logger.warning("Web UI music_seek seconds=%s: %s", seconds, exc)
 
@@ -1924,10 +1942,7 @@ async def run_orchestrator() -> None:
                 if music_manager:
                     try:
                         await music_manager.clear_queue()
-                        if web_service:
-                            ms = await music_manager.get_ui_music_state()
-                            q = await music_manager.get_ui_playlist()
-                            web_service.update_music_state(queue=q, **ms)
+                        await _ui_refresh_music_state("music_clear_queue")
                     except Exception as exc:
                         logger.warning("Web UI music_clear_queue: %s", exc)
 
@@ -1939,10 +1954,7 @@ async def run_orchestrator() -> None:
                 if music_manager:
                     try:
                         await music_manager.remove_from_queue_positions(positions, song_ids=song_ids)
-                        if web_service:
-                            ms = await music_manager.get_ui_music_state()
-                            q = await music_manager.get_ui_playlist()
-                            web_service.update_music_state(queue=q, **ms)
+                        await _ui_refresh_music_state("music_remove_selected")
                     except Exception as exc:
                         logger.warning("Web UI music_remove_selected: %s", exc)
 
@@ -1952,10 +1964,7 @@ async def run_orchestrator() -> None:
                         result = await music_manager.add_files_to_queue(files)
                         if str(result).strip().lower().startswith("error:"):
                             raise RuntimeError(result)
-                        if web_service:
-                            ms = await music_manager.get_ui_music_state()
-                            q = await music_manager.get_ui_playlist()
-                            web_service.update_music_state(queue=q, **ms)
+                        await _ui_refresh_music_state("music_add_files")
                     except Exception as exc:
                         logger.warning("Web UI music_add_files: %s", exc)
 
@@ -1963,10 +1972,7 @@ async def run_orchestrator() -> None:
                 if music_manager:
                     try:
                         await music_manager.create_playlist_from_queue_positions(name, positions)
-                        if web_service:
-                            ms = await music_manager.get_ui_music_state()
-                            q = await music_manager.get_ui_playlist()
-                            web_service.update_music_state(queue=q, **ms)
+                        await _ui_refresh_music_state("music_create_playlist")
                     except Exception as exc:
                         logger.warning("Web UI music_create_playlist '%s': %s", name, exc)
 
@@ -1974,10 +1980,7 @@ async def run_orchestrator() -> None:
                 if music_manager:
                     try:
                         await music_manager.save_playlist(name)
-                        if web_service:
-                            ms = await music_manager.get_ui_music_state()
-                            q = await music_manager.get_ui_playlist()
-                            web_service.update_music_state(queue=q, **ms)
+                        await _ui_refresh_music_state("music_save_playlist")
                     except Exception as exc:
                         logger.warning("Web UI music_save_playlist '%s': %s", name, exc)
 
@@ -1985,10 +1988,7 @@ async def run_orchestrator() -> None:
                 if music_manager:
                     try:
                         await music_manager.delete_playlist(name)
-                        if web_service:
-                            ms = await music_manager.get_ui_music_state()
-                            q = await music_manager.get_ui_playlist()
-                            web_service.update_music_state(queue=q, **ms)
+                        await _ui_refresh_music_state("music_delete_playlist")
                     except Exception as exc:
                         logger.warning("Web UI music_delete_playlist '%s': %s", name, exc)
 
@@ -2060,6 +2060,7 @@ async def run_orchestrator() -> None:
                 on_music_delete_playlist=_ui_music_delete_playlist,
                 on_music_search_library=_ui_music_search_library,
                 on_music_list_playlists=_ui_music_list_playlists,
+                on_get_music_state=_ui_get_music_state_snapshot,
                 on_timer_cancel=_ui_timer_cancel,
                 on_alarm_cancel=_ui_alarm_cancel,
                 on_chat_new=_ui_chat_new,

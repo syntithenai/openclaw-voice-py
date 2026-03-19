@@ -26,6 +26,7 @@ The MPDManager will start the local 'mpd' command; ensure it's in PATH.
 import logging
 import os
 import re
+import socket
 import subprocess
 import tempfile
 import time
@@ -66,6 +67,33 @@ class MPDManager:
         self.process: Optional[subprocess.Popen] = None
         self.pid_file: Optional[Path] = None
         self._runtime_config_path: Optional[Path] = None
+        self._using_external_mpd = False
+
+    def _probe_existing_mpd(self, timeout_sec: float = 1.0) -> bool:
+        """Return True when an MPD server is already reachable on configured host/port."""
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(max(0.1, float(timeout_sec)))
+            sock.connect((self.mpd_host, self.mpd_port))
+            banner = sock.recv(128)
+            if banner.startswith(b"OK MPD"):
+                return True
+            logger.debug(
+                "Port %s:%d is in use by non-MPD service (banner=%r)",
+                self.mpd_host,
+                self.mpd_port,
+                banner[:64],
+            )
+            return False
+        except (socket.timeout, ConnectionRefusedError, OSError):
+            return False
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
 
     def _prepare_runtime_config(self) -> str:
         """Create an effective mpd.conf with requested directory overrides."""
@@ -179,8 +207,18 @@ class MPDManager:
             logger.info("MPD already running (PID %d)", self.process.pid)
             return True
 
+        if self._probe_existing_mpd(timeout_sec=1.0):
+            self._using_external_mpd = True
+            logger.info(
+                "Detected existing MPD at %s:%d; reusing it and skipping managed MPD startup",
+                self.mpd_host,
+                self.mpd_port,
+            )
+            return True
+
         try:
             logger.info("Starting MPD (port %d)...", self.mpd_port)
+            self._using_external_mpd = False
 
             # Prepare MPD command
             cmd = ["mpd"]
@@ -218,6 +256,15 @@ class MPDManager:
                 # Process exited immediately (error)
                 stdout, stderr = self.process.communicate()
                 stderr_text = stderr.decode("utf-8", errors="replace") if stderr else "(empty)"
+                if "address already in use" in stderr_text.lower() and self._probe_existing_mpd(timeout_sec=1.0):
+                    logger.info(
+                        "MPD bind conflict detected, but existing MPD is healthy at %s:%d; reusing existing server",
+                        self.mpd_host,
+                        self.mpd_port,
+                    )
+                    self.process = None
+                    self._using_external_mpd = True
+                    return True
                 logger.error(
                     "MPD failed to start (exit code %d). stderr: %s",
                     returncode,
@@ -249,6 +296,13 @@ class MPDManager:
             True if MPD stopped successfully or was not running, False on error.
         """
         if self.process is None or self.process.poll() is not None:
+            if self._using_external_mpd:
+                logger.info(
+                    "External MPD is in use; skip stopping unmanaged server at %s:%d",
+                    self.mpd_host,
+                    self.mpd_port,
+                )
+                return True
             logger.debug("MPD not running")
             return True
 
@@ -279,6 +333,8 @@ class MPDManager:
     def is_running(self) -> bool:
         """Check if MPD process is running."""
         if self.process is None:
+            if self._using_external_mpd:
+                return self._probe_existing_mpd(timeout_sec=0.5)
             return False
         return self.process.poll() is None
 
@@ -307,13 +363,11 @@ class MPDManager:
         Returns:
             True if MPD is ready, False on timeout
         """
-        import socket
-
         start = time.monotonic()
         sock = None
 
         while time.monotonic() - start < timeout_sec:
-            if not self.is_running():
+            if not self._using_external_mpd and not self.is_running():
                 logger.warning("MPD process died while waiting for readiness")
                 return False
 

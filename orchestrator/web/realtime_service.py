@@ -2448,6 +2448,7 @@ function handleMsg(msg){{
             if(msg.action_id) delete S.pendingMusicActions[String(msg.action_id)];
             S.musicActionError='';
             S.musicActionErrorTs=0;
+            sendAction({{type:'music_get_state'}});
             if(S.page==='music') renderMusicPage(document.getElementById('main'));
             applyMusicHeader();
             break;
@@ -3327,15 +3328,6 @@ class EmbeddedVoiceWebService:
     async def _ws_handler(self, websocket: Any) -> None:
         client_id = uuid.uuid4().hex[:8]
 
-        # Single-client mode: newest connection replaces existing one.
-        for existing in list(self._clients):
-            if existing is not websocket:
-                try:
-                    await existing.close(code=4001, reason="Replaced by newer Web UI client")
-                except Exception:
-                    pass
-                self._clients.discard(existing)
-
         self._clients.add(websocket)
         self._active_client = websocket
         logger.info("Web UI client connected (%s); clients=%d", client_id, len(self._clients))
@@ -3357,7 +3349,7 @@ class EmbeddedVoiceWebService:
         finally:
             self._clients.discard(websocket)
             if self._active_client is websocket:
-                self._active_client = None
+                self._active_client = next(iter(self._clients), None)
             self._browser_pcm_frames.clear()
             logger.info("Web UI client disconnected (%s); clients=%d", client_id, len(self._clients))
 
@@ -3371,6 +3363,8 @@ class EmbeddedVoiceWebService:
         except json.JSONDecodeError:
             return
         msg_type = payload.get("type", "")
+        if isinstance(msg_type, str) and msg_type.startswith("music_"):
+            logger.info("Web UI music action received (%s) from %s", msg_type, client_id)
 
         if msg_type == "browser_audio_level":
             try:
@@ -3449,6 +3443,14 @@ class EmbeddedVoiceWebService:
                 )
             except Exception:
                 pass
+
+        if msg_type == "music_get_state" and self._on_get_music_state:
+            try:
+                transport, queue = await self._on_get_music_state()
+                await self.push_music_state_now(queue=queue, **transport)
+            except Exception as exc:
+                logger.warning("music_get_state handler error: %s", exc)
+            return
 
         if msg_type == "music_toggle" and self._on_music_toggle:
             action_id = payload.get("action_id")
