@@ -757,6 +757,54 @@ class QuickAnswerClient:
             self.new_session_enabled,
         )
         self._last_tool_steps: list[dict[str, str]] = []
+        self._voice_music_action_seq: int = 0
+
+    def _new_voice_music_action_id(self) -> str:
+        self._voice_music_action_seq += 1
+        return f"qa-music-{self._voice_music_action_seq}"
+
+    async def _emit_music_action_pending(self, action: str, action_id: str) -> None:
+        if not self.web_service:
+            return
+        try:
+            await self.web_service.broadcast(
+                {
+                    "type": "music_action_pending",
+                    "action": str(action),
+                    "action_id": str(action_id),
+                }
+            )
+        except Exception as exc:
+            logger.debug("Failed to emit music_action_pending: %s", exc)
+
+    async def _emit_music_action_ack(self, action: str, action_id: str) -> None:
+        if not self.web_service:
+            return
+        try:
+            await self.web_service.broadcast(
+                {
+                    "type": "music_action_ack",
+                    "action": str(action),
+                    "action_id": str(action_id),
+                }
+            )
+        except Exception as exc:
+            logger.debug("Failed to emit music_action_ack: %s", exc)
+
+    async def _emit_music_action_error(self, action: str, action_id: str, error: object) -> None:
+        if not self.web_service:
+            return
+        try:
+            await self.web_service.broadcast(
+                {
+                    "type": "music_action_error",
+                    "action": str(action),
+                    "action_id": str(action_id),
+                    "error": str(error),
+                }
+            )
+        except Exception as exc:
+            logger.debug("Failed to emit music_action_error: %s", exc)
 
     def set_new_session_handler(self, handler: Callable[[], Awaitable[str | None]] | None) -> None:
         """Update handler for quick-answer initiated new-session requests."""
@@ -951,8 +999,23 @@ class QuickAnswerClient:
 
         # Try music fast-path first if enabled
         if self.music_enabled and self.music_router:
+            voice_music_action_id: str | None = None
+            fast_match = None
+            try:
+                fast_match = self.music_router.parser.parse(user_query)
+            except Exception:
+                fast_match = None
+            if fast_match and fast_match[0] == "load_playlist":
+                voice_music_action_id = self._new_voice_music_action_id()
+                await self._emit_music_action_pending("music_load_playlist", voice_music_action_id)
+
             music_result = await self.music_router.handle_request(user_query, use_fast_path=True)
             if music_result is not None:
+                if voice_music_action_id:
+                    if str(music_result).lower().startswith("error"):
+                        await self._emit_music_action_error("music_load_playlist", voice_music_action_id, music_result)
+                    else:
+                        await self._emit_music_action_ack("music_load_playlist", voice_music_action_id)
                 await self._sync_web_music_state()
                 logger.info("← QUICK ANSWER: Music fast-path execution: %s", _preview(music_result))
                 return False, sanitize_quick_answer_text(music_result)
@@ -1102,7 +1165,20 @@ class QuickAnswerClient:
                             
                             # Route to appropriate handler
                             if func_name.startswith("music_") and self.music_enabled and self.music_router:
+                                voice_music_action_id: str | None = None
+                                voice_action_name: str | None = None
+                                if func_name == "music_load_playlist":
+                                    voice_action_name = "music_load_playlist"
+                                    voice_music_action_id = self._new_voice_music_action_id()
+                                    await self._emit_music_action_pending(voice_action_name, voice_music_action_id)
+
                                 result = await self.music_router.handle_tool_call(func_name, args_dict)
+
+                                if voice_music_action_id and voice_action_name:
+                                    if str(result).lower().startswith("error"):
+                                        await self._emit_music_action_error(voice_action_name, voice_music_action_id, result)
+                                    else:
+                                        await self._emit_music_action_ack(voice_action_name, voice_music_action_id)
                                 await self._sync_web_music_state()
                             elif func_name == "recorder" and self.recorder_enabled and self.recorder_tool:
                                 result = await self.recorder_tool.execute_tool(**args_dict)

@@ -79,6 +79,22 @@ function handleMsg(msg){
             }
             break;
 
+        case 'chat_update':
+            if(msg.message){
+                applyServerChatState(undefined, msg.chat_threads, msg.active_chat_id);
+                const updatedMsg = normalizeChatMessage(msg.message);
+                if(updatedMsg && updatedMsg.id){
+                    // Find and replace message with same ID
+                    const idx = S.chat.findIndex(m => m.id === updatedMsg.id);
+                    if(idx >= 0){
+                        S.chat[idx] = updatedMsg;
+                        if(S.page==='home') renderChatMessages('active');
+                    }
+                }
+                persistChatCache();
+            }
+            break;
+
         case 'chat_threads_update':
             applyServerChatState(undefined, msg.chat_threads, msg.active_chat_id);
             if(S.page==='home') renderPage();
@@ -159,6 +175,16 @@ function handleMsg(msg){
             S.musicActionErrorTs=0;
             if(String(msg.action||'')==='music_load_playlist'){
                 requestMusicStateRetry('music_load_playlist ack', 8, 600);
+            }
+            if(S.page==='music') renderMusicPage(document.getElementById('main'));
+            applyMusicHeader();
+            break;
+        case 'music_action_pending':
+            if(msg.action_id){
+                S.pendingMusicActions[String(msg.action_id)]={
+                    type:String(msg.action||''),
+                    ts:Date.now(),
+                };
             }
             if(S.page==='music') renderMusicPage(document.getElementById('main'));
             applyMusicHeader();

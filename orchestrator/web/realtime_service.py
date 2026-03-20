@@ -444,6 +444,62 @@ class EmbeddedVoiceWebService:
             )
         )
 
+    def update_or_append_chat_message(self, message: dict[str, Any]) -> None:
+        """
+        Append a user message, or replace the last user message if it's a prefix extension.
+        
+        This handles the case where high background noise causes multiple audio captures,
+        each extending the previous transcript. Instead of creating multiple user messages
+        like "Can you help me?" → "Can you help me? to find out" → "Can you help me? to find out
+        What the time is?", this merges them into a single evolving message.
+        """
+        # Only apply this logic to user messages from voice source
+        if message.get("role") != "user" or message.get("source") != "voice":
+            self.append_chat_message(message)
+            return
+        
+        new_text = (message.get("text") or "").strip()
+        if not new_text:
+            self.append_chat_message(message)
+            return
+        
+        # Check if last message is a user message from voice
+        if (
+            self._chat_messages
+            and self._chat_messages[-1].get("role") == "user"
+            and self._chat_messages[-1].get("source") == "voice"
+        ):
+            last_msg = self._chat_messages[-1]
+            last_text = (last_msg.get("text") or "").strip()
+            
+            # Check if new text is a prefix extension of last message (case-insensitive)
+            if (
+                last_text
+                and new_text.lower().startswith(last_text.lower())
+                and new_text != last_text
+            ):
+                # Replace the last message with the extended text
+                updated_msg = dict(last_msg)
+                updated_msg["text"] = new_text
+                updated_msg["ts"] = time.time()  # Update timestamp
+                self._chat_messages[-1] = updated_msg
+                self._upsert_active_chat_thread()
+                self._persist_chat_state()
+                asyncio.create_task(
+                    self.broadcast(
+                        {
+                            "type": "chat_update",
+                            "message": updated_msg,
+                            "chat_threads": list(self._chat_threads),
+                            "active_chat_id": self._active_chat_id,
+                        }
+                    )
+                )
+                return
+        
+        # Otherwise, append as a new message
+        self.append_chat_message(message)
+
     def update_music_transport(self, **state: Any) -> None:
         self._music_state.update(state)
         self._music_rev += 1

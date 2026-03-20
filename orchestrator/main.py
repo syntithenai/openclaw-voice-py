@@ -2543,6 +2543,15 @@ async def run_orchestrator() -> None:
             except Exception as exc:
                 logger.warning("Failed to append web chat message (%s): %s", context, exc)
         
+        def _safe_update_or_append_chat_message(message: dict[str, Any], context: str) -> None:
+            """Append or update user message if it's a prefix extension of the last one."""
+            if not web_service:
+                return
+            try:
+                web_service.update_or_append_chat_message(message)
+            except Exception as exc:
+                logger.warning("Failed to update or append web chat message (%s): %s", context, exc)
+        
         if immediate:
             logger.info("⏱️ Immediate dispatch requested (web text input)")
         else:
@@ -2636,7 +2645,7 @@ async def run_orchestrator() -> None:
             print(f"\033[93m→ USER: {combined_transcript}\033[0m", flush=True)
             suppress_gateway_messages_for_new_session = False
             is_music_query = bool(music_router and music_router.is_music_related(combined_transcript))
-            _safe_append_chat_message(
+            _safe_update_or_append_chat_message(
                 {
                     "role": "user",
                     "text": combined_transcript,

@@ -38,6 +38,8 @@ class MusicManager:
         self.pipewire_stream_target_percent = max(1, min(150, int(pipewire_stream_target_percent)))
         self._last_pipewire_normalize_ts = 0.0
         self._loaded_playlist_name: str = ""
+        self._loading_playlist_event: asyncio.Event = asyncio.Event()
+        self._loading_playlist_event.set()  # Initially not loading
         self._ui_search_cache: Dict[tuple[str, int], tuple[float, List[Dict[str, str]]]] = {}
         self._ui_search_cache_ttl_s = 20.0
         self._ui_search_cache_max_entries = 64
@@ -140,12 +142,21 @@ class MusicManager:
         """
         Start or resume playback.
         
+        Waits for any pending playlist load to complete before starting playback,
+        to ensure the correct playlist is in the queue.
+        
         Args:
             position: Optional queue position to start from (0-indexed)
         
         Returns:
             Success message
         """
+        # Wait for any pending playlist load to complete
+        if not self._loading_playlist_event.is_set():
+            logger.info("⏸ Play command waiting for pending playlist load to complete...")
+            await self._loading_playlist_event.wait()
+            logger.info("✓ Playlist load completed, resuming play command")
+        
         try:
             if position is not None:
                 await self.pool.execute(f"play {position}")
@@ -931,12 +942,33 @@ class MusicManager:
         return []
     
     async def load_playlist(self, name: str) -> str:
-        """Load a saved playlist."""
+        """Load a saved playlist (case-insensitive matching)."""
+        # Signal that a playlist load is in progress
+        self._loading_playlist_event.clear()
+        
         start_ms = time.monotonic() * 1000
         try:
             playlist_name = str(name or "").strip()
             if not playlist_name:
+                self._loading_playlist_event.set()  # Signal load complete (even though it failed)
                 return "Playlist name is required"
+
+            # Find the actual playlist name (case-insensitive matching)
+            # This handles voice commands like "load fred" matching "Fred.m3u" on disk
+            available_playlists = await self.list_playlists()
+            actual_playlist_name = None
+            
+            for available in available_playlists:
+                if available.lower() == playlist_name.lower():
+                    actual_playlist_name = available
+                    break
+            
+            if not actual_playlist_name:
+                self._loading_playlist_event.set()  # Signal load complete
+                logger.warning(
+                    f"Playlist '{playlist_name}' not found. Available: {available_playlists}"
+                )
+                return f"Error: Playlist '{playlist_name}' not found"
 
             clear_start = time.monotonic() * 1000
             await self.pool.execute("clear", timeout=8.0)
@@ -947,31 +979,42 @@ class MusicManager:
             last_exc: Exception | None = None
             for attempt in (1, 2):
                 try:
-                    await self.pool.execute(f'load "{self._quote(playlist_name)}"', timeout=25.0)
+                    await self.pool.execute(f'load "{self._quote(actual_playlist_name)}"', timeout=25.0)
                     load_ok = True
                     break
                 except Exception as exc:
                     last_exc = exc
                     if attempt == 1:
-                        logger.warning("load_playlist first attempt failed for '%s', retrying: %s", playlist_name, exc)
+                        logger.warning("load_playlist first attempt failed for '%s', retrying: %s", actual_playlist_name, exc)
                         await asyncio.sleep(0.05)
             if not load_ok:
                 if last_exc is not None:
+                    self._loading_playlist_event.set()  # Signal load complete
                     raise last_exc
+                self._loading_playlist_event.set()  # Signal load complete
                 raise RuntimeError("Playlist load failed")
             load_ms = time.monotonic() * 1000 - load_start
             
-            self._loaded_playlist_name = playlist_name
+            self._loaded_playlist_name = actual_playlist_name
             total_ms = time.monotonic() * 1000 - start_ms
+            
+            # Log the case mapping if different from original
+            case_info = ""
+            if actual_playlist_name != playlist_name:
+                case_info = f" (normalized from '{playlist_name}')"
+            
             logger.info(
-                f"📂 Load playlist '{playlist_name}': {total_ms:.1f}ms total "
+                f"📂 Load playlist '{actual_playlist_name}'{case_info}: {total_ms:.1f}ms total "
                 f"(clear:{clear_ms:.1f}ms, load:{load_ms:.1f}ms)"
             )
-            return f"Loaded playlist: {playlist_name}"
+            return f"Loaded playlist: {actual_playlist_name}"
         except Exception as e:
             elapsed = time.monotonic() * 1000 - start_ms
             logger.error(f"Failed to load playlist '{name}' after {elapsed:.1f}ms: {e}")
             return f"Error: {e}"
+        finally:
+            # Always signal that the load operation is complete
+            self._loading_playlist_event.set()
     
     async def save_playlist(self, name: str) -> str:
         """Save current queue as a playlist."""
@@ -991,12 +1034,38 @@ class MusicManager:
             return f"Error: {e}"
     
     async def delete_playlist(self, name: str) -> str:
-        """Delete a saved playlist."""
+        """Delete a saved playlist (case-insensitive matching)."""
         try:
-            await self.pool.execute(f'rm "{name}"')
-            return f"Deleted playlist: {name}"
+            playlist_name = str(name or "").strip()
+            if not playlist_name:
+                return "Playlist name is required"
+            
+            # Find the actual playlist name (case-insensitive matching)
+            # This ensures deletion works with "delete fred" even if playlist is "Fred.m3u"
+            available_playlists = await self.list_playlists()
+            actual_playlist_name = None
+            
+            for available in available_playlists:
+                if available.lower() == playlist_name.lower():
+                    actual_playlist_name = available
+                    break
+            
+            if not actual_playlist_name:
+                logger.warning(
+                    f"Playlist '{playlist_name}' not found for deletion. Available: {available_playlists}"
+                )
+                return f"Error: Playlist '{playlist_name}' not found"
+            
+            await self.pool.execute(f'rm "{self._quote(actual_playlist_name)}"')
+            
+            case_info = ""
+            if actual_playlist_name != playlist_name:
+                case_info = f" (matched '{actual_playlist_name}')"
+            
+            logger.info(f"📂 Deleted playlist '{playlist_name}'{case_info}")
+            return f"Deleted playlist: {playlist_name}"
         except Exception as e:
-            logger.error(f"Failed to delete playlist: {e}")
+            logger.error(f"Failed to delete playlist '{name}': {e}")
             return f"Error: {e}"
     
     # ========== High-Level Operations ==========

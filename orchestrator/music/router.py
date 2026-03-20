@@ -216,6 +216,15 @@ class MusicRouter:
         result = await self.manager.play_song(title)
         return result if self._is_error(result) else f"Playing: {title}."
     
+    async def _handle_play_playlist(self, name: str) -> str:
+        """Play a saved playlist (load and start playback)."""
+        result = await self.manager.load_playlist(name)
+        if self._is_error(result):
+            return result
+        # Auto-play after loading
+        play_result = await self.manager.play(0)
+        return play_result if self._is_error(play_result) else f"Now playing: {name}"
+
     async def _handle_load_playlist(self, name: str) -> str:
         """Handle load playlist command."""
         return await self.manager.load_playlist(name)
@@ -279,6 +288,7 @@ class MusicRouter:
                 arguments.get("shuffle", True)
             ),
             "music_play_song": lambda: self._handle_play_song(arguments.get("title", "")),
+            "music_play_playlist": lambda: self._handle_play_playlist(arguments.get("name", "")),
             "music_search": lambda: self._handle_search(arguments.get("query", "")),
             "music_load_playlist": lambda: self.manager.load_playlist(arguments.get("name", "")),
             "music_update_library": lambda: self.manager.update_library(),
