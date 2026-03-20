@@ -63,9 +63,13 @@ function handleMsg(msg){
     case 'status': if(msg.orchestrator) applyOrch(msg.orchestrator); break;
         case 'chat_append':
             if(msg.message){
+                applyServerChatState(undefined, msg.chat_threads, msg.active_chat_id);
                 const nextMsg = normalizeChatMessage(msg.message);
                 if(nextMsg) S.chat.push(nextMsg);
                 if(nextMsg && nextMsg.role==='user') requestScrollToBottomBurst();
+                if(nextMsg && nextMsg.role==='user' && queueOptimisticTimerFromText(String(nextMsg.text||''), 'chat_append')){
+                    renderTimerBar();
+                }
                 S.selectedChatId='active';
                 persistChatCache();
                 if(S.page==='home'){
@@ -318,6 +322,21 @@ function syncMusicFromQueue(){
     if(album) S.music.album = album;
     if(current.file) S.music.file = current.file;
 }
+function applyMusicQueueHighlight(){
+    if(S.page!=='music') return;
+    const pos = Number(S.music && S.music.position);
+    if(!Number.isFinite(pos) || pos < 0) return;
+    const rows = document.querySelectorAll('.music-queue-table-container tbody tr[data-queue-pos]');
+    if(!rows || !rows.length) return;
+
+    rows.forEach((row) => {
+        const rowPos = Number(row.getAttribute('data-queue-pos'));
+        const isActive = Number.isFinite(rowPos) && rowPos === pos;
+        row.classList.toggle('bg-gray-800', isActive);
+        row.classList.toggle('font-semibold', isActive);
+        row.classList.toggle('text-green-400', isActive);
+    });
+}
 function applyMusic(m){
     const payload=(m&&typeof m==='object'&&m.music&&typeof m.music==='object')?m.music:m;
     if(!payload||typeof payload!=='object') return;
@@ -327,19 +346,62 @@ function applyMusic(m){
     syncMusicFromQueue();
     applyTopMusicProgress();
     applyMusicHeader();
+    applyMusicQueueHighlight();
 }
 function applyTimers(t){
   const now=Date.now()/1000;
-    S.timers=(Array.isArray(t)?t:[])
+    const serverTimers=(Array.isArray(t)?t:[])
         .filter(timer=>{
             if(!timer||typeof timer!=='object') return false;
             const kind=String(timer.kind||'timer').toLowerCase();
             const rem=Number(timer.remaining_seconds);
             if(!Number.isFinite(rem)) return false;
+            if(kind==='timer' && rem<=0) return false;
             if(kind==='alarm' && rem<=0 && !timer.ringing) return false;
             return true;
         })
         .map(timer=>Object.assign({},timer,{_clientAnchorTs:now, _clientAnchorRem:Number(timer.remaining_seconds)||0}));
+
+    const optimistic=Object.assign({}, S.optimisticTimers||{});
+    const optimisticList=[];
+    Object.keys(optimistic).forEach((id)=>{
+        const it=optimistic[id];
+        if(!it) return;
+        const ageSec=Math.max(0, (Date.now()-Number(it.createdAtMs||Date.now()))/1000);
+        const expectedRem=Math.max(0, Number(it.durationSeconds||0)-ageSec);
+        if(expectedRem<=0 || ageSec>20){
+            delete S.optimisticTimers[id];
+            return;
+        }
+        const matched=serverTimers.some((s)=>{
+            const sk=String(s.kind||'timer').toLowerCase();
+            if(sk!==String(it.kind||'timer')) return false;
+            const srem=Number(s.remaining_seconds)||0;
+            return Math.abs(srem-expectedRem)<=8;
+        });
+        if(matched){
+            delete S.optimisticTimers[id];
+            return;
+        }
+        optimisticList.push({
+            id,
+            kind:String(it.kind||'timer'),
+            label:String(it.label|| (String(it.kind||'timer')==='alarm'?'Alarm':'Timer')),
+            remaining_seconds:expectedRem,
+            ringing:false,
+            _optimistic:true,
+            _clientAnchorTs:now,
+            _clientAnchorRem:expectedRem,
+        });
+    });
+
+    S.timers=serverTimers.concat(optimisticList)
+        .sort((a,b)=>{
+            const ak=String(a.kind||'timer').toLowerCase()==='alarm'?0:1;
+            const bk=String(b.kind||'timer').toLowerCase()==='alarm'?0:1;
+            if(ak!==bk) return ak-bk;
+            return (Number(a.remaining_seconds)||0)-(Number(b.remaining_seconds)||0);
+        });
   renderTimerBar();
 }
 

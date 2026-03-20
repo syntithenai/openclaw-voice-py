@@ -80,16 +80,18 @@
   <div id="wsProgressFill" class="absolute inset-y-0 left-0 pointer-events-none bg-blue-700/45" style="width:0%;transition:width .12s linear;"></div>
   <span id="wsDebugText" class="relative z-10 block px-3 py-1 text-left">0:00 / 0:00</span>
 </div>
-<div id="timerBar" class="hidden flex-none px-3 py-2 bg-amber-950/60 border-b border-amber-800/50 flex gap-2 flex-wrap items-center text-sm"></div>
-<div id="scrollUpWrap" class="hidden flex-none justify-center pt-2 pb-1">
-  <button id="scrollUpBtn" data-action="page-scroll-up" type="button" class="px-3 py-1.5 rounded-lg text-xs bg-gray-800 hover:bg-gray-700 transition-colors">Scroll up</button>
-</div>
+<div class="relative flex-1 min-h-0">
+  <div id="scrollUpWrap" class="hidden absolute inset-x-0 top-2 z-20 justify-center pointer-events-none">
+    <button id="scrollUpBtn" data-action="page-scroll-up" type="button" class="pointer-events-auto px-3 py-1.5 rounded-lg text-xs bg-gray-800/95 hover:bg-gray-700 transition-colors shadow-lg shadow-black/30">Scroll up</button>
+  </div>
 
-<main id="main" class="flex-1 overflow-y-auto min-h-0"></main>
+  <main id="main" class="h-full overflow-y-auto min-h-0"></main>
+</div>
 <div id="chatComposerDock" class="hidden flex-none border-t border-gray-800 bg-gray-900 px-3 py-2 z-10">
   <div id="scrollDownWrap" class="hidden justify-center pb-2">
     <button id="scrollDownBtn" data-action="chat-scroll-down" type="button" class="px-3 py-1.5 rounded-lg text-xs bg-gray-800 hover:bg-gray-700 transition-colors">Scroll down</button>
   </div>
+  <div id="timerBar" class="hidden mb-2 px-3 py-2 bg-amber-950/60 border border-amber-800/50 rounded-lg flex gap-2 flex-wrap items-center text-sm"></div>
   <form id="chatComposer" class="flex items-center gap-2">
     <input id="chatInput" type="text" placeholder="Type a message" class="flex-1 min-w-0 rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />
     <button id="chatSendBtn" type="submit" class="px-3 py-2 rounded-lg text-sm bg-blue-700 hover:bg-blue-600 transition-colors">Send</button>

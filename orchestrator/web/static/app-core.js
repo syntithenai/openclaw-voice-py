@@ -40,6 +40,9 @@ const S = {
     nextSettingActionId:1, pendingSettingActions:{},
     settingActionErrors:{}, timerActionErrors:{},
     musicActionError:'', musicActionErrorTs:0,
+    optimisticTimers:{},
+    _lastOptimisticIntentKey:'',
+    _lastOptimisticIntentTs:0,
     lastStatusRev:0, lastMusicRev:0, lastTimersRev:0, lastUiControlRev:0,
     wsDebug:{ status:'init', lastCloseCode:null, lastCloseReason:'', lastError:'' },
     wsManualDisconnect:false, wsReconnectTimer:null,
@@ -49,6 +52,143 @@ const S = {
     scrollToBottomPending:false,
     autoScrollUntilTs:0,
 };
+
+const SIMPLE_NUMBER_WORDS = {
+    zero:0, one:1, two:2, three:3, four:4, five:5, six:6, seven:7, eight:8, nine:9,
+    ten:10, eleven:11, twelve:12, thirteen:13, fourteen:14, fifteen:15, sixteen:16,
+    seventeen:17, eighteen:18, nineteen:19, twenty:20, thirty:30, forty:40, fifty:50, sixty:60,
+};
+
+function parseSimpleNumberToken(raw){
+    const s=String(raw||'').trim().toLowerCase().replace(/[^a-z0-9\-\s]/g,'');
+    if(!s) return null;
+    if(/^\d+(?:\.\d+)?$/.test(s)) return Number(s);
+    if(s==='half' || s==='a half') return 0.5;
+    if(s==='couple' || s==='a couple') return 2;
+    const halfMatch=s.match(/^(.+?)\s+and\s+a\s+half$/);
+    if(halfMatch){
+        const base=parseSimpleNumberToken(halfMatch[1]);
+        if(Number.isFinite(base)) return Number(base)+0.5;
+    }
+    if(SIMPLE_NUMBER_WORDS[s]!==undefined) return SIMPLE_NUMBER_WORDS[s];
+    if(s.includes('-')){
+        const parts=s.split('-').map(p=>p.trim()).filter(Boolean);
+        if(parts.length===2 && SIMPLE_NUMBER_WORDS[parts[0]]!==undefined && SIMPLE_NUMBER_WORDS[parts[1]]!==undefined){
+            return SIMPLE_NUMBER_WORDS[parts[0]] + SIMPLE_NUMBER_WORDS[parts[1]];
+        }
+    }
+    if(s.includes(' ')){
+        const parts=s.split(/\s+/).filter(Boolean);
+        if(parts.length===2 && SIMPLE_NUMBER_WORDS[parts[0]]!==undefined && SIMPLE_NUMBER_WORDS[parts[1]]!==undefined){
+            return SIMPLE_NUMBER_WORDS[parts[0]] + SIMPLE_NUMBER_WORDS[parts[1]];
+        }
+    }
+    return null;
+}
+
+function parseSimpleDurationSeconds(text){
+    const raw=String(text||'').toLowerCase();
+    const compact=raw.replace(/[,!?\.]/g,' ');
+    const patterns=[
+        /\b(?:for|in)\s*([a-z0-9\-\s]{1,36}?)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?)\b/i,
+        /\b([a-z0-9\-\s]{1,36}?)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?)\b/i,
+    ];
+    for(const rx of patterns){
+        const m=compact.match(rx);
+        if(!m) continue;
+        const count=parseSimpleNumberToken(m[1]);
+        if(!Number.isFinite(count) || count<=0) continue;
+        const unit=String(m[2]||'').toLowerCase();
+        let mult=1;
+        if(unit.startsWith('min')) mult=60;
+        else if(unit.startsWith('hour') || unit.startsWith('hr')) mult=3600;
+        const total=Math.round(Number(count)*mult);
+        if(Number.isFinite(total) && total>0) return total;
+    }
+    return null;
+}
+
+function extractScheduleLabel(normalized, kind){
+    const named=normalized.match(/\b(?:called|named)\s+([a-z][a-z0-9\s]{1,28})\b/i);
+    if(named && named[1]){
+        return String(named[1]).trim().replace(/\s+/g,' ').replace(/\b(timer|alarm)\b/gi,'').trim();
+    }
+    const kindWord=kind==='alarm'?'alarm':'timer';
+    const prefixed=normalized.match(new RegExp('\\bset\\s+(?:an?\\s+)?([a-z][a-z0-9\\s]{1,28})\\s+'+kindWord+'\\b','i'));
+    if(prefixed && prefixed[1]){
+        const raw=String(prefixed[1]).replace(/\b(for|in)\b.*$/i,'').trim();
+        const cleaned=raw.replace(/\s+/g,' ').trim();
+        if(cleaned && cleaned!=='a' && cleaned!=='an' && cleaned!=='the') return cleaned;
+    }
+    return '';
+}
+
+function inferOptimisticScheduleFromText(text){
+    const raw=String(text||'').trim();
+    if(!raw) return null;
+    const normalized=raw.toLowerCase();
+    if(!/\b(set|create|start|wake\s+me|wake\s+us|remind\s+me|alarm\s+me)\b/.test(normalized)) return null;
+    const wakeStyle=/\bwake\s+(me|us)\b/.test(normalized);
+    const remindStyle=/\bremind\s+me\b/.test(normalized);
+    const isAlarm=/\balarm\b/.test(normalized) || wakeStyle;
+    const isTimer=/\btimer\b/.test(normalized);
+    if(!isAlarm && !isTimer && !remindStyle) return null;
+    const durationSeconds=parseSimpleDurationSeconds(normalized);
+    if(!durationSeconds) return null;
+    const kind=isAlarm?'alarm':'timer';
+    const label=extractScheduleLabel(normalized, kind);
+    return {
+        kind,
+        durationSeconds,
+        label,
+        dedupeKey:kind+':'+String(durationSeconds)+':'+String(label||''),
+    };
+}
+
+function queueOptimisticTimerFromText(text, sourceTag='user'){
+    const parsed=inferOptimisticScheduleFromText(text);
+    if(!parsed) return false;
+    const now=Date.now();
+    const key=String(parsed.dedupeKey||'');
+    if(key && S._lastOptimisticIntentKey===key && (now-Number(S._lastOptimisticIntentTs||0))<2500){
+        return false;
+    }
+    S._lastOptimisticIntentKey=key;
+    S._lastOptimisticIntentTs=now;
+
+    const id='optimistic-'+now+'-'+Math.random().toString(36).slice(2,7);
+    const label=(parsed.label&&String(parsed.label).trim()) || (parsed.kind==='alarm'?'Alarm':'Timer');
+    const optimisticEntry={
+        id,
+        kind:parsed.kind,
+        label,
+        remaining_seconds:Number(parsed.durationSeconds)||0,
+        ringing:false,
+        _optimistic:true,
+        _clientAnchorTs:now/1000,
+        _clientAnchorRem:Number(parsed.durationSeconds)||0,
+    };
+    S.optimisticTimers[id]={
+        id,
+        kind:parsed.kind,
+        createdAtMs:now,
+        durationSeconds:parsed.durationSeconds,
+        source:String(sourceTag||'user'),
+        label,
+    };
+
+    const currentTimers=Array.isArray(S.timers)?S.timers:[];
+    S.timers=currentTimers
+        .filter(t=>!(t&&t._optimistic&&String(t.id||'')===id))
+        .concat([optimisticEntry])
+        .sort((a,b)=>{
+            const ak=String((a&&a.kind)||'timer').toLowerCase()==='alarm'?0:1;
+            const bk=String((b&&b.kind)||'timer').toLowerCase()==='alarm'?0:1;
+            if(ak!==bk) return ak-bk;
+            return (Number((a&&a.remaining_seconds)||0))-(Number((b&&b.remaining_seconds)||0));
+        });
+    return true;
+}
 
 function applyToggle(btn, enabled){
         if(!btn) return;
@@ -164,7 +304,12 @@ function hydrateChatCache(){
 
 function applyServerChatState(chat, chatThreads, activeChatId){
     if(Array.isArray(chat)) S.chat = chat.map(normalizeChatMessage).filter(Boolean);
-    if(Array.isArray(chatThreads)) S.chatThreads = mergeChatThreads(chatThreads, S.chatThreads);
+    if(Array.isArray(chatThreads)){
+        S.chatThreads = chatThreads
+            .map(normalizeChatThread)
+            .filter(Boolean)
+            .sort((a,b)=>Number(b.updated_ts||0)-Number(a.updated_ts||0));
+    }
     if(activeChatId) S.activeChatId = String(activeChatId);
     if(!S.selectedChatId) S.selectedChatId = 'active';
     const selected = String(S.selectedChatId||'active');
@@ -243,6 +388,12 @@ function onTopMusicProgressClick(event){
     const x=Math.min(rect.width, Math.max(0, rawX));
     const ratio=x/rect.width;
     const target=Math.max(0, Math.min(duration, duration*ratio));
+    // Optimistically update client-side elapsed time so UI stays at the target position
+    if(S.music){
+        S.music.elapsed = target;
+        // Reset the client‑side anchor timestamp used by getEffectiveMusicElapsed()
+        S.music._clientElapsedAnchorTs = Date.now();
+    }
     sendMusicAction('music_seek', {seconds: target});
 }
 

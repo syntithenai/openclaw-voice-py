@@ -47,8 +47,8 @@ function renderMusicPage(main){
   const playlistRows=filteredPlaylists.map(name=>{
     const n=String(name||'').trim();
     if(!n) return '';
-    return '<div class="flex items-center gap-2 px-3 py-2 border-b border-gray-800">'
-      +'<button data-action="music-load-playlist" data-playlist-name="'+esc(n)+'" class="flex-1 text-left text-sm text-gray-200 hover:text-white truncate">'+esc(n)+'</button>'
+    return '<div class="flex w-full items-center justify-start gap-2 px-3 py-2 border-b border-gray-800 text-left">'
+      +'<button data-action="music-load-playlist" data-playlist-name="'+esc(n)+'" class="block flex-1 w-full text-left text-sm text-gray-200 hover:text-white truncate">'+esc(n)+'</button>'
       +'<button data-action="music-open-delete-playlist" data-playlist-name="'+esc(n)+'" class="shrink-0 w-6 h-6 inline-flex items-center justify-center rounded text-sm bg-gray-700 hover:bg-red-700 transition-colors" title="Delete playlist" aria-label="Delete playlist">✕</button>'
     +'</div>';
   }).join('');
@@ -160,7 +160,7 @@ function renderMusicPage(main){
         +'<div class="px-2 py-2 border-b border-gray-800">'
           +'<input id="musicPlaylistSearch" type="search" value="'+esc(S.musicPlaylistFilter||'')+'" placeholder="Search playlists" class="w-full rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
         +'</div>'
-        +'<div class="max-h-72 overflow-y-auto p-0">'
+        +'<div class="max-h-72 overflow-y-auto p-0 text-left">'
           +(playlistRows || '<p class="text-xs text-gray-500 px-3 py-3 text-left">No playlists found</p>')
         +'</div>'
       +'</div>'

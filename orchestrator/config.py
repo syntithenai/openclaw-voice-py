@@ -117,6 +117,8 @@ class VoiceConfig(BaseSettings):
     vad_cut_in_tts_hold_timeout_ms: int = Field(4500)  # Suppress further TTS after cut-in until transcript or timeout
     vad_cut_in_use_silero: bool = Field(False)
     vad_cut_in_silero_confidence: float = Field(0.3)
+    alarm_cut_in_arming_s: float = Field(0.35)  # Ignore alarm cut-in until this many seconds after ringing starts
+    alarm_cut_in_required_hits: int = Field(2)  # Consecutive speech hits required to stop a ringing alarm
     silero_model_path: str = Field("")
     silero_auto_download: bool = Field(True)
     silero_model_url: str = Field("https://raw.githubusercontent.com/snakers4/silero-vad/v5.1.2/src/silero_vad/data/silero_vad.onnx")

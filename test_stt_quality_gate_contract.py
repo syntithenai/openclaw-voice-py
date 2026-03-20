@@ -80,6 +80,7 @@ def test_high_self_echo_overlap_is_suppressed():
             token_count=3,
             is_single_word=False,
             self_echo_similarity=0.9,
+            tts_playing=True,
         )
     )
     assert decision.accepted is False

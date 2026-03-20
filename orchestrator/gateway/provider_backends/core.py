@@ -819,7 +819,7 @@ class OpenClawGateway(BaseGateway):
             "message": text,
             "sessionKey": session_key,
             "agentId": resolved_agent_id,
-            "channel": "last",
+            "channel": "webchat",
             "deliver": True,
             "extraSystemPrompt": VOICE_OUTPUT_FORMAT_PROMPT,
             "idempotencyKey": str(uuid4()),

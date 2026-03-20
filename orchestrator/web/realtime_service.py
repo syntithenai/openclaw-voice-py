@@ -112,6 +112,7 @@ class EmbeddedVoiceWebService:
         self._chat_seq: int = 0
         self._chat_threads: list[dict[str, Any]] = []
         self._active_chat_id: str = "active"
+        self._active_chat_thread_id: str | None = None
         self._chat_thread_limit = 100
         _default_persist = Path.home() / ".config" / "openclaw" / "chat_state.json"
         self._chat_persist_path = Path(chat_persist_path) if chat_persist_path else _default_persist
@@ -265,6 +266,13 @@ class EmbeddedVoiceWebService:
             seq = data.get("chat_seq")
             if isinstance(seq, int):
                 self._chat_seq = seq
+            active_thread_id = data.get("active_thread_id")
+            if isinstance(active_thread_id, str) and active_thread_id.strip():
+                self._active_chat_thread_id = active_thread_id.strip()
+            if self._active_chat_thread_id and not any(
+                str(t.get("id", "")) == self._active_chat_thread_id for t in self._chat_threads
+            ):
+                self._active_chat_thread_id = None
             logger.info(
                 "Loaded %d chat thread(s) and %d active message(s) from %s",
                 len(self._chat_threads),
@@ -281,6 +289,7 @@ class EmbeddedVoiceWebService:
             payload = {
                 "threads": self._chat_threads,
                 "active_messages": self._chat_messages,
+                "active_thread_id": self._active_chat_thread_id,
                 "chat_seq": self._chat_seq,
                 "saved_ts": time.time(),
             }
@@ -304,6 +313,7 @@ class EmbeddedVoiceWebService:
 
     def update_chat_history(self, messages: list[dict[str, Any]]) -> None:
         self._chat_messages = list(messages[-self.chat_history_limit:])
+        self._upsert_active_chat_thread()
         self._persist_chat_state()
 
     def _derive_chat_title(self, messages: list[dict[str, Any]]) -> str:
@@ -312,17 +322,61 @@ class EmbeddedVoiceWebService:
                 raw = str(m.get("text", "")).strip()
                 if raw:
                     return raw[:72]
+        for m in messages:
+            raw = str(m.get("text", "")).strip()
+            if raw:
+                return raw[:72]
         return f"Chat {len(self._chat_threads) + 1}"
+
+    def _upsert_active_chat_thread(self) -> None:
+        if not self._chat_messages:
+            return
+        now = time.time()
+        thread_id = self._active_chat_thread_id or uuid.uuid4().hex[:12]
+        self._active_chat_thread_id = thread_id
+        existing_index = next(
+            (i for i, t in enumerate(self._chat_threads) if str(t.get("id", "")) == thread_id),
+            -1,
+        )
+        created_ts = now
+        if existing_index >= 0:
+            existing = self._chat_threads.pop(existing_index)
+            try:
+                created_ts = float(existing.get("created_ts", now))
+            except Exception:
+                created_ts = now
+        thread = {
+            "id": thread_id,
+            "title": self._derive_chat_title(self._chat_messages),
+            "messages": list(self._chat_messages),
+            "created_ts": created_ts,
+            "updated_ts": now,
+        }
+        self._chat_threads.insert(0, thread)
+        if len(self._chat_threads) > self._chat_thread_limit:
+            self._chat_threads = self._chat_threads[: self._chat_thread_limit]
 
     def _archive_active_chat_if_needed(self) -> None:
         if not self._chat_messages:
             return
         now = time.time()
+        thread_id = self._active_chat_thread_id or uuid.uuid4().hex[:12]
+        existing_index = next(
+            (i for i, t in enumerate(self._chat_threads) if str(t.get("id", "")) == thread_id),
+            -1,
+        )
+        created_ts = now
+        if existing_index >= 0:
+            existing = self._chat_threads.pop(existing_index)
+            try:
+                created_ts = float(existing.get("created_ts", now))
+            except Exception:
+                created_ts = now
         archived = {
-            "id": uuid.uuid4().hex[:12],
+            "id": thread_id,
             "title": self._derive_chat_title(self._chat_messages),
             "messages": list(self._chat_messages),
-            "created_ts": now,
+            "created_ts": created_ts,
             "updated_ts": now,
         }
         self._chat_threads.insert(0, archived)
@@ -334,6 +388,7 @@ class EmbeddedVoiceWebService:
         self._archive_active_chat_if_needed()
         self._chat_messages = []
         self._active_chat_id = "active"
+        self._active_chat_thread_id = None
         self._persist_chat_state()
         asyncio.create_task(
             self.broadcast(
@@ -354,6 +409,8 @@ class EmbeddedVoiceWebService:
         self._chat_threads = [t for t in self._chat_threads if str(t.get("id", "")) != tid]
         if len(self._chat_threads) == before:
             return False
+        if self._active_chat_thread_id == tid:
+            self._active_chat_thread_id = None
         self._persist_chat_state()
         asyncio.create_task(
             self.broadcast(
@@ -374,8 +431,18 @@ class EmbeddedVoiceWebService:
         self._chat_messages.append(msg)
         if len(self._chat_messages) > self.chat_history_limit:
             self._chat_messages = self._chat_messages[-self.chat_history_limit:]
+        self._upsert_active_chat_thread()
         self._persist_chat_state()
-        asyncio.create_task(self.broadcast({"type": "chat_append", "message": msg}))
+        asyncio.create_task(
+            self.broadcast(
+                {
+                    "type": "chat_append",
+                    "message": msg,
+                    "chat_threads": list(self._chat_threads),
+                    "active_chat_id": self._active_chat_id,
+                }
+            )
+        )
 
     def update_music_transport(self, **state: Any) -> None:
         self._music_state.update(state)
@@ -396,6 +463,18 @@ class EmbeddedVoiceWebService:
             "queue": list(self._music_queue),
         }
         asyncio.create_task(self.broadcast(payload))
+
+    def update_music_playlists(self, playlists: list[str]) -> None:
+        playlist_names = [str(name).strip() for name in playlists if str(name).strip()]
+        self._music_playlists_cache = playlist_names
+        asyncio.create_task(
+            self.broadcast(
+                {
+                    "type": "music_playlists",
+                    "playlists": list(self._music_playlists_cache),
+                }
+            )
+        )
 
     def update_music_state(self, queue: list[dict[str, Any]] | None = None, **state: Any) -> None:
         self._music_state.update(state)

@@ -784,8 +784,23 @@ class QuickAnswerClient:
             return
         try:
             transport = await self.music_router.manager.get_ui_music_state()
-            queue = await self.music_router.manager.get_ui_playlist()
-            self.web_service.update_music_state(queue=queue, **transport)
+            # Push transport state immediately so voice-driven actions are reflected right away.
+            self.web_service.update_music_transport(**transport)
+
+            async def _publish_queue_and_playlists() -> None:
+                try:
+                    queue = await self.music_router.manager.get_ui_playlist()
+                    self.web_service.update_music_queue(queue)
+                except Exception as queue_exc:
+                    logger.debug("Failed to update web music queue: %s", queue_exc)
+
+                try:
+                    playlists = await self.music_router.manager.list_playlists()
+                    self.web_service.update_music_playlists(playlists)
+                except Exception as playlists_exc:
+                    logger.debug("Failed to update web playlists: %s", playlists_exc)
+
+            asyncio.create_task(_publish_queue_and_playlists())
         except Exception as update_exc:
             logger.debug("Failed to update web music state: %s", update_exc)
         

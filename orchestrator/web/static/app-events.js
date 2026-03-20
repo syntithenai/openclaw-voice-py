@@ -49,7 +49,12 @@ document.addEventListener('click', e => {
     const deleteThreadConfirmBtn = target.closest('[data-action="chat-delete-confirm"]');
     if (deleteThreadConfirmBtn) {
         const tid = String(S.chatDeleteTargetId || '').trim();
-        if(tid && tid!=='active') sendAction({type:'chat_delete', thread_id: tid});
+        if(tid && tid!=='active'){
+            S.chatThreads = (S.chatThreads||[]).filter(t=>String((t&&t.id)||'')!==tid);
+            if(String(S.selectedChatId||'active')===tid) S.selectedChatId='active';
+            persistChatCache();
+            sendAction({type:'chat_delete', thread_id: tid});
+        }
         S.chatDeleteModalOpen = false;
         S.chatDeleteTargetId = '';
         S.chatDeleteTargetTitle = '';
@@ -87,6 +92,17 @@ document.addEventListener('click', e => {
     const alarmBtn = target.closest('[data-action="alarm-cancel"]');
     if (alarmBtn) {
         sendTimerAction('alarm_cancel','alarm_id', alarmBtn.dataset.alarmId);
+        return;
+    }
+
+    const optimisticTimerBtn = target.closest('[data-action="optimistic-timer-cancel"]');
+    if (optimisticTimerBtn) {
+        const optimisticId = String(optimisticTimerBtn.dataset.optimisticId || '').trim();
+        if(optimisticId && S.optimisticTimers && S.optimisticTimers[optimisticId]){
+            delete S.optimisticTimers[optimisticId];
+            S.timers = (Array.isArray(S.timers)?S.timers:[]).filter(t=>String((t&&t.id)||'')!==optimisticId);
+            renderTimerBar();
+        }
         return;
     }
 
@@ -377,6 +393,7 @@ document.addEventListener('submit', e => {
     S.pendingChatSends.add(clientMsgId);
     requestScrollToBottomBurst();
     updateChatComposerState();
+    if(queueOptimisticTimerFromText(text, 'chat_submit')) renderTimerBar();
     sendAction({type:'chat_text', text, client_msg_id:clientMsgId});
     input.value = '';
     if (S.selectedChatId !== 'active') {
@@ -523,6 +540,7 @@ function renderTimerBar(){
         const kind=String(t.kind||'timer').toLowerCase();
         const rem=Number(t.remaining_seconds);
         if(!Number.isFinite(rem)) return false;
+                if(kind==='timer' && rem<=0) return false;
         if(kind==='alarm' && rem<=0 && !t.ringing) return false;
         return true;
     });
@@ -533,20 +551,28 @@ function renderTimerBar(){
     const mm=String(Math.floor(rem/60)).padStart(2,'0'),ss=String(rem%60).padStart(2,'0');
         const kind=String(t.kind||'timer').toLowerCase();
         const isAlarm=kind==='alarm';
+        const isOptimistic=!!t._optimistic;
         const actionAttr=isAlarm?'alarm-cancel':'timer-cancel';
         const idAttr=isAlarm?' data-alarm-id="'+esc(t.id)+'"':' data-timer-id="'+esc(t.id)+'"';
                 const pendingKey=(isAlarm?'alarm_cancel:':'timer_cancel:')+String(t.id||'');
                 const isPending=!!(S.pendingTimerActions&&S.pendingTimerActions[pendingKey]);
                 const timerErr=(S.timerActionErrors&&S.timerActionErrors[pendingKey])?S.timerActionErrors[pendingKey].msg:'';
         const icon=isAlarm?'⏰':'⏱';
+        const isRingingAlarm=isAlarm && !!t.ringing;
         const baseCls=isAlarm
-            ?'flex items-center gap-1 px-3 py-1 rounded-full bg-red-800 hover:bg-red-700 text-xs transition-colors'
+            ?('flex items-center gap-1 px-3 py-1 rounded-full text-xs transition-colors '+(isRingingAlarm?'bg-red-600 hover:bg-red-500 animate-pulse':'bg-red-800 hover:bg-red-700'))
             :'flex items-center gap-1 px-3 py-1 rounded-full bg-amber-700 hover:bg-amber-600 text-xs transition-colors';
         const label=isAlarm?(t.label||'Alarm'):(t.label||'Timer');
-                const disabledAttr=isPending?' disabled style="opacity:.55;cursor:not-allowed"':'';
-                const pendingTxt=isPending?' …':'';
+            const disabledAttr=(isPending||isOptimistic)?' disabled style="opacity:.55;cursor:not-allowed"':'';
+            const pendingTxt=(isPending||isOptimistic)?' …':'';
                 const errTxt=timerErr?' ⚠':'';
-                return '<button class="'+baseCls+'" data-action="'+actionAttr+'"'+idAttr+disabledAttr+' title="'+esc(timerErr||'Click to cancel')+'">'+icon+' '+esc(label)+' '+mm+':'+ss+pendingTxt+errTxt+'</button>';
+                                const titleTxt=isOptimistic?'Click to cancel pending '+(isAlarm?'alarm':'timer'):(timerErr||'Click to cancel');
+                                const actionChunk=isOptimistic
+                                        ?(' data-action="optimistic-timer-cancel" data-optimistic-id="'+esc(t.id)+'"')
+                                        :(' data-action="'+actionAttr+'"'+idAttr);
+                                const effectiveDisabledAttr=(isPending && !isOptimistic)?' disabled style="opacity:.55;cursor:not-allowed"':'';
+                                                                const ringingTxt=isRingingAlarm?' 🔔':'';
+                                                                return '<button type="button" class="'+baseCls+'"'+actionChunk+effectiveDisabledAttr+' title="'+esc(titleTxt)+'">'+icon+' '+esc(label)+ringingTxt+' '+mm+':'+ss+pendingTxt+errTxt+'</button>';
   }).join('');
 }
 
@@ -554,15 +580,15 @@ function renderPage(){
   const main=document.getElementById('main');
     const dock=document.getElementById('chatComposerDock');
         if(main) main.onscroll=null;
+    if(dock) dock.classList.remove('hidden');
     if(S.page==='music'){
-        if(dock) dock.classList.add('hidden');
         renderMusicPage(main);
         sendAction({type:'music_list_playlists'});
     } else {
-        if(dock) dock.classList.remove('hidden');
         renderHomePage(main);
-        updateChatComposerState();
     }
+    updateChatComposerState();
+    renderTimerBar();
     applyMusicHeader();
     updateScrollUpButton();
 }
