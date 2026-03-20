@@ -140,7 +140,9 @@ function renderMusicPage(main){
     : (S.musicPlaylistModalMode==='selected' ? 'Create Playlist from Selected' : 'Delete Playlist');
     const modalName=String(S.musicPlaylistModalName||'').trim();
     const existingPlaylists=(S.musicPlaylists||[]).map(x=>String(x||'').trim().toLowerCase()).filter(Boolean);
-    const loadedPlaylist=String((S.music&&S.music.loaded_playlist)||'').trim().toLowerCase();
+    const loadedPlaylistName=String((S.music&&S.music.loaded_playlist)||'').trim();
+    const loadedPlaylist=loadedPlaylistName.toLowerCase();
+    const queueLabel=loadedPlaylistName ? ('Playlist '+loadedPlaylistName) : 'Queue';
     const hasNameConflict=!!modalName && existingPlaylists.includes(modalName.toLowerCase()) && modalName.toLowerCase()!==loadedPlaylist;
   const modalBody = S.musicPlaylistModalMode==='delete'
     ? '<p class="text-sm text-gray-300">Delete playlist <span class="font-semibold">'+esc(S.musicPlaylistModalName||'')+'</span>?</p>'
@@ -166,7 +168,7 @@ function renderMusicPage(main){
       +'</div>'
       +'<div class="md:col-span-3 space-y-3">'
         +'<div class="flex items-center justify-between gap-2 flex-wrap px-2">'
-          +'<h2 class="font-semibold text-lg">Queue <span class="text-gray-400 font-normal text-sm ml-1">'+m.queue_length+' tracks</span></h2>'
+          +'<h2 class="font-semibold text-lg">'+esc(queueLabel)+' <span class="text-gray-400 font-normal text-sm ml-1">'+m.queue_length+' tracks</span></h2>'
           +'<div class="flex items-center gap-2">'
             +'<button data-action="music-clear-queue" class="px-3 py-1 rounded-lg text-sm bg-red-800 hover:bg-red-700 transition-colors" title="Clear entire queue">Clear Queue</button>'
             +'<button data-action="music-add-open" class="px-3 py-1 rounded-lg text-sm bg-blue-700 hover:bg-blue-600 transition-colors">Add Songs</button>'

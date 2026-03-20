@@ -368,8 +368,15 @@ AUDIO_LOG_LEVEL = 25
 logging.addLevelName(AUDIO_LOG_LEVEL, "AUDIO")
 
 
+def _resolve_runtime_log_level() -> int:
+    raw = str(os.environ.get("OPENCLAW_LOG_LEVEL") or os.environ.get("LOG_LEVEL") or "WARNING").strip().upper()
+    if raw == "AUDIO":
+        return AUDIO_LOG_LEVEL
+    return getattr(logging, raw, logging.WARNING)
+
+
 logging.basicConfig(
-    level=logging.WARNING,
+    level=_resolve_runtime_log_level(),
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
     force=True,  # Force reconfiguration
@@ -2067,10 +2074,36 @@ async def run_orchestrator() -> None:
                     logger.warning("Web UI music_list_playlists: %s", exc)
                     return []
 
+            def _push_schedule_state_now(reason: str = "") -> None:
+                if not web_service or not timer_manager:
+                    return
+                try:
+                    timers = timer_manager.list_ui_timers()
+                    alarms = alarm_manager.list_ui_alarms() if alarm_manager else []
+                    entries: list[dict[str, Any]] = []
+                    for t in timers:
+                        item = dict(t)
+                        item.setdefault("kind", "timer")
+                        entries.append(item)
+                    for a in alarms:
+                        entries.append(dict(a))
+                    entries.sort(
+                        key=lambda x: (
+                            0 if str(x.get("kind", "timer")).lower() == "alarm" else 1,
+                            float(x.get("remaining_seconds", 0.0)),
+                        )
+                    )
+                    web_service.update_timers_state(entries)
+                    if reason:
+                        logger.info("🕒 Pushed immediate schedule state (%s): %d entries", reason, len(entries))
+                except Exception as exc:
+                    logger.debug("Immediate schedule state push failed (%s): %s", reason, exc)
+
             async def _ui_timer_cancel(timer_id: str, client_id: str) -> None:
                 if timer_manager:
                     try:
                         await timer_manager.cancel_timer(timer_id)
+                        _push_schedule_state_now("timer_cancel")
                     except Exception as exc:
                         logger.warning("Web UI timer_cancel id=%s: %s", timer_id, exc)
 
@@ -2078,6 +2111,7 @@ async def run_orchestrator() -> None:
                 if alarm_manager:
                     try:
                         await alarm_manager.cancel_alarm(alarm_id)
+                        _push_schedule_state_now("alarm_cancel")
                     except Exception as exc:
                         logger.warning("Web UI alarm_cancel id=%s: %s", alarm_id, exc)
 
@@ -2500,6 +2534,14 @@ async def run_orchestrator() -> None:
         if processing_request:
             logger.info("⏱️ Debounce timer skipped - already processing a request")
             return
+
+        def _safe_append_chat_message(message: dict[str, Any], context: str) -> None:
+            if not web_service:
+                return
+            try:
+                web_service.append_chat_message(message)
+            except Exception as exc:
+                logger.warning("Failed to append web chat message (%s): %s", context, exc)
         
         if immediate:
             logger.info("⏱️ Immediate dispatch requested (web text input)")
@@ -2594,13 +2636,15 @@ async def run_orchestrator() -> None:
             print(f"\033[93m→ USER: {combined_transcript}\033[0m", flush=True)
             suppress_gateway_messages_for_new_session = False
             is_music_query = bool(music_router and music_router.is_music_related(combined_transcript))
-            if web_service:
-                web_service.append_chat_message({
+            _safe_append_chat_message(
+                {
                     "role": "user",
                     "text": combined_transcript,
                     "source": "voice",
                     "request_id": current_request_id,
-                })
+                },
+                "voice_user",
+            )
 
             last_user_text = combined_transcript
             last_user_accepted_ts = time.monotonic()
@@ -2645,14 +2689,17 @@ async def run_orchestrator() -> None:
                             logger.info("→ TTS QUEUE [req#%d]: Enqueuing quick answer: '%s'", current_request_id, quick_response[:80])
                             last_activity_ts = time.monotonic()
                             await submit_tts(quick_response, request_id=current_request_id)
-                            if web_service and quick_response:
-                                web_service.append_chat_message({
-                                    "role": "assistant",
-                                    "text": quick_response,
-                                    "source": "quick_answer",
-                                    "request_id": current_request_id,
-                                    "segment_kind": "final",
-                                })
+                            if quick_response:
+                                _safe_append_chat_message(
+                                    {
+                                        "role": "assistant",
+                                        "text": quick_response,
+                                        "source": "quick_answer",
+                                        "request_id": current_request_id,
+                                        "segment_kind": "final",
+                                    },
+                                    "quick_answer_assistant",
+                                )
                             last_assistant_text = quick_response
                             last_assistant_source = "quick_answer"
                             last_assistant_ts = time.monotonic()
@@ -2764,14 +2811,17 @@ async def run_orchestrator() -> None:
                         # Update activity timestamp to keep system awake during TTS synthesis
                         last_activity_ts = time.monotonic()
                         await submit_tts(response_text, request_id=current_request_id)
-                        if web_service and response_text:
-                            web_service.append_chat_message({
-                                "role": "assistant",
-                                "text": response_text,
-                                "source": "gateway",
-                                "request_id": current_request_id,
-                                "segment_kind": "final",
-                            })
+                        if response_text:
+                            _safe_append_chat_message(
+                                {
+                                    "role": "assistant",
+                                    "text": response_text,
+                                    "source": "gateway",
+                                    "request_id": current_request_id,
+                                    "segment_kind": "final",
+                                },
+                                "gateway_assistant",
+                            )
                         last_assistant_text = response_text
                         last_assistant_source = "gateway"
                         last_assistant_ts = time.monotonic()
@@ -2789,6 +2839,7 @@ async def run_orchestrator() -> None:
                 except Exception as exc:
                     logger.warning("Gateway send failed (%s); continuing", exc)
         finally:
+            _push_schedule_state_now("request_complete")
             # Always clear processing flag
             processing_request = False
             
@@ -2880,22 +2931,29 @@ async def run_orchestrator() -> None:
         canonical = canonicalize_transcript_for_match(text)
         if not canonical:
             return False
-        return canonical in {
+        if canonical in {
             "stop",
-            "stop alarm",
-            "stop the alarm",
-            "stop alarms",
-            "stop the alarms",
-            "alarm off",
-            "turn off alarm",
-            "turn off the alarm",
+            "stop stop",
+            "stop stop stop",
             "silence",
-            "silence alarm",
-            "silence the alarm",
-            "cancel alarm",
-            "cancel the alarm",
+            "cancel",
+            "quiet",
+            "enough",
             "shut up",
-        }
+        }:
+            return True
+
+        stop_token = bool(re.search(r"\b(stop|silence|cancel|quiet|enough|dismiss|off|shut up)\b", canonical))
+        alarm_token = bool(re.search(r"\b(alarm|alarms|ringing|ring|bell|beeping|beep)\b", canonical))
+        if stop_token and alarm_token:
+            return True
+
+        return bool(
+            re.search(r"\b(turn|switch)\s+off\s+(the\s+)?alarm(s)?\b", canonical)
+            or re.search(r"\bmake\s+it\s+stop\b", canonical)
+            or re.search(r"\bstop\s+it\b", canonical)
+            or re.search(r"\bplease\s+stop\b", canonical)
+        )
 
     def _is_incremental_prefix_extension(previous_text: str, next_text: str) -> bool:
         prev = canonicalize_transcript_for_match(previous_text)
@@ -3019,11 +3077,15 @@ async def run_orchestrator() -> None:
 
             now_ts = time.monotonic()
             canonical_transcript = canonicalize_transcript_for_match(transcript)
-            if alarm_manager and alarm_manager.ringing_alarms and _is_alarm_stop_intent_transcript(transcript):
-                dismissed_by_phrase = await stop_ringing_alarms_immediately("voice stop phrase")
-                if dismissed_by_phrase > 0:
-                    logger.info("✋ Voice stop phrase dismissed active alarm ringing: '%s'", transcript[:80])
-                    return
+            if alarm_manager and alarm_manager.ringing_alarms:
+                if _is_alarm_stop_intent_transcript(transcript):
+                    dismissed_by_phrase = await stop_ringing_alarms_immediately("voice stop phrase")
+                    if dismissed_by_phrase > 0:
+                        logger.info("✋ Voice stop phrase dismissed active alarm ringing: '%s'", transcript[:80])
+                else:
+                    logger.info("⏰ Ignoring transcript while alarm is ringing: '%s'", transcript[:80])
+                logger.info("⏰ Swallowing transcript while alarm is ringing: '%s'", transcript[:80])
+                return
             token_count = len([t for t in canonical_transcript.split() if t])
             is_single_word = token_count == 1
             is_short_transcript = token_count <= 3
@@ -3161,11 +3223,15 @@ async def run_orchestrator() -> None:
             
             # Cancel existing debounce task and start new one
             immediate_schedule_dispatch = _is_schedule_intent_transcript(transcript)
+            immediate_music_dispatch = bool(music_router and music_router.is_music_related(transcript))
+            immediate_dispatch = immediate_schedule_dispatch or immediate_music_dispatch
             if debounce_task and not debounce_task.done():
                 debounce_task.cancel()
-            debounce_task = asyncio.create_task(send_debounced_transcripts(immediate=immediate_schedule_dispatch))
+            debounce_task = asyncio.create_task(send_debounced_transcripts(immediate=immediate_dispatch))
             if immediate_schedule_dispatch:
                 logger.info("⏩ Debounce bypass: immediate dispatch for schedule intent")
+            elif immediate_music_dispatch:
+                logger.info("⏩ Debounce bypass: immediate dispatch for music intent")
         finally:
             active_transcriptions = max(0, active_transcriptions - 1)
             if active_transcriptions == 0:
@@ -3749,6 +3815,11 @@ async def run_orchestrator() -> None:
     cut_in_hits = 0
     silero_zero_hits = 0
     alarm_cut_in_hits = 0
+    alarm_shout_hits = 0
+    alarm_shout_recent_hits: deque[float] = deque(maxlen=64)
+    alarm_hard_stop_recent_hits: deque[float] = deque(maxlen=64)
+    alarm_shout_floor = 0.0
+    alarm_shout_floor_initialized = False
     last_alarm_cut_in_log_ts = 0.0
     alarm_cut_in_floor = 0.0
     alarm_cut_in_floor_initialized = False
@@ -4215,23 +4286,135 @@ async def run_orchestrator() -> None:
                 and wake_detector is not None
             )
 
-            # Alarm cut-in detection for ASLEEP state: the wake-word ASLEEP block below
-            # always `continue`s, which would skip the main alarm cut-in check entirely.
-            # This early check handles the case where the system is asleep when an alarm
-            # rings and the user speaks — without needing a wakeword to stop the alarm.
-            if alarm_manager and alarm_manager.ringing_alarms and not tts_playing and wake_state == WakeState.ASLEEP:
+            # Emergency shout-to-stop path for ringing alarms.
+            # Uses raw mic RMS only so it still works when VAD/AEC miss speech under loud bell playback.
+            if alarm_manager and alarm_manager.ringing_alarms and not tts_playing:
+                now_wall = time.time()
                 _ring_ages = []
                 for _rid in list(alarm_manager.ringing_alarms):
                     _ra = alarm_manager.get_alarm(_rid)
                     if _ra and _ra.triggered_at is not None:
-                        _ring_ages.append(now - float(_ra.triggered_at))
+                        _ring_ages.append(now_wall - float(_ra.triggered_at))
+                _min_ring_age_for_shout = min(_ring_ages) if _ring_ages else 999.0
+                _shout_min_ring_age_s = max(1.0, float(config.alarm_cut_in_arming_s))
+                _hard_stop_min_ring_age_s = max(2.5, _shout_min_ring_age_s + 1.0)
+                _shout_rms_threshold = max(0.005, float(config.alarm_shout_rms))
+                _shout_required_frames = int(config.alarm_shout_frames)
+                _hard_stop_rms_threshold = max(0.020, _shout_rms_threshold * 1.2)
+                _hard_stop_extreme_rms = max(0.050, _shout_rms_threshold * 3.0)
+                if not alarm_shout_floor_initialized:
+                    alarm_shout_floor = rms_raw
+                    alarm_shout_floor_initialized = True
+                else:
+                    alarm_shout_floor = (0.96 * alarm_shout_floor) + (0.04 * rms_raw)
+                _shout_excess = max(0.0, rms_raw - alarm_shout_floor)
+                _shout_excess_threshold = max(0.0035, _shout_rms_threshold * 0.22)
+                if _shout_required_frames > 0 and _min_ring_age_for_shout >= _shout_min_ring_age_s:
+                    _shout_frame = (rms_raw >= _shout_rms_threshold) and (_shout_excess >= _shout_excess_threshold)
+                    _extreme_shout_frame = (rms_raw >= max(0.03, _shout_rms_threshold * 2.5)) and (
+                        _shout_excess >= max(0.008, _shout_excess_threshold * 1.6)
+                    )
+                    _hard_stop_frame = rms_raw >= _hard_stop_rms_threshold
+                    _hard_stop_extreme_frame = rms_raw >= _hard_stop_extreme_rms
+                    if _shout_frame:
+                        alarm_shout_hits += 1
+                        alarm_shout_recent_hits.append(now)
+                    else:
+                        alarm_shout_hits = 0
+                    if _hard_stop_frame and _min_ring_age_for_shout >= _hard_stop_min_ring_age_s:
+                        alarm_hard_stop_recent_hits.append(now)
+                    _shout_window_s = 1.2
+                    while alarm_shout_recent_hits and (now - alarm_shout_recent_hits[0]) > _shout_window_s:
+                        alarm_shout_recent_hits.popleft()
+                    while alarm_hard_stop_recent_hits and (now - alarm_hard_stop_recent_hits[0]) > _shout_window_s:
+                        alarm_hard_stop_recent_hits.popleft()
+                    _shout_window_hits = len(alarm_shout_recent_hits)
+                    _hard_stop_window_hits = len(alarm_hard_stop_recent_hits)
+                    if (
+                        (_hard_stop_extreme_frame and _min_ring_age_for_shout >= _hard_stop_min_ring_age_s)
+                        or _hard_stop_window_hits >= 3
+                    ):
+                        logger.info(
+                            "✋ Alarm hard-stop triggered (rms_raw=%.4f, hard_hits=%d, extreme=%s, threshold=%.4f, min_age=%.2f, age=%.2f)",
+                            rms_raw,
+                            _hard_stop_window_hits,
+                            _hard_stop_extreme_frame,
+                            _hard_stop_rms_threshold,
+                            _hard_stop_min_ring_age_s,
+                            _min_ring_age_for_shout,
+                        )
+                        dismissed_hard_stop = await stop_ringing_alarms_immediately("voice hard-stop fallback")
+                        if dismissed_hard_stop > 0:
+                            alarm_shout_hits = 0
+                            alarm_shout_recent_hits.clear()
+                            alarm_hard_stop_recent_hits.clear()
+                            alarm_shout_floor = 0.0
+                            alarm_shout_floor_initialized = False
+                            alarm_cut_in_hits = 0
+                            alarm_cut_in_floor = 0.0
+                            alarm_cut_in_floor_initialized = False
+                            chunk_frames = []
+                            state = VoiceState.IDLE
+                            skip_audio_until = now + 0.75
+                            logger.info("✋ Alarm dismissed via hard raw-audio fallback")
+                            continue
+                    if _extreme_shout_frame or _shout_window_hits >= _shout_required_frames:
+                        logger.info(
+                            "✋ Alarm emergency shout-stop triggered (rms_raw=%.4f, floor=%.4f, excess=%.4f, hits=%d/%d, window_hits=%d, extreme=%s, threshold=%.4f)",
+                            rms_raw,
+                            alarm_shout_floor,
+                            _shout_excess,
+                            alarm_shout_hits,
+                            _shout_required_frames,
+                            _shout_window_hits,
+                            _extreme_shout_frame,
+                            _shout_rms_threshold,
+                        )
+                        dismissed_shout = await stop_ringing_alarms_immediately("voice shout override")
+                        if dismissed_shout > 0:
+                            alarm_shout_hits = 0
+                            alarm_shout_recent_hits.clear()
+                            alarm_hard_stop_recent_hits.clear()
+                            alarm_shout_floor = 0.0
+                            alarm_shout_floor_initialized = False
+                            alarm_cut_in_hits = 0
+                            alarm_cut_in_floor = 0.0
+                            alarm_cut_in_floor_initialized = False
+                            chunk_frames = []
+                            state = VoiceState.IDLE
+                            skip_audio_until = now + 0.75
+                            logger.info("✋ Alarm dismissed via emergency shout override")
+                            continue
+                else:
+                    alarm_shout_hits = 0
+                    alarm_shout_recent_hits.clear()
+                    alarm_hard_stop_recent_hits.clear()
+            else:
+                alarm_shout_hits = 0
+                alarm_shout_recent_hits.clear()
+                alarm_hard_stop_recent_hits.clear()
+                alarm_shout_floor = 0.0
+                alarm_shout_floor_initialized = False
+
+            # Alarm cut-in detection for ASLEEP state: the wake-word ASLEEP block below
+            # always `continue`s, which would skip the main alarm cut-in check entirely.
+            # This early check handles the case where the system is asleep when an alarm
+            # rings and the user speaks — without needing a wakeword to stop the alarm.
+            if alarm_manager and alarm_manager.ringing_alarms and not tts_playing and wake_state == WakeState.ASLEEP and config.alarm_audio_stop_enabled:
+                now_wall = time.time()
+                _ring_ages = []
+                for _rid in list(alarm_manager.ringing_alarms):
+                    _ra = alarm_manager.get_alarm(_rid)
+                    if _ra and _ra.triggered_at is not None:
+                        _ring_ages.append(now_wall - float(_ra.triggered_at))
                 _min_ring_age = min(_ring_ages) if _ring_ages else 999.0
                 _alarm_cutin_arming_s = max(0.0, float(config.alarm_cut_in_arming_s))
                 if _min_ring_age < _alarm_cutin_arming_s:
                     alarm_cut_in_hits = 0
                 else:
-                    _asig = rms_cutin if rms_cutin > 0.0 else rms_raw
-                    _athr = min(config.vad_cut_in_rms, max(config.vad_min_rms * 2.0, 0.003))
+                    _speech_like_min_ring_age_s = max(1.2, _alarm_cutin_arming_s + 0.35)
+                    _asig = max(rms_raw, rms_cutin)
+                    _athr = min(config.vad_cut_in_rms, max(config.vad_min_rms * 1.25, 0.0018))
                     if not alarm_cut_in_floor_initialized:
                         alarm_cut_in_floor = _asig
                         alarm_cut_in_floor_initialized = True
@@ -4248,29 +4431,44 @@ async def run_orchestrator() -> None:
                         _processed_vad_frame = resample_pcm(processed_frame, config.audio_sample_rate, 16000)
                     _asleep_vad_raw = vad.is_speech(_raw_vad_frame)
                     _asleep_vad_processed = vad.is_speech(_processed_vad_frame)
+                    _asleep_silero_gate = True
+                    _asleep_silero_conf: float | None = None
+                    if config.vad_cut_in_use_silero and cut_in_silero is not None:
+                        _silero_alarm_frame = frame
+                        if config.audio_sample_rate != 16000:
+                            _silero_alarm_frame = resample_pcm(frame, config.audio_sample_rate, 16000)
+                        _silero_alarm_result = cut_in_silero.is_speech(_silero_alarm_frame)
+                        _asleep_silero_conf = _silero_alarm_result.confidence
+                        _asleep_silero_gate = _asleep_silero_conf >= config.vad_cut_in_silero_confidence
 
-                    _speech_detected = bool(_asleep_vad_raw.speech_detected or _asleep_vad_processed.speech_detected)
-                    _rms_or_excess = (_asig >= _athr) or (_aexcess >= max(0.0015, _athr * 0.5))
-                    _loud_voice_override = (_asig >= max(0.02, _athr * 1.8)) and (_aexcess >= max(0.006, _athr * 0.8))
-                    _alarm_cutin_candidate = (_speech_detected and _rms_or_excess) or _loud_voice_override
-                    if _alarm_cutin_candidate:
+                    _vad_speech_like = bool(_asleep_vad_raw.speech_detected or _asleep_vad_processed.speech_detected)
+                    _rms_or_excess = (_asig >= _athr) or (_aexcess >= max(0.0010, _athr * 0.25))
+                    _alarm_speech_like_candidate = (
+                        _vad_speech_like
+                        and _rms_or_excess
+                        and (_aexcess >= max(0.0030, _athr * 0.55))
+                        and (_min_ring_age >= _speech_like_min_ring_age_s)
+                    )
+                    if _alarm_speech_like_candidate:
                         alarm_cut_in_hits += 1
                     else:
                         alarm_cut_in_hits = 0
-                    _required_hits = max(1, int(config.alarm_cut_in_required_hits))
+                    _required_hits = max(2, int(config.alarm_cut_in_required_hits))
                     if alarm_cut_in_hits >= _required_hits:
                         if now - last_alarm_cut_in_log_ts >= tts_speech_log_interval:
                             logger.info(
-                                "✋ Alarm cut-in triggered (asleep)! (rms_raw=%.4f, rms_aec=%.4f, floor=%.4f, excess=%.4f, vad_raw=%s, vad_aec=%s, loud_override=%s, hits=%d/%d)",
+                                "✋ Alarm speech-like stop triggered (asleep)! (rms_raw=%.4f, rms_aec=%.4f, floor=%.4f, excess=%.4f, vad_raw=%s, vad_aec=%s, silero_gate=%s, silero_conf=%s, candidate=%s, hits=%d/%d)",
                                 rms_raw, rms_cutin, alarm_cut_in_floor, _aexcess,
                                 _asleep_vad_raw.speech_detected,
                                 _asleep_vad_processed.speech_detected,
-                                _loud_voice_override,
+                                _asleep_silero_gate,
+                                f"{_asleep_silero_conf:.3f}" if _asleep_silero_conf is not None else "n/a",
+                                _alarm_speech_like_candidate,
                                 alarm_cut_in_hits, _required_hits,
                             )
-                            print("✋ Alarm cut-in triggered (asleep) → stopping alarm", flush=True)
+                            print("✋ Alarm speech-like stop triggered (asleep) → stopping alarm", flush=True)
                             last_alarm_cut_in_log_ts = now
-                        dismissed_asleep = await stop_ringing_alarms_immediately("voice cut-in (asleep)")
+                        dismissed_asleep = await stop_ringing_alarms_immediately("voice any sound (asleep)")
                         if dismissed_asleep > 0:
                             logger.info("✋ Voice cut-in (asleep) dismissed active alarm ringing")
                             alarm_cut_in_hits = 0
@@ -4281,7 +4479,8 @@ async def run_orchestrator() -> None:
                             skip_audio_until = now + 0.75
                             logger.info("✋ Dropping audio for 750ms to suppress alarm-cut-in transcript")
 
-            if (recorder_hotword_mode or (config.wake_word_enabled and (not continuous_mode))) and wake_state == WakeState.ASLEEP:
+            alarm_ringing_now = bool(alarm_manager and alarm_manager.ringing_alarms)
+            if (recorder_hotword_mode or (config.wake_word_enabled and (not continuous_mode))) and wake_state == WakeState.ASLEEP and not alarm_ringing_now:
                 # While sleeping during music playback, use voice cut-in only to duck
                 # volume briefly so the hotword can be heard more reliably.
                 if (
@@ -4562,26 +4761,28 @@ async def run_orchestrator() -> None:
                     chunk_frames.append(processed_frame)
 
             alarm_ringing_active = bool(alarm_manager and alarm_manager.ringing_alarms)
-            if alarm_ringing_active and not tts_playing:
+            if alarm_ringing_active and not tts_playing and config.alarm_audio_stop_enabled:
+                now_wall = time.time()
                 ring_ages = []
                 if alarm_manager:
                     for rid in list(alarm_manager.ringing_alarms):
                         ra = alarm_manager.get_alarm(rid)
                         if ra and ra.triggered_at is not None:
-                            ring_ages.append(now - float(ra.triggered_at))
+                            ring_ages.append(now_wall - float(ra.triggered_at))
                 min_ring_age = min(ring_ages) if ring_ages else 999.0
                 alarm_cutin_arming_s = max(0.0, float(config.alarm_cut_in_arming_s))
                 if min_ring_age < alarm_cutin_arming_s:
                     alarm_cut_in_hits = 0
                 else:
-                    alarm_signal = rms_cutin if rms_cutin > 0.0 else rms_raw
+                    alarm_speech_like_min_ring_age_s = max(1.2, alarm_cutin_arming_s + 0.35)
+                    alarm_signal = max(rms_raw, rms_cutin)
                     if not alarm_cut_in_floor_initialized:
                         alarm_cut_in_floor = alarm_signal
                         alarm_cut_in_floor_initialized = True
                     else:
                         alarm_cut_in_floor = (0.92 * alarm_cut_in_floor) + (0.08 * alarm_signal)
 
-                    alarm_cut_in_threshold = min(config.vad_cut_in_rms, max(config.vad_min_rms * 2.0, 0.003))
+                    alarm_cut_in_threshold = min(config.vad_cut_in_rms, max(config.vad_min_rms * 1.25, 0.0018))
                     alarm_rms_excess = max(0.0, alarm_signal - alarm_cut_in_floor)
 
                     alarm_vad_raw_frame = frame
@@ -4591,42 +4792,54 @@ async def run_orchestrator() -> None:
                         alarm_vad_processed_frame = resample_pcm(processed_frame, config.audio_sample_rate, 16000)
                     alarm_vad_raw = vad.is_speech(alarm_vad_raw_frame)
                     alarm_vad_processed = vad.is_speech(alarm_vad_processed_frame)
-                    alarm_speech_detected = bool(alarm_vad_raw.speech_detected or alarm_vad_processed.speech_detected)
+                    alarm_silero_gate = True
+                    alarm_silero_conf: float | None = None
+                    if config.vad_cut_in_use_silero and cut_in_silero is not None:
+                        alarm_silero_frame = frame
+                        if config.audio_sample_rate != 16000:
+                            alarm_silero_frame = resample_pcm(frame, config.audio_sample_rate, 16000)
+                        alarm_silero_result = cut_in_silero.is_speech(alarm_silero_frame)
+                        alarm_silero_conf = alarm_silero_result.confidence
+                        alarm_silero_gate = alarm_silero_conf >= config.vad_cut_in_silero_confidence
+                    alarm_vad_speech_like = bool(alarm_vad_raw.speech_detected or alarm_vad_processed.speech_detected)
                     alarm_rms_or_excess = (
                         (rms_raw >= alarm_cut_in_threshold)
                         or (rms_cutin >= alarm_cut_in_threshold)
-                        or (alarm_rms_excess >= max(0.0015, alarm_cut_in_threshold * 0.5))
+                        or (alarm_rms_excess >= max(0.0010, alarm_cut_in_threshold * 0.25))
                     )
-                    alarm_loud_voice_override = (
-                        (alarm_signal >= max(0.02, alarm_cut_in_threshold * 1.8))
-                        and (alarm_rms_excess >= max(0.006, alarm_cut_in_threshold * 0.8))
+                    alarm_cut_in_candidate = (
+                        alarm_vad_speech_like
+                        and alarm_rms_or_excess
+                        and (alarm_rms_excess >= max(0.0030, alarm_cut_in_threshold * 0.55))
+                        and (min_ring_age >= alarm_speech_like_min_ring_age_s)
                     )
-                    alarm_cut_in_candidate = (alarm_speech_detected and alarm_rms_or_excess) or alarm_loud_voice_override
                     if alarm_cut_in_candidate:
                         alarm_cut_in_hits += 1
                     else:
                         alarm_cut_in_hits = 0
 
-                    alarm_cut_in_required_hits = max(1, int(config.alarm_cut_in_required_hits))
+                    alarm_cut_in_required_hits = max(2, int(config.alarm_cut_in_required_hits))
                     alarm_cut_in = alarm_cut_in_hits >= alarm_cut_in_required_hits
                     if alarm_cut_in and now - last_alarm_cut_in_log_ts >= tts_speech_log_interval:
                         logger.info(
-                            "✋ Alarm cut-in triggered! (rms_raw=%.4f, rms_aec=%.4f, floor=%.4f, excess=%.4f, vad_raw=%s, vad_aec=%s, loud_override=%s, hits=%d/%d)",
+                            "✋ Alarm speech-like stop triggered! (rms_raw=%.4f, rms_aec=%.4f, floor=%.4f, excess=%.4f, vad_raw=%s, vad_aec=%s, silero_gate=%s, silero_conf=%s, candidate=%s, hits=%d/%d)",
                             rms_raw,
                             rms_cutin,
                             alarm_cut_in_floor,
                             alarm_rms_excess,
                             alarm_vad_raw.speech_detected,
                             alarm_vad_processed.speech_detected,
-                            alarm_loud_voice_override,
+                            alarm_silero_gate,
+                            f"{alarm_silero_conf:.3f}" if alarm_silero_conf is not None else "n/a",
+                            alarm_cut_in_candidate,
                             alarm_cut_in_hits,
                             alarm_cut_in_required_hits,
                         )
-                        print("✋ Alarm cut-in triggered → stopping alarm", flush=True)
+                        print("✋ Alarm speech-like stop triggered → stopping alarm", flush=True)
                         last_alarm_cut_in_log_ts = now
 
                     if alarm_cut_in:
-                        dismissed_by_cut_in = await stop_ringing_alarms_immediately("voice cut-in")
+                        dismissed_by_cut_in = await stop_ringing_alarms_immediately("voice any sound")
                         if dismissed_by_cut_in > 0:
                             logger.info("✋ Voice cut-in dismissed active alarm ringing")
                             alarm_cut_in_hits = 0
@@ -4668,6 +4881,7 @@ async def run_orchestrator() -> None:
                     playback_ms = int((now - tts_playback_start_ts) * 1000)
                 cut_in_ready = playback_ms >= config.vad_cut_in_min_ms
                 rms_excess = max(0.0, rms_raw - tts_rms_baseline)
+                alarm_ringing_during_tts = bool(alarm_manager and alarm_manager.ringing_alarms)
                 if tts_playing and config.vad_cut_in_use_silero and silero_conf is not None:
                     if silero_conf <= 0.01 and vad_result_cutin.speech_detected and rms_excess >= config.vad_cut_in_rms:
                         silero_zero_hits += 1
@@ -4677,13 +4891,15 @@ async def run_orchestrator() -> None:
                         logger.warning("Silero gate stuck at low confidence; disabling Silero cut-in gate")
                         config.vad_cut_in_use_silero = False
                         silero_gate = True
-                cut_in_candidate = cut_in_ready and silero_gate and (
+                cut_in_candidate = (not alarm_ringing_during_tts) and cut_in_ready and silero_gate and (
                     (vad_result_cutin.speech_detected and rms_excess >= config.vad_cut_in_rms)
                     or rms_cutin >= config.vad_cut_in_rms
                 )
                 if cut_in_candidate:
                     cut_in_hits += 1
                 else:
+                    cut_in_hits = 0
+                if alarm_ringing_during_tts:
                     cut_in_hits = 0
                 cut_in = cut_in_hits >= config.vad_cut_in_frames
                 if cut_in and now - last_tts_speech_log_ts >= tts_speech_log_interval:

@@ -80,7 +80,7 @@ class MusicFastPathParser:
     ]
 
     COMMAND_START_HINT = (
-        r"(?:play|resume|continue|unpause|pause|hold|stop|next|skip|previous|back|"
+        r"(?:play|put\s+on|resume|continue|unpause|pause|hold|stop|next|skip|previous|back|"
         r"volume|turn|increase|raise|decrease|lower|louder|quieter|what|current|"
         r"now|update|scan|refresh|index|load|save)"
     )
@@ -129,6 +129,44 @@ class MusicFastPathParser:
             normalized,
             flags=re.IGNORECASE,
         )
+
+        # Drop polite question prefixes that commonly appear in voice requests.
+        normalized = re.sub(
+            rf"^(?:can|could|would|will)\s+you\s+(?:please\s+)?(?={self.COMMAND_START_HINT}\b)",
+            "",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        normalized = re.sub(
+            rf"^(?:please\s+)?(?:can|could|would|will)\s+you\s+(?:please\s+)?(?={self.COMMAND_START_HINT}\b)",
+            "",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+
+        # Normalize colloquial playback phrasing to the existing command grammar.
+        normalized = re.sub(r"^put\s+on\s+", "play ", normalized, flags=re.IGNORECASE)
+        normalized = re.sub(r"^play\s+me\s+", "play ", normalized, flags=re.IGNORECASE)
+        normalized = re.sub(
+            r"^i\s+(?:want|wanna|would\s+like)\s+to\s+(?:hear|listen\s+to)\s+",
+            "play ",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+
+        # Trim common trailing acknowledgement/filler fragments that often get
+        # appended after a valid command in live STT, e.g. "play some jazz. all right. um".
+        filler_tail = r"(?:all\s+right|alright|okay|ok|um+|uh+|hmm+|mm+|mhm+)"
+        while True:
+            trimmed = re.sub(
+                rf"(?:[\s,.;:!?-]+{filler_tail}[\s,.;:!?-]*)+$",
+                "",
+                normalized,
+                flags=re.IGNORECASE,
+            ).strip()
+            if trimmed == normalized:
+                break
+            normalized = trimmed
 
         # Trim polite/filler words and end punctuation to improve regex hit rate.
         normalized = re.sub(r"^(?:please\s+)", "", normalized)
@@ -225,6 +263,10 @@ class MusicFastPathParser:
                 genre = words[1]
             elif len(words) == 3 and words[1] == "some":  # "play some jazz"
                 genre = words[2]
+            elif len(words) == 3 and words[2] == "music":  # "play jazz music"
+                genre = words[1]
+            elif len(words) == 4 and words[1] == "some" and words[3] == "music":  # "play some jazz music"
+                genre = words[2]
 
             if genre:
                 # Common genres (helps disambiguate from artist names)
@@ -235,6 +277,42 @@ class MusicFastPathParser:
                 ]
                 if genre in common_genres:
                     return ("play_genre", {"genre": genre, "shuffle": True})
+
+        # === Bare Genre Names ===
+        # Handle cases where user just says a genre name alone (e.g., "rock", "jazz")
+        # This enables ultra-fast playback without "play" prefix
+        common_genres = [
+            "rock", "pop", "jazz", "blues", "classical", "country",
+            "hip-hop", "hiphop", "rap", "metal", "punk", "folk",
+            "electronic", "dance", "reggae", "soul", "funk", "indie",
+            "alternative", "ambient", "ballad", "bebop", "bluegrass",
+            "bossa nova", "breakbeat", "britpop", "cajun", "calypso",
+            "chamber", "chillout", "cool jazz", "darkwave", "death metal",
+            "deep house", "delta blues", "dub", "dubstep", "easy listening",
+            "folk rock", "funk rock", "fusion", "garage", "garage rock",
+            "glam", "glitch", "gospel", "goth", "grunge", "hardcore",
+            "hard rock", "heavy metal", "house", "indie pop", "indie rock",
+            "industrial", "instrumental", "jazz funk", "jump blues", "k-pop",
+            "latin", "lo-fi", "lounge", "metal", "metalcore", "minimal",
+            "modern jazz", "new wave", "noise", "nu metal", "nu soul",
+            "opera", "orchestral", "post-punk", "post-rock", "power ballad",
+            "power pop", "prog", "progressive", "psychedelic", "punk rock",
+            "quiet storm", "r&b", "rave", "reggae fusion", "reggaeton",
+            "rock and roll", "rockabilly", "rocksteady", "romantic", "roots",
+            "sacred", "salsa", "samba", "ska", "skiffle", "smooth jazz",
+            "soul", "soundtrack", "speed metal", "spiritual", "swamp rock",
+            "swing", "synthpop", "synth rock", "synthwave", "techno",
+            "trance", "trap", "trip hop", "tropical house", "vaporwave",
+            "vocal", "vocal jazz", "waltz", "wave", "western", "western swing",
+            "witch house", "world", "yacht rock", "ambient pop"
+
+        ]
+        
+        # Only match if it's a single word and matches a known genre
+        if len(text.split()) == 1 and text.lower() in common_genres:
+            return ("play_genre", {"genre": text.lower(), "shuffle": True})
+        
+
         
         # === Playlist Management ===
         
@@ -271,6 +349,18 @@ class MusicFastPathParser:
             "play", "pause", "stop", "skip", "next", "previous", "back",
             "volume", "music", "song", "track", "album", "artist", "playlist",
             "playlists", "queue", "queued", "genre", "playing", "library", "scan", "update", "resume",
+            # Common genres for fast detection
+            "rock", "pop", "jazz", "blues", "classical", "country",
+            "hip-hop", "hiphop", "rap", "metal", "punk", "folk",
+            "electronic", "dance", "reggae", "soul", "funk", "indie",
+            "alternative", "ambient", "ballad", "bebop", "bluegrass",
+            "bossa nova", "breakbeat", "britpop", "cajun", "calypso",
+            "disco", "darkwave", "dream pop", "dungeon synth", "synthpop",
+            "synth rock", "techno", "trance", "trap", "trip hop",
+            "tropical house", "trotter", "turbo folk", "twangy", "twee pop",
+            "uk garage", "upbeat", "vapor wave", "vaporwave", "vocal",
+            "vocal jazz", "voicemail", "waltz", "wave", "wavy",
+            "webcore", "weirdcore", "western", "western swing", "witch house",
+            "wizard rock", "wonky", "world", "worship", "yacht rock", "yodeling", "yodelling", "yoik"
         ]
-        
         return any(keyword in text for keyword in music_keywords)

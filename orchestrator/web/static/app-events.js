@@ -541,7 +541,6 @@ function renderTimerBar(){
         const rem=Number(t.remaining_seconds);
         if(!Number.isFinite(rem)) return false;
                 if(kind==='timer' && rem<=0) return false;
-        if(kind==='alarm' && rem<=0 && !t.ringing) return false;
         return true;
     });
     if(!visibleTimers.length){ bar.classList.add('hidden'); bar.innerHTML=''; return; }

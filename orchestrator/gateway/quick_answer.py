@@ -782,27 +782,38 @@ class QuickAnswerClient:
     async def _sync_web_music_state(self) -> None:
         if not (self.web_service and self.music_router and self.music_router.manager):
             return
-        try:
-            transport = await self.music_router.manager.get_ui_music_state()
-            # Push transport state immediately so voice-driven actions are reflected right away.
-            self.web_service.update_music_transport(**transport)
+        async def _publish_transport() -> None:
+            try:
+                transport = await asyncio.wait_for(
+                    self.music_router.manager.get_ui_music_state(),
+                    timeout=1.5,
+                )
+                # Push transport state immediately so voice-driven actions are reflected right away.
+                self.web_service.update_music_transport(**transport)
+            except Exception as update_exc:
+                logger.debug("Failed to update web music transport: %s", update_exc)
 
-            async def _publish_queue_and_playlists() -> None:
-                try:
-                    queue = await self.music_router.manager.get_ui_playlist()
-                    self.web_service.update_music_queue(queue)
-                except Exception as queue_exc:
-                    logger.debug("Failed to update web music queue: %s", queue_exc)
+        async def _publish_queue_and_playlists() -> None:
+            try:
+                queue = await asyncio.wait_for(
+                    self.music_router.manager.get_ui_playlist(),
+                    timeout=4.0,
+                )
+                self.web_service.update_music_queue(queue)
+            except Exception as queue_exc:
+                logger.debug("Failed to update web music queue: %s", queue_exc)
 
-                try:
-                    playlists = await self.music_router.manager.list_playlists()
-                    self.web_service.update_music_playlists(playlists)
-                except Exception as playlists_exc:
-                    logger.debug("Failed to update web playlists: %s", playlists_exc)
+            try:
+                playlists = await asyncio.wait_for(
+                    self.music_router.manager.list_playlists(),
+                    timeout=3.0,
+                )
+                self.web_service.update_music_playlists(playlists)
+            except Exception as playlists_exc:
+                logger.debug("Failed to update web playlists: %s", playlists_exc)
 
-            asyncio.create_task(_publish_queue_and_playlists())
-        except Exception as update_exc:
-            logger.debug("Failed to update web music state: %s", update_exc)
+        asyncio.create_task(_publish_transport())
+        asyncio.create_task(_publish_queue_and_playlists())
         
     async def get_quick_answer(self, user_query: str, *, chat_history: list[dict] | None = None) -> tuple[bool, str]:
         """

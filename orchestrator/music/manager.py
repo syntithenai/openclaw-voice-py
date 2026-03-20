@@ -401,6 +401,22 @@ class MusicManager:
         except Exception as e:
             logger.error(f"Failed to add to queue: {e}")
             return f"Error: {e}"
+
+    async def add_many_to_queue(self, uris: List[str], batch_size: int = 40) -> str:
+        """Add multiple tracks to the queue efficiently using MPD command lists."""
+        cleaned = [str(uri).strip() for uri in uris if str(uri).strip()]
+        if not cleaned:
+            return "No tracks to add"
+
+        try:
+            chunk = max(1, int(batch_size))
+            for start in range(0, len(cleaned), chunk):
+                commands = [f'add "{self._quote(uri)}"' for uri in cleaned[start:start + chunk]]
+                await self.pool.execute_batch(commands, timeout=15.0)
+            return f"Added {len(cleaned)} tracks to queue"
+        except Exception as e:
+            logger.error(f"Failed to add multiple tracks to queue: {e}")
+            return f"Error: {e}"
     
     async def get_queue(self, limit: int = 500) -> List[Dict[str, str]]:
         """Get current queue contents (limited to avoid overwhelming huge playlists).
@@ -1072,7 +1088,37 @@ class MusicManager:
 
             safe_genre = genre.replace('"', '\\"')
             search_start = time.monotonic() * 1000
-            genre_tracks = await self.pool.execute_list(f'search genre "{safe_genre}"')
+            limit = max(1, int(self.genre_queue_limit))
+            genre_tracks: List[Dict[str, str]] = []
+            window_size = min(200, limit)
+            offset = 0
+
+            while len(genre_tracks) < limit:
+                take = min(window_size, limit - len(genre_tracks))
+                cmd = f'search genre "{safe_genre}" window {offset}:{offset + take}'
+                try:
+                    rows = await self.pool.execute_list(cmd)
+                except Exception as window_exc:
+                    # Compatibility fallback for older MPD versions without window support.
+                    if offset == 0:
+                        logger.debug(
+                            "Genre window query failed, falling back to full search for '%s': %s",
+                            genre,
+                            window_exc,
+                        )
+                        rows = await self.pool.execute_list(f'search genre "{safe_genre}"')
+                        genre_tracks.extend(rows[:limit])
+                        break
+                    raise
+
+                if not rows:
+                    break
+
+                genre_tracks.extend(rows)
+                if len(rows) < take:
+                    break
+                offset += take
+
             search_ms = time.monotonic() * 1000 - search_start
             
             queue_len = len(genre_tracks)
@@ -1087,23 +1133,15 @@ class MusicManager:
                 logger.info(f"🎵 Play genre '{genre}': no matches found (search:{search_ms:.1f}ms, total:{elapsed:.1f}ms)")
                 return f"No tracks found for genre: {genre}"
 
-            # Apply queue cap to keep startup snappy for very broad genres.
-            if queue_len > self.genre_queue_limit:
-                genre_tracks = genre_tracks[:self.genre_queue_limit]
-                queue_len = self.genre_queue_limit
-                logger.info(
-                    "Genre '%s' limited to %d tracks (search found > %d)",
-                    genre,
-                    queue_len,
-                    len(genre_tracks),
-                )
+            if queue_len >= limit:
+                logger.info("Genre '%s' limited to %d tracks", genre, queue_len)
             
             # Add limited tracks to queue
             add_start = time.monotonic() * 1000
-            for track in genre_tracks:
-                file_uri = track.get("file", "")
-                if file_uri:
-                    await self.add_to_queue(file_uri)
+            queue_files = [track.get("file", "") for track in genre_tracks if track.get("file", "")]
+            add_result = await self.add_many_to_queue(queue_files, batch_size=40)
+            if str(add_result).lower().startswith("error"):
+                return add_result
             add_ms = time.monotonic() * 1000 - add_start
             
             play_start = time.monotonic() * 1000

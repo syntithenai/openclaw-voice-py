@@ -8,6 +8,7 @@ Provides low-level MPD protocol communication with:
 """
 
 import asyncio
+import itertools
 import logging
 import time
 from typing import Optional, Dict, List
@@ -16,8 +17,33 @@ from contextlib import asynccontextmanager
 logger = logging.getLogger(__name__)
 
 
+_TRACE_COMMAND_PREFIXES = ("status", "playlistinfo", "play", "random")
+
+
+def _command_preview(command: str, limit: int = 120) -> str:
+    text = str(command or "").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit-3]}..."
+
+
+def _should_trace_command(command: str) -> bool:
+    stripped = str(command or "").strip().lower()
+    return any(stripped == prefix or stripped.startswith(f"{prefix} ") for prefix in _TRACE_COMMAND_PREFIXES)
+
+
+def _log_command_timing(kind: str, command: str, conn_label: str, elapsed_ms: float, extra: str = "") -> None:
+    preview = _command_preview(command)
+    suffix = f" {extra}" if extra else ""
+    if elapsed_ms >= 1000:
+        logger.warning("⏱️ MPD %s %s on %s took %.1fms%s", kind, preview, conn_label, elapsed_ms, suffix)
+    else:
+        logger.info("⏱️ MPD %s %s on %s took %.1fms%s", kind, preview, conn_label, elapsed_ms, suffix)
+
+
 class MPDConnection:
     """Single TCP connection to MPD server."""
+    _id_counter = itertools.count(1)
     
     def __init__(self, host: str, port: int, timeout: float = 5.0):
         self.host = host
@@ -28,9 +54,15 @@ class MPDConnection:
         self._connected = False
         self._lock = asyncio.Lock()
         self._last_activity_ts = 0.0
+        self._conn_id = next(self._id_counter)
+
+    @property
+    def label(self) -> str:
+        return f"mpd#{self._conn_id}"
     
     async def connect(self) -> bool:
         """Establish connection to MPD server."""
+        started = time.monotonic()
         try:
             self._reader, self._writer = await asyncio.wait_for(
                 asyncio.open_connection(self.host, self.port),
@@ -50,7 +82,13 @@ class MPDConnection:
             
             self._connected = True
             self._last_activity_ts = time.monotonic()
-            logger.info(f"Connected to MPD at {self.host}:{self.port}")
+            logger.info(
+                "Connected %s to MPD at %s:%s in %.1fms",
+                self.label,
+                self.host,
+                self.port,
+                (time.monotonic() - started) * 1000,
+            )
             return True
             
         except asyncio.TimeoutError:
@@ -94,10 +132,19 @@ class MPDConnection:
         """
         async with self._lock:
             op_timeout = float(timeout) if timeout is not None else self.timeout
+            trace_command = _should_trace_command(command)
+            started = time.monotonic()
             if not self.is_connected or self._reader is None or self._writer is None:
                 raise ConnectionError("Not connected to MPD")
             
             try:
+                if trace_command:
+                    logger.info(
+                        "→ MPD command %s on %s (timeout=%.1fs)",
+                        _command_preview(command),
+                        self.label,
+                        op_timeout,
+                    )
                 # Send command
                 self._writer.write(f"{command}\n".encode('utf-8'))
                 await asyncio.wait_for(
@@ -142,15 +189,19 @@ class MPDConnection:
                             response[key].append(value)
                         else:
                             response[key] = value
+
+                if trace_command:
+                    extra = f"keys={len(response)}"
+                    _log_command_timing("command", command, self.label, (time.monotonic() - started) * 1000, extra)
                 
                 return response
                 
             except asyncio.TimeoutError:
-                logger.error("Timeout waiting for MPD response")
+                logger.error("Timeout waiting for MPD response on %s for %s", self.label, _command_preview(command))
                 self._connected = False
                 raise ConnectionError("MPD command timeout")
             except Exception as e:
-                logger.error(f"Error sending MPD command: {e}")
+                logger.error("Error sending MPD command on %s for %s: %s", self.label, _command_preview(command), e)
                 self._connected = False
                 raise
             finally:
@@ -169,12 +220,21 @@ class MPDConnection:
         """
         async with self._lock:
             op_timeout = float(timeout) if timeout is not None else self.timeout
+            trace_command = _should_trace_command(send_cmd)
+            started = time.monotonic()
             if not self.is_connected or self._reader is None or self._writer is None:
                 raise ConnectionError("Not connected to MPD")
             
             try:
                 # Send command if provided
                 if send_cmd:
+                    if trace_command:
+                        logger.info(
+                            "→ MPD list %s on %s (timeout=%.1fs)",
+                            _command_preview(send_cmd),
+                            self.label,
+                            op_timeout,
+                        )
                     self._writer.write(f"{send_cmd}\n".encode('utf-8'))
                     await asyncio.wait_for(
                         self._writer.drain(),
@@ -220,20 +280,68 @@ class MPDConnection:
                             current_item = {}
                         
                         current_item[key] = value
+
+                if trace_command:
+                    extra = f"items={len(items)}"
+                    _log_command_timing("list", send_cmd, self.label, (time.monotonic() - started) * 1000, extra)
                 
                 return items
                 
             except asyncio.TimeoutError:
-                logger.error("Timeout waiting for MPD list response")
+                logger.error("Timeout waiting for MPD list response on %s for %s", self.label, _command_preview(send_cmd))
                 self._connected = False
                 raise ConnectionError("MPD command timeout")
             except ConnectionError:
                 # Connection errors are already handled
                 raise
             except Exception as e:
-                logger.error(f"Error in MPD list response: {e}")
+                logger.error("Error in MPD list response on %s for %s: %s", self.label, _command_preview(send_cmd), e)
                 self._connected = False
                 raise ConnectionError(f"MPD list response error: {e}")
+            finally:
+                if self._connected:
+                    self._last_activity_ts = time.monotonic()
+
+    async def send_command_batch(self, commands: List[str], timeout: float | None = None) -> None:
+        """Send multiple non-query commands via MPD command list mode."""
+        async with self._lock:
+            op_timeout = float(timeout) if timeout is not None else self.timeout
+            if not self.is_connected or self._reader is None or self._writer is None:
+                raise ConnectionError("Not connected to MPD")
+            if not commands:
+                return
+
+            try:
+                payload_lines = ["command_list_ok_begin", *commands, "command_list_end", ""]
+                self._writer.write("\n".join(payload_lines).encode("utf-8"))
+                await asyncio.wait_for(self._writer.drain(), timeout=op_timeout)
+
+                while True:
+                    if self._reader is None:
+                        raise ConnectionError("Connection lost to MPD during batch command")
+
+                    line = await asyncio.wait_for(self._reader.readline(), timeout=op_timeout)
+                    if not line:
+                        self._connected = False
+                        raise ConnectionError("Connection closed by MPD during batch command")
+
+                    line = line.decode("utf-8").strip()
+                    if line == "OK":
+                        break
+                    if line == "list_OK":
+                        continue
+                    if line.startswith("ACK"):
+                        error_msg = line[4:].strip() if len(line) > 4 else "Unknown error"
+                        raise ValueError(f"MPD error: {error_msg}")
+
+            except asyncio.TimeoutError:
+                logger.error("Timeout waiting for MPD batch response")
+                self._connected = False
+                raise ConnectionError("MPD batch command timeout")
+            except Exception as e:
+                logger.error(f"Error sending MPD batch command: {e}")
+                self._connected = False
+                raise
             finally:
                 if self._connected:
                     self._last_activity_ts = time.monotonic()
@@ -245,9 +353,11 @@ class MPDConnection:
         if (time.monotonic() - self._last_activity_ts) < idle_probe_after_s:
             return True
         try:
+            logger.info("↻ MPD liveness probe on %s after %.1fs idle", self.label, time.monotonic() - self._last_activity_ts)
             await self.send_command("ping", timeout=min(1.5, max(0.5, self.timeout)))
             return True
-        except Exception:
+        except Exception as exc:
+            logger.warning("↻ MPD liveness probe failed on %s: %s", self.label, exc)
             self._connected = False
             return False
 
@@ -329,12 +439,12 @@ class MPDClientPool:
         try:
             # Check if connection is still valid, reconnect if needed
             if not conn.is_connected:
-                logger.debug("Reconnecting to stale MPD connection...")
+                logger.info("↻ Reconnecting stale %s", conn.label)
                 if not await conn.connect():
                     logger.warning("Failed to reconnect to MPD; keeping connection in pool for future retry")
                     raise ConnectionError("Failed to reconnect to MPD")
             elif not await conn.ensure_alive(idle_probe_after_s=4.0):
-                logger.debug("MPD connection failed liveness probe; reconnecting...")
+                logger.warning("↻ %s failed liveness probe; reconnecting", conn.label)
                 await conn.close()
                 if not await conn.connect():
                     raise ConnectionError("Failed to reconnect to MPD")
@@ -363,6 +473,13 @@ class MPDClientPool:
                     return await conn.send_command(command, timeout=timeout)
                 except ConnectionError as exc:
                     last_exc = exc
+                    logger.warning(
+                        "↻ MPD command retry %d/3 on %s for %s after connection error: %s",
+                        attempt,
+                        conn.label,
+                        _command_preview(command),
+                        exc,
+                    )
                     await conn.close()
                     if attempt < 3:
                         await asyncio.sleep(0.05 * attempt)
@@ -387,9 +504,37 @@ class MPDClientPool:
                     return await conn.send_command_list(send_cmd=command, timeout=timeout)
                 except ConnectionError as exc:
                     last_exc = exc
-                    logger.debug(f"List command failed ({exc}), reconnecting and retrying (attempt {attempt}/3)...")
+                    logger.warning(
+                        "↻ MPD list retry %d/3 on %s for %s after connection error: %s",
+                        attempt,
+                        conn.label,
+                        _command_preview(command),
+                        exc,
+                    )
                     await conn.close()
                     if attempt < 3:
                         await asyncio.sleep(0.05 * attempt)
                         continue
         raise ConnectionError(f"MPD list command failed after retries: {last_exc}")
+
+    async def execute_batch(self, commands: List[str], timeout: float | None = None) -> None:
+        """Execute multiple non-query commands using MPD command list mode."""
+        last_exc: Exception | None = None
+        for attempt in (1, 2, 3):
+            async with self.get_connection() as conn:
+                try:
+                    await conn.send_command_batch(commands, timeout=timeout)
+                    return
+                except ConnectionError as exc:
+                    last_exc = exc
+                    logger.warning(
+                        "↻ MPD batch retry %d/3 on %s after connection error: %s",
+                        attempt,
+                        conn.label,
+                        exc,
+                    )
+                    await conn.close()
+                    if attempt < 3:
+                        await asyncio.sleep(0.05 * attempt)
+                        continue
+        raise ConnectionError(f"MPD batch command failed after retries: {last_exc}")

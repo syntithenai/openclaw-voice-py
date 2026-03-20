@@ -119,6 +119,9 @@ class VoiceConfig(BaseSettings):
     vad_cut_in_silero_confidence: float = Field(0.3)
     alarm_cut_in_arming_s: float = Field(0.35)  # Ignore alarm cut-in until this many seconds after ringing starts
     alarm_cut_in_required_hits: int = Field(2)  # Consecutive speech hits required to stop a ringing alarm
+    alarm_audio_stop_enabled: bool = Field(False)  # Allow audio-only (non-transcript) speech-like alarm stop while ringing
+    alarm_shout_rms: float = Field(0.025)  # Raw mic RMS threshold for emergency shout-to-stop while alarm rings
+    alarm_shout_frames: int = Field(2)  # Consecutive frames above alarm_shout_rms required for emergency stop
     silero_model_path: str = Field("")
     silero_auto_download: bool = Field(True)
     silero_model_url: str = Field("https://raw.githubusercontent.com/snakers4/silero-vad/v5.1.2/src/silero_vad/data/silero_vad.onnx")
@@ -165,7 +168,7 @@ class VoiceConfig(BaseSettings):
     picovoice_confidence: float = Field(0.5)  # Detection threshold
 
     # Chunking
-    chunk_max_ms: int = Field(10000)
+    chunk_max_ms: int = Field(3500)
     pre_roll_ms: int = Field(2000)
     cut_in_pre_roll_ms: int = Field(100)
 
