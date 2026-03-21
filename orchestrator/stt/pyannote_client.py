@@ -1,4 +1,5 @@
 import requests
+from pathlib import Path
 
 
 class PyannoteClient:
@@ -9,7 +10,19 @@ class PyannoteClient:
 
     def diarize(self, wav_bytes: bytes) -> list[dict]:
         files = {"file": ("audio.wav", wav_bytes, "audio/wav")}
-        data = {"model_id": self.model_id}
+        model_id_to_send = self.model_id
+        if model_id_to_send:
+            looks_like_fs_path = (
+                model_id_to_send.startswith(("/", "./", "../", "~"))
+                or Path(model_id_to_send).is_absolute()
+                or "\\" in model_id_to_send
+            )
+            if looks_like_fs_path:
+                model_id_to_send = ""
+
+        data = {}
+        if model_id_to_send:
+            data["model_id"] = model_id_to_send
         headers = {}
         if self.auth_token:
             headers["Authorization"] = f"Bearer {self.auth_token}"

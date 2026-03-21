@@ -11,6 +11,22 @@ app = FastAPI()
 MODEL = None
 device = None
 
+
+def _normalize_segments(raw_segments):
+    normalized = []
+    for row in raw_segments or []:
+        text = str(row.get("text", "") or "").strip()
+        start = float(row.get("start", 0.0) or 0.0)
+        end = float(row.get("end", start) or start)
+        normalized.append(
+            {
+                "start": max(0.0, start),
+                "end": max(start, end),
+                "text": text,
+            }
+        )
+    return normalized
+
 def load_model_safely():
     """Load whisper model with GPU fallback"""
     global MODEL, device
@@ -72,7 +88,10 @@ async def transcribe(file: UploadFile):
         temp_audio.flush()
         result = MODEL.transcribe(temp_audio.name)
 
+    segments = _normalize_segments(result.get("segments"))
+
     return {
         "text": (result.get("text") or "").strip(),
+        "segments": segments,
         "language": result.get("language", ""),
     }

@@ -17,6 +17,28 @@ _PIPELINE_MODEL = None
 _PIPELINE_DEVICE = "unknown"
 
 
+def _resolve_requested_model(model_id: str) -> str:
+    requested = (model_id or "").strip()
+    if not requested:
+        return MODEL_ID
+
+    requested_path = Path(requested).expanduser()
+    looks_like_path = (
+        requested.startswith(("/", "./", "../", "~"))
+        or requested_path.is_absolute()
+        or "\\" in requested
+    )
+    if not looks_like_path:
+        return requested
+
+    # If the request uses a host-side path, prefer a matching file/dir under the
+    # container's mounted /models volume. Otherwise fall back to the service default.
+    candidate = Path("/models") / requested_path.name
+    if candidate.exists():
+        return str(candidate)
+    return MODEL_ID
+
+
 def _iter_diarization_tracks(diarization_obj):
     if hasattr(diarization_obj, "itertracks"):
         return diarization_obj.itertracks(yield_label=True)
@@ -114,7 +136,7 @@ async def diarize(file: UploadFile, model_id: str = Form(default="")) -> dict[st
     if not audio:
         return {"segments": [], "error": "empty audio"}
 
-    resolved_model = (model_id or MODEL_ID).strip() or MODEL_ID
+    resolved_model = _resolve_requested_model(model_id)
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
         temp_audio.write(audio)

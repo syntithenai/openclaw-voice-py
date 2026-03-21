@@ -63,7 +63,7 @@ services:
       - /dev/dri:/dev/dri
     group_add:
       - video
-      - render
+      - ${RENDER_GID:-110}
 
   snapserver:
     restart: unless-stopped
@@ -115,7 +115,7 @@ services:
       - /dev/dri:/dev/dri
     group_add:
       - video
-      - render
+      - ${RENDER_GID:-110}
 
   # Cross-platform-safe default orchestrator container.
   # Works on Linux/macOS/Windows, but direct host microphone/speaker mapping

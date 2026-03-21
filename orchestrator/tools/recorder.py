@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from orchestrator.audio.pcm_utils import pcm_to_wav_bytes
+from orchestrator.stt.whisper_client import WhisperTranscriptSegment
 
 
 logger = logging.getLogger("orchestrator.tools.recorder")
@@ -29,6 +30,18 @@ def _format_seconds(total_seconds: float) -> str:
     minutes = int(total_seconds // 60)
     seconds = total_seconds - (minutes * 60)
     return f"{minutes:02d}:{seconds:05.2f}"
+
+
+def _format_spoken_duration(total_seconds: float) -> str:
+    total_rounded = max(0, int(round(float(total_seconds))))
+    minutes = total_rounded // 60
+    seconds = total_rounded % 60
+    parts: list[str] = []
+    if minutes:
+        parts.append(f"{minutes} minute" + ("s" if minutes != 1 else ""))
+    if seconds or not parts:
+        parts.append(f"{seconds} second" + ("s" if seconds != 1 else ""))
+    return " ".join(parts)
 
 
 def _pipeline_from_pretrained_with_token(model_ref: str, token: str):
@@ -61,6 +74,7 @@ class RecorderStopResult:
     audio_path: str
     transcript_path: str
     diarization_path: str = ""
+    duration_seconds: float = 0.0
 
 
 class RecorderTool:
@@ -94,6 +108,7 @@ class RecorderTool:
         self._recording_active = False
         self._recording_started_ts = 0.0
         self._frames: list[bytes] = []
+        self._postprocess_tasks: set[asyncio.Task[Any]] = set()
 
     async def _invoke_hook(self, hook: Any) -> None:
         if hook is None:
@@ -155,6 +170,7 @@ class RecorderTool:
                 "audio_path": stop_result.audio_path,
                 "transcript_path": stop_result.transcript_path,
                 "diarization_path": stop_result.diarization_path,
+                "duration_seconds": stop_result.duration_seconds,
             }
         if self.should_report_status_from_transcript(transcript):
             return await self.execute_tool(action="status")
@@ -172,6 +188,7 @@ class RecorderTool:
                 "audio_path": result.audio_path,
                 "transcript_path": result.transcript_path,
                 "diarization_path": result.diarization_path,
+                "duration_seconds": result.duration_seconds,
             }
         if normalized == "status":
             if self._recording_active:
@@ -221,6 +238,7 @@ class RecorderTool:
                     audio_path="",
                     transcript_path="",
                     diarization_path="",
+                    duration_seconds=0.0,
                 )
 
             self._recording_active = False
@@ -229,6 +247,10 @@ class RecorderTool:
             with self._append_lock:
                 frames = self._frames
                 self._frames = []
+
+        # Transition recorder/UI state immediately. File writing and post-processing
+        # continue after this, but recording mode itself is already over.
+        await self._invoke_hook(self.on_recording_stopped)
 
         pcm = b"".join(frames)
         if trim_tail_seconds > 0 and pcm:
@@ -245,6 +267,7 @@ class RecorderTool:
                 audio_path="",
                 transcript_path="",
                 diarization_path="",
+                duration_seconds=0.0,
             )
 
         wav_bytes = pcm_to_wav_bytes(pcm, self.sample_rate)
@@ -255,62 +278,93 @@ class RecorderTool:
 
         audio_path.write_bytes(wav_bytes)
 
-        transcript_text = ""
-        diarization_rows: list[dict[str, Any]] = []
-        diarization_note = ""
+        bytes_per_second = max(1, int(self.sample_rate) * 2)
+        duration_s = float(len(pcm)) / float(bytes_per_second)
+        transcript_path.write_text("", encoding="utf-8")
+        diarization_path.write_text("", encoding="utf-8")
 
-        try:
-            transcript_text = await asyncio.to_thread(self.whisper_client.transcribe, wav_bytes)
-        except Exception as exc:
-            transcript_text = ""
-            diarization_note = f"Whisper transcription failed: {exc}"
-            logger.warning("Recorder whisper transcription failed: %s", exc)
-
-        diarization_rows, diarization_err = await asyncio.to_thread(self._run_pyannote, audio_path)
-        if diarization_err:
-            if diarization_note:
-                diarization_note = f"{diarization_note}; {diarization_err}"
-            else:
-                diarization_note = diarization_err
-
-        diarization_path.write_text(
-            self._format_diarization_text(
-                diarization_rows=diarization_rows,
-                diarization_note=diarization_note,
-            ),
-            encoding="utf-8",
-        )
-
-        duration_s = max(0.0, time.time() - started_ts)
-        transcript_path.write_text(
-            self._format_output_text(
-                audio_path=audio_path,
-                duration_s=duration_s,
-                reason=reason,
-                transcript_text=(transcript_text or "").strip(),
-                diarization_rows=diarization_rows,
-                diarization_note=diarization_note,
-            ),
-            encoding="utf-8",
+        self._schedule_postprocess(
+            wav_bytes=wav_bytes,
+            audio_path=audio_path,
+            transcript_path=transcript_path,
+            diarization_path=diarization_path,
         )
 
         response = (
-            f"Stopped recording ({_format_seconds(duration_s)}). "
+            f"Finished recording {_format_spoken_duration(duration_s)} of audio. "
             f"Created files: {audio_path.name}, {transcript_path.name}, {diarization_path.name}."
         )
         logger.info(
-            "Recorder stopped: audio=%s transcript=%s diarization=%s duration=%s",
+            "Recorder stopped: audio=%s transcript=%s diarization=%s duration=%s (post-processing queued)",
             audio_path,
             transcript_path,
             diarization_path,
             _format_seconds(duration_s),
         )
-        await self._invoke_hook(self.on_recording_stopped)
         return RecorderStopResult(
             response=response,
             audio_path=str(audio_path),
             transcript_path=str(transcript_path),
             diarization_path=str(diarization_path),
+            duration_seconds=duration_s,
+        )
+
+    def _schedule_postprocess(
+        self,
+        *,
+        wav_bytes: bytes,
+        audio_path: Path,
+        transcript_path: Path,
+        diarization_path: Path,
+    ) -> None:
+        task = asyncio.create_task(
+            self._finalize_recording_files(
+                wav_bytes=wav_bytes,
+                audio_path=audio_path,
+                transcript_path=transcript_path,
+                diarization_path=diarization_path,
+            )
+        )
+        self._postprocess_tasks.add(task)
+        task.add_done_callback(self._postprocess_tasks.discard)
+
+    async def _finalize_recording_files(
+        self,
+        *,
+        wav_bytes: bytes,
+        audio_path: Path,
+        transcript_path: Path,
+        diarization_path: Path,
+    ) -> None:
+        transcript_text = ""
+        transcript_segments: list[WhisperTranscriptSegment] = []
+        diarization_rows: list[dict[str, Any]] = []
+
+        try:
+            transcript_result = await asyncio.to_thread(self.whisper_client.transcribe_detailed, wav_bytes)
+            transcript_text = (transcript_result.text or "").strip()
+            transcript_segments = list(transcript_result.segments or [])
+        except Exception as exc:
+            logger.warning("Recorder whisper transcription failed: %s", exc)
+
+        try:
+            diarization_rows, _diarization_err = await asyncio.to_thread(self._run_pyannote, audio_path)
+        except Exception as exc:
+            diarization_rows = []
+            logger.warning("Recorder diarization post-process failed: %s", exc)
+
+        transcript_path.write_text((transcript_text or "").strip(), encoding="utf-8")
+        diarization_path.write_text(
+            self._format_diarization_text(
+                diarization_rows=diarization_rows,
+                transcript_segments=transcript_segments,
+            ),
+            encoding="utf-8",
+        )
+        logger.info(
+            "Recorder post-processing complete: transcript=%s diarization=%s",
+            transcript_path,
+            diarization_path,
         )
 
     def _run_pyannote(self, audio_path: Path) -> tuple[list[dict[str, Any]], str]:
@@ -372,70 +426,44 @@ class RecorderTool:
                 return [], f"{remote_error}; pyannote diarization failed: {exc}"
             return [], f"pyannote diarization failed: {exc}"
 
-    def _format_output_text(
-        self,
-        *,
-        audio_path: Path,
-        duration_s: float,
-        reason: str,
-        transcript_text: str,
-        diarization_rows: list[dict[str, Any]],
-        diarization_note: str,
-    ) -> str:
-        show_diarization_section = bool(diarization_rows) or _should_surface_diarization_note(diarization_note)
-        lines: list[str] = []
-        lines.append(f"audio_file: {audio_path}")
-        lines.append(f"duration: {_format_seconds(duration_s)}")
-        lines.append(f"stopped_by: {reason}")
-        lines.append("")
-        lines.append("whisper_transcript:")
-        lines.append(transcript_text if transcript_text else "(empty)")
-        if show_diarization_section:
-            lines.append("")
-            lines.append("pyannote_diarization:")
-            if diarization_rows:
-                for row in diarization_rows:
-                    lines.append(
-                        f"[{_format_seconds(row['start'])} - {_format_seconds(row['end'])}] {row['speaker']}"
-                    )
-            else:
-                lines.append("(none)")
-
-        if show_diarization_section and diarization_note and _should_surface_diarization_note(diarization_note):
-            lines.append("")
-            lines.append(f"note: {diarization_note}")
-
-        lines.append("")
-        lines.append("combined_output:")
-        if transcript_text:
-            lines.append(transcript_text)
-        else:
-            lines.append("(no whisper transcript)")
-        if diarization_rows:
-            lines.append("")
-            lines.append("speaker_timeline:")
-            for row in diarization_rows:
-                lines.append(
-                    f"- [{_format_seconds(row['start'])} - {_format_seconds(row['end'])}] {row['speaker']}"
-                )
-
-        return "\n".join(lines)
-
     def _format_diarization_text(
         self,
         *,
         diarization_rows: list[dict[str, Any]],
-        diarization_note: str,
+        transcript_segments: list[WhisperTranscriptSegment],
     ) -> str:
+        if not diarization_rows:
+            return ""
+
+        assigned_texts = ["" for _ in diarization_rows]
+        if transcript_segments:
+            for segment in transcript_segments:
+                segment_text = (segment.text or "").strip()
+                if not segment_text:
+                    continue
+                best_idx = -1
+                best_overlap = -1.0
+                seg_start = float(segment.start)
+                seg_end = max(seg_start, float(segment.end))
+                seg_mid = (seg_start + seg_end) / 2.0
+                for idx, row in enumerate(diarization_rows):
+                    row_start = float(row["start"])
+                    row_end = max(row_start, float(row["end"]))
+                    overlap = max(0.0, min(seg_end, row_end) - max(seg_start, row_start))
+                    contains_midpoint = row_start <= seg_mid <= row_end
+                    if contains_midpoint and overlap == 0.0:
+                        overlap = 1e-6
+                    if overlap > best_overlap:
+                        best_overlap = overlap
+                        best_idx = idx
+                if best_idx >= 0:
+                    assigned_texts[best_idx] = (assigned_texts[best_idx] + " " + segment_text).strip()
+
         lines: list[str] = []
-        if diarization_rows:
-            for row in diarization_rows:
-                lines.append(
-                    f"[{_format_seconds(row['start'])} - {_format_seconds(row['end'])}] {row['speaker']}"
-                )
-        else:
-            lines.append("(none)")
-        if diarization_note:
-            lines.append("")
-            lines.append(f"note: {diarization_note}")
+        for idx, row in enumerate(diarization_rows):
+            chunk_text = assigned_texts[idx].strip()
+            line = f"[{_format_seconds(row['start'])} - {_format_seconds(row['end'])}] {row['speaker']}"
+            if chunk_text:
+                line += f" {chunk_text}"
+            lines.append(line)
         return "\n".join(lines)

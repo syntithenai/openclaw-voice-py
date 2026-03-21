@@ -978,8 +978,10 @@ async def run_orchestrator() -> None:
             nonlocal recording_blocks_tools, wake_state, wake_sleep_ts, last_wake_detected_ts
             nonlocal recorder_stop_hotword_armed_ts
             nonlocal last_timeout_progress_log_ts
+            nonlocal state
             recording_blocks_tools = False
             wake_state = WakeState.ASLEEP
+            state = VoiceState.IDLE
             wake_sleep_ts = time.monotonic()
             last_wake_detected_ts = None
             recorder_stop_hotword_armed_ts = None
@@ -991,6 +993,7 @@ async def run_orchestrator() -> None:
                     wake_state=wake_state.value,
                     voice_state=state.value,
                     mic_enabled=False,
+                    speech_active=False,
                 )
             if wake_detector and hasattr(wake_detector, 'reset_state'):
                 try:
@@ -1408,6 +1411,7 @@ async def run_orchestrator() -> None:
                     if recording_blocks_tools and recorder_tool and recorder_tool.is_recording():
                         logger.info("🎛️ Play button stopping active recording")
                         stop_result = await recorder_tool.stop_recording(reason="play button")
+                        _append_recorder_finished_chat(stop_result)
                         if stop_result.response:
                             await submit_tts(stop_result.response, request_id=current_request_id, kind="notification")
                         return
@@ -1863,6 +1867,7 @@ async def run_orchestrator() -> None:
                 if recording_blocks_tools and recorder_tool and recorder_tool.is_recording():
                     logger.info("🎛️ Web mic button stopping active recording")
                     stop_result = await recorder_tool.stop_recording(reason="mic button")
+                    _append_recorder_finished_chat(stop_result)
                     if stop_result.response:
                         await submit_tts(stop_result.response, request_id=current_request_id, kind="notification")
                     return
@@ -2609,6 +2614,35 @@ async def run_orchestrator() -> None:
             )
         )
 
+    def _append_recorder_finished_chat(stop_result: Any) -> None:
+        if not web_service:
+            return
+        if not stop_result or not getattr(stop_result, "audio_path", ""):
+            return
+        try:
+            duration_seconds = float(getattr(stop_result, "duration_seconds", 0.0) or 0.0)
+        except Exception:
+            duration_seconds = 0.0
+        rounded = max(0, int(round(duration_seconds)))
+        minutes = rounded // 60
+        seconds = rounded % 60
+        if minutes > 0:
+            duration_phrase = f"{minutes} minute" + ("s" if minutes != 1 else "")
+            if seconds > 0:
+                duration_phrase += f" {seconds} second" + ("s" if seconds != 1 else "")
+        else:
+            duration_phrase = f"{seconds} second" + ("s" if seconds != 1 else "")
+        try:
+            web_service.append_chat_message(
+                {
+                    "role": "assistant",
+                    "source": "recorder",
+                    "text": f"Finished recording {duration_phrase} of audio",
+                }
+            )
+        except Exception as exc:
+            logger.warning("Failed to append recorder completion chat message: %s", exc)
+
     async def send_debounced_transcripts(immediate: bool = False) -> None:
         """Send accumulated transcripts after debounce period."""
         nonlocal pending_transcripts, processing_request, debounce_task
@@ -3299,6 +3333,7 @@ async def run_orchestrator() -> None:
                         trim_tail_seconds=1.6,
                     )
                     recorder_stop_hotword_armed_ts = None
+                    _append_recorder_finished_chat(stop_result)
                     if stop_result.response:
                         await submit_tts(stop_result.response, request_id=current_request_id, kind="notification")
                     logger.info("🎙️ Recorder stop phrase handled locally after hotword arm")
