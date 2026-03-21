@@ -387,6 +387,15 @@ class MusicManager:
         """Return currently loaded playlist name, if any."""
         return str(self._loaded_playlist_name or "").strip()
 
+    def _detach_loaded_playlist(self) -> None:
+        """Mark the current queue as no longer backed by a saved playlist."""
+        if self._loaded_playlist_name:
+            logger.info(
+                "Detaching active queue from saved playlist '%s'",
+                self._loaded_playlist_name,
+            )
+        self._loaded_playlist_name = ""
+
     @staticmethod
     def _quote(value: str) -> str:
         return str(value).replace('\\', '\\\\').replace('"', '\\"')
@@ -453,6 +462,7 @@ class MusicManager:
         """Clear the playback queue."""
         try:
             await self.pool.execute("clear")
+            self._detach_loaded_playlist()
             return "Queue cleared"
         except Exception as e:
             logger.error(f"Failed to clear queue: {e}")
@@ -491,11 +501,12 @@ class MusicManager:
             logger.error(f"Failed to add multiple tracks to queue: {e}")
             return f"Error: {e}"
     
-    async def get_queue(self, limit: int = 500) -> List[Dict[str, str]]:
+    async def get_queue(self, limit: int = 500, timeout: float | None = None) -> List[Dict[str, str]]:
         """Get current queue contents (limited to avoid overwhelming huge playlists).
         
         Args:
             limit: Maximum number of items to fetch (default 500). Use None for unlimited.
+            timeout: Optional MPD query timeout override in seconds.
         
         Returns:
             List of queue items
@@ -506,11 +517,12 @@ class MusicManager:
             t0 = time.monotonic()
             if limit is None:
                 # Large queries need extra time; 60s for potentially slow connections
-                result = await self.pool.execute_list("playlistinfo", timeout=60.0)
+                query_timeout = float(timeout) if timeout is not None else 60.0
+                result = await self.pool.execute_list("playlistinfo", timeout=query_timeout)
             else:
                 cmd = f"playlistinfo 0:{limit-1}"
                 # Scale timeout based on limit; 200 items = 45s, 500 items = 60s
-                query_timeout = max(45.0, min(60.0, 30.0 + (limit / 10)))
+                query_timeout = float(timeout) if timeout is not None else max(45.0, min(60.0, 30.0 + (limit / 10)))
                 result = await self.pool.execute_list(cmd, timeout=query_timeout)
             elapsed_ms = (time.monotonic() - t0) * 1000
             if len(result) > 50:
@@ -1518,7 +1530,7 @@ class MusicManager:
         t0 = time.monotonic()
         try:
             # Fetch only as many items as we'll display to avoid connection timeouts on huge queues
-            queue = await self.get_queue(limit=limit)
+            queue = await self.get_queue(limit=limit, timeout=6.0)
             t_queue = time.monotonic()
             result = []
             for i, item in enumerate(queue[:limit]):

@@ -287,7 +287,7 @@ class VoiceConfig(BaseSettings):
     tools_persist_dir: str = Field("timers")  # Directory for timer/alarm persistence (relative to workspace root)
     tools_debounce_ms: int = Field(75)  # Write debouncing window for alarm state updates
     tools_monitor_interval_ms: int = Field(100)  # How often to check for timer/alarm expiration
-    tools_clear_on_startup: bool = Field(True)  # Clear persisted timers/alarms at process start
+    tools_clear_on_startup: bool = Field(False)  # Legacy flag (ignored): persist active timers/alarms across process start
 
     # Music Control (MPD)
     music_enabled: bool = Field(False)  # Enable music control via MPD

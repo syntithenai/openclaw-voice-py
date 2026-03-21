@@ -478,10 +478,16 @@ function applyMicState(){
   btn.style.borderWidth=bw+'px';
   btn.classList.remove('bg-red-900','border-red-600','bg-green-900','border-green-500','bg-gray-700','border-gray-500');
     btn.classList.remove('border-transparent');
-        if(S.hotword_active) btn.classList.add('bg-green-900','border-green-500');
+        if(S.recorderActive) btn.classList.add('bg-green-900','border-green-500');
+    else if(S.hotword_active) btn.classList.add('bg-green-900','border-green-500');
     else if(!S.micEnabled) btn.classList.add('bg-red-900','border-red-600');
     else if(S.wake_state==='awake') btn.classList.add('bg-green-900','border-green-500');
   else btn.classList.add('bg-red-900','border-red-600');
+  const col = S.recorderActive ? 'green(recorder)' : (S.hotword_active ? 'green(hotword)' : (!S.micEnabled ? 'red(mic_off)' : (S.wake_state==='awake' ? 'green(awake)' : 'red(asleep)')));
+  if(!applyMicState._lastCol || applyMicState._lastCol !== col){
+    console.log('[mic_btn]', col, '| wake_state='+S.wake_state, 'micEnabled='+S.micEnabled, 'hotword='+S.hotword_active, 'voice='+S.voice_state);
+    applyMicState._lastCol = col;
+  }
 }
 document.getElementById('micBtn').addEventListener('click',()=>{
     if(S.browserAudioEnabled){
@@ -498,9 +504,11 @@ document.getElementById('micBtn').addEventListener('click',()=>{
         return;
     }
   sendAction({type:'mic_toggle'});
-  if(!S.micEnabled){ S.micEnabled=true; S.wake_state='awake'; }
-  else if(S.wake_state==='awake'){ S.wake_state='asleep'; }
-  else{ S.wake_state='awake'; }
+  if(!S.recorderActive){
+    if(!S.micEnabled){ S.micEnabled=true; S.wake_state='awake'; }
+    else if(S.wake_state==='awake'){ S.wake_state='asleep'; }
+    else{ S.wake_state='awake'; }
+  }
   applyMicState();
 });
 

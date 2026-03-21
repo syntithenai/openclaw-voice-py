@@ -4,8 +4,9 @@ import logging
 import re
 import httpx
 import random
+import time
 from datetime import datetime
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 
 logger = logging.getLogger("orchestrator.gateway.quick_answer")
@@ -849,43 +850,65 @@ class QuickAnswerClient:
         self._last_tool_steps.clear()
         return steps
 
-    async def _sync_web_music_state(self) -> None:
+    async def _sync_web_music_state(self, trace: dict[str, Any] | None = None) -> None:
         if not (self.web_service and self.music_router and self.music_router.manager):
             return
         manager = self.music_router.manager
+        sync_start_ts = time.monotonic()
+        trace_id = str((trace or {}).get("trace_id", "")).strip()
+        voice_load_complete_ts = (trace or {}).get("voice_load_complete_ts")
 
-        # Step 1+2: fetch transport and queue concurrently, then push a single
-        # combined state.  This reduces total latency from ~1.5 s + queue fetch
-        # to roughly the slower of the two calls.
-        transport: dict | None = None
-        queue: list[dict] | None = None
-        for attempt in (1, 2, 3):
-            try:
-                transport_task = asyncio.wait_for(manager.get_ui_music_state(), timeout=1.5)
-                queue_task = asyncio.wait_for(manager.get_ui_playlist(), timeout=5.0)
-                transport, queue = await asyncio.gather(transport_task, queue_task)
-                # If MPD reports a non‑zero queue length but we got an empty list,
-                # retry a short delay – this can happen when the playlist is still
-                # being materialised.
-                expected_len = int((transport or {}).get("queue_length", 0) or 0)
-                if expected_len > 0 and (queue is None or len(queue) == 0) and attempt < 3:
-                    await asyncio.sleep(0.2 * attempt)
-                    continue
-                if transport is not None:
-                    await self.web_service.push_music_state_now(queue=queue or [], **transport)
-                break
-            except Exception as exc:
-                if attempt == 3:
-                    logger.debug("Failed to push combined music state after retries: %s", exc)
-                else:
-                    await asyncio.sleep(0.3 * attempt)
-
-        # Step 3: update playlist sidebar.
+        # Mirror _ui_refresh_music_state exactly:
+        # 1. Push transport immediately (fast: just status + currentsong).
+        # 2. Push queue via update_music_queue — this sends a 'music_queue' message
+        #    which clears the client's requestMusicStateRetry timer, stopping the
+        #    20-retry polling loop that otherwise runs for 15 full seconds.
+        # Using push_music_state_now (sends 'music_state') does NOT clear the retry
+        # timer, causing 20x redundant re-renders over 15s after every voice load.
         try:
-            playlists = await asyncio.wait_for(manager.list_playlists(), timeout=3.0)
-            self.web_service.update_music_playlists(playlists)
-        except Exception as playlists_exc:
-            logger.debug("Failed to update web playlists: %s", playlists_exc)
+            transport = await manager.get_ui_music_state()
+            self.web_service.update_music_transport(**transport)
+        except Exception as exc:
+            logger.debug("Failed to push voice music transport: %s", exc)
+            return
+
+        try:
+            queue = await manager.get_ui_playlist()
+            queue_ready_ts = time.monotonic()
+            if trace_id:
+                logger.info(
+                    "🧭 Voice playlist trace %s: queue snapshot ready in %.1fms (since sync start)",
+                    trace_id,
+                    (queue_ready_ts - sync_start_ts) * 1000,
+                )
+            self.web_service.update_music_queue(
+                queue,
+                trace_id=trace_id,
+                voice_load_complete_ts=voice_load_complete_ts,
+                sync_start_ts=sync_start_ts,
+            )
+            if trace_id:
+                logger.info(
+                    "🧭 Voice playlist trace %s: queued music_queue broadcast handoff in %.1fms (since sync start)",
+                    trace_id,
+                    (time.monotonic() - sync_start_ts) * 1000,
+                )
+        except Exception as exc:
+            logger.debug("Failed to push voice music queue: %s", exc)
+
+        playlists_cb = getattr(self.web_service, "_on_music_list_playlists", None)
+        if playlists_cb is not None:
+            try:
+                playlists = await playlists_cb("voice")
+                self.web_service.update_music_playlists(playlists)
+            except Exception as playlists_exc:
+                logger.debug("Failed to update web playlists via callback: %s", playlists_exc)
+        else:
+            try:
+                playlists = await asyncio.wait_for(manager.list_playlists(), timeout=3.0)
+                self.web_service.update_music_playlists(playlists)
+            except Exception as playlists_exc:
+                logger.debug("Failed to update web playlists: %s", playlists_exc)
         
     async def get_quick_answer(self, user_query: str, *, chat_history: list[dict] | None = None) -> tuple[bool, str]:
         """
@@ -1039,11 +1062,22 @@ class QuickAnswerClient:
                     if str(music_result).lower().startswith("error"):
                         await self._emit_music_action_error("music_load_playlist", voice_music_action_id, music_result)
                     else:
+                        voice_load_complete_ts = time.monotonic()
+                        logger.info(
+                            "🧭 Voice playlist trace %s: voice load completed (fast-path)",
+                            voice_music_action_id,
+                        )
                         await self._emit_music_action_ack("music_load_playlist", voice_music_action_id)
                 # Fire-and-forget: ack already sent, client starts polling via
                 # requestMusicStateRetry; state sync runs in background so TTS
                 # is returned to the user without waiting for MPD queue fetch.
-                asyncio.create_task(self._sync_web_music_state())
+                sync_trace = None
+                if voice_music_action_id and not str(music_result).lower().startswith("error"):
+                    sync_trace = {
+                        "trace_id": voice_music_action_id,
+                        "voice_load_complete_ts": voice_load_complete_ts,
+                    }
+                asyncio.create_task(self._sync_web_music_state(sync_trace))
                 logger.info("← QUICK ANSWER: Music fast-path execution: %s", _preview(music_result))
                 return False, sanitize_quick_answer_text(music_result)
         
@@ -1205,9 +1239,25 @@ class QuickAnswerClient:
                                     if str(result).lower().startswith("error"):
                                         await self._emit_music_action_error(voice_action_name, voice_music_action_id, result)
                                     else:
+                                        voice_load_complete_ts = time.monotonic()
+                                        logger.info(
+                                            "🧭 Voice playlist trace %s: voice load completed (tool-call %s)",
+                                            voice_music_action_id,
+                                            func_name,
+                                        )
                                         await self._emit_music_action_ack(voice_action_name, voice_music_action_id)
                                 # Fire-and-forget (same rationale as fast-path above).
-                                asyncio.create_task(self._sync_web_music_state())
+                                sync_trace = None
+                                if (
+                                    voice_music_action_id
+                                    and voice_action_name == "music_load_playlist"
+                                    and not str(result).lower().startswith("error")
+                                ):
+                                    sync_trace = {
+                                        "trace_id": voice_music_action_id,
+                                        "voice_load_complete_ts": voice_load_complete_ts,
+                                    }
+                                asyncio.create_task(self._sync_web_music_state(sync_trace))
                             elif func_name == "recorder" and self.recorder_enabled and self.recorder_tool:
                                 result = await self.recorder_tool.execute_tool(**args_dict)
                             elif func_name == "start_new_session" and self.new_session_enabled and self.new_session_handler:

@@ -641,6 +641,7 @@ async def run_orchestrator() -> None:
     wake_sleep_cooldown_ms = max(0, config.wake_sleep_cooldown_ms)
     last_wake_detected_ts: float | None = None
     last_wake_conf_log_ts = 0.0
+    last_timeout_progress_log_ts = 0.0  # Rate-limit for inactivity progress logs
     warned_missing_playerctl = False
 
     wake_detector = None
@@ -811,18 +812,24 @@ async def run_orchestrator() -> None:
             alarm_manager=alarm_manager,
         )
         
+        # Always restore persisted pending timers/alarms so active items survive restarts.
+        # Legacy TOOLS_CLEAR_ON_STARTUP is intentionally ignored for safety.
         if config.tools_clear_on_startup:
-            cleared = await state_manager.clear_active_items()
             logger.warning(
-                "Tool System: Cleared persisted active timers/alarms on startup "
-                "(TOOLS_CLEAR_ON_STARTUP=true, timers=%d alarms=%d)",
-                cleared.get("timers", 0),
-                cleared.get("alarms", 0),
+                "Tool System: TOOLS_CLEAR_ON_STARTUP=true is ignored; "
+                "preserving persisted pending timers/alarms on startup"
             )
-        else:
-            # Load persisted timers and alarms from disk
-            await timer_manager.load_from_disk()
-            await alarm_manager.load_from_disk()
+
+        timers_restored, timers_expired_skipped = await timer_manager.load_from_disk()
+        alarms_restored, alarms_expired_skipped = await alarm_manager.load_from_disk()
+        logger.info(
+            "Tool System: Startup restore summary timers(restored=%d skipped_expired=%d) "
+            "alarms(restored=%d skipped_expired=%d)",
+            timers_restored,
+            timers_expired_skipped,
+            alarms_restored,
+            alarms_expired_skipped,
+        )
         
         logger.info("✓ Tool System ready (persist_dir=%s)", timers_dir)
         print("✓ Tool System ready", flush=True)
@@ -944,6 +951,8 @@ async def run_orchestrator() -> None:
             chunk_frames = []
             chunk_start_ts = None
             last_speech_ts = None
+            ring_buffer.clear()
+            web_service.update_orchestrator_status(recorder_active=True)
             logger.info("🎙️ Recorder started: enforcing quiet mode")
             if music_manager:
                 try:
@@ -967,6 +976,7 @@ async def run_orchestrator() -> None:
             wake_state = WakeState.AWAKE if not config.wake_word_enabled else WakeState.ASLEEP
             wake_sleep_ts = time.monotonic()
             last_wake_detected_ts = None
+            web_service.update_orchestrator_status(recorder_active=False)
             logger.info("🎙️ Recorder stopped: timer/alarm processing resumes")
 
         print("→ Initializing Recorder tool...", flush=True)
@@ -1234,7 +1244,10 @@ async def run_orchestrator() -> None:
                         web_service.note_hotword_detected()
                     last_activity_ts = time.monotonic()
                     state = VoiceState.LISTENING
-                    logger.info("🎙️ System woken by %s", source_label)
+                    logger.info(
+                        "🎙️ System woken by %s | timeout=%dms | listening for transcription | mic_btn=green",
+                        source_label, config.wake_word_timeout_ms,
+                    )
                     if web_service:
                         web_service.update_ui_control_state(mic_enabled=True)
                         web_service.update_orchestrator_status(
@@ -1304,6 +1317,7 @@ async def run_orchestrator() -> None:
                     chunk_start_ts = None
                     last_speech_ts = None
                     cut_in_triggered_ts = None
+                    ring_buffer.clear()
                     music_auto_resume_timer = 0.0
                     state = VoiceState.IDLE
 
@@ -1338,12 +1352,13 @@ async def run_orchestrator() -> None:
                         )
 
                     await restore_music_if_needed(source_label)
-                    logger.info("😴 System put to sleep by %s", source_label)
+                    logger.info("😴 System put to sleep by %s | mic_btn=red", source_label)
                     if web_service:
-                        web_service.update_orchestrator_status(
-                            wake_state=wake_state.value, voice_state=state.value
-                        )
                         web_service.update_ui_control_state(mic_enabled=False)
+                        web_service.update_orchestrator_status(
+                            wake_state=wake_state.value, voice_state=state.value,
+                            mic_enabled=False,
+                        )
                 
                 # Mute button -> force zero microphone input via capture mute.
                 if event.key == "mute":
@@ -1361,6 +1376,13 @@ async def run_orchestrator() -> None:
                 
                 # Play button (or mapped MSC_SCAN play) → Toggle wake/sleep
                 elif event.key in ("play_pause", "play", "pause"):
+                    if recording_blocks_tools and recorder_tool and recorder_tool.is_recording():
+                        logger.info("🎛️ Play button stopping active recording")
+                        stop_result = await recorder_tool.stop_recording(reason="play button")
+                        if stop_result.response:
+                            await submit_tts(stop_result.response, request_id=current_request_id, kind="notification")
+                        return
+
                     dismissed = await stop_ringing_alarms_immediately("play button")
                     if dismissed > 0:
                         tts_stop_event.set()
@@ -1809,6 +1831,13 @@ async def run_orchestrator() -> None:
             async def _ui_mic_toggle(client_id: str) -> None:
                 nonlocal wake_state, state, wake_sleep_ts, last_wake_detected_ts, last_activity_ts
 
+                if recording_blocks_tools and recorder_tool and recorder_tool.is_recording():
+                    logger.info("🎛️ Web mic button stopping active recording")
+                    stop_result = await recorder_tool.stop_recording(reason="mic button")
+                    if stop_result.response:
+                        await submit_tts(stop_result.response, request_id=current_request_id, kind="notification")
+                    return
+
                 dismissed = await stop_ringing_alarms_immediately("web ui mic button")
                 if dismissed > 0:
                     tts_stop_event.set()
@@ -1944,12 +1973,8 @@ async def run_orchestrator() -> None:
                 try:
                     queue = await music_manager.get_ui_playlist()
                 except Exception as exc:
-                    logger.warning("Web UI snapshot queue fetch failed; retrying with smaller limit: %s", exc)
-                    try:
-                        queue = await music_manager.get_ui_playlist(limit=80)
-                    except Exception as exc2:
-                        logger.warning("Web UI snapshot queue retry failed; sending empty queue: %s", exc2)
-                        queue = []
+                    logger.warning("Web UI snapshot queue fetch failed; sending empty queue: %s", exc)
+                    queue = []
                 return transport, queue
 
             async def _ui_music_toggle(client_id: str) -> None:
@@ -1990,11 +2015,6 @@ async def run_orchestrator() -> None:
                         result = await music_manager.clear_queue()
                         if str(result).strip().lower().startswith("error:"):
                             raise RuntimeError(result)
-                        loaded_playlist = music_manager.get_loaded_playlist_name()
-                        if loaded_playlist:
-                            save_result = await music_manager.save_playlist(loaded_playlist)
-                            if str(save_result).strip().lower().startswith("error:"):
-                                raise RuntimeError(save_result)
                         asyncio.create_task(_ui_refresh_music_state("music_clear_queue"))
                     except Exception as exc:
                         logger.warning("Web UI music_clear_queue: %s", exc)
@@ -2742,7 +2762,20 @@ async def run_orchestrator() -> None:
                         last_user_went_upstream = False
                         # Keep any transcripts that arrived during QA handling so they can be debounced
                         # into a follow-up request (often incremental STT extensions).
-                        pending_transcripts = list(trailing_transcripts)
+                        filtered_trailing: list[tuple[str, str]] = []
+                        for trailing_text, trailing_emotion in trailing_transcripts:
+                            trailing_norm = normalize_transcript(trailing_text)
+                            if not trailing_norm:
+                                continue
+                            if _is_incremental_prefix_extension(combined_transcript, trailing_norm):
+                                logger.info("⏱️ Dropping trailing transcript that extends already-handled text")
+                                continue
+                            if _is_incremental_prefix_extension(trailing_norm, combined_transcript):
+                                logger.info("⏱️ Dropping trailing transcript that duplicates handled prefix")
+                                continue
+                            filtered_trailing.append((trailing_norm, trailing_emotion))
+
+                        pending_transcripts = filtered_trailing
                         if pending_transcripts:
                             logger.info(
                                 "⏱️ QUICK ANSWER local handled; preserving %d trailing transcript(s) for next debounce",
@@ -4384,6 +4417,10 @@ async def run_orchestrator() -> None:
                             alarm_cut_in_floor = 0.0
                             alarm_cut_in_floor_initialized = False
                             chunk_frames = []
+                            chunk_start_ts = None
+                            last_speech_ts = None
+                            cut_in_triggered_ts = None
+                            ring_buffer.clear()
                             state = VoiceState.IDLE
                             skip_audio_until = now + 0.75
                             logger.info("✋ Alarm dismissed via hard raw-audio fallback")
@@ -4411,6 +4448,10 @@ async def run_orchestrator() -> None:
                             alarm_cut_in_floor = 0.0
                             alarm_cut_in_floor_initialized = False
                             chunk_frames = []
+                            chunk_start_ts = None
+                            last_speech_ts = None
+                            cut_in_triggered_ts = None
+                            ring_buffer.clear()
                             state = VoiceState.IDLE
                             skip_audio_until = now + 0.75
                             logger.info("✋ Alarm dismissed via emergency shout override")
@@ -4505,6 +4546,10 @@ async def run_orchestrator() -> None:
                             alarm_cut_in_floor = 0.0
                             alarm_cut_in_floor_initialized = False
                             chunk_frames = []
+                            chunk_start_ts = None
+                            last_speech_ts = None
+                            cut_in_triggered_ts = None
+                            ring_buffer.clear()
                             state = VoiceState.IDLE
                             skip_audio_until = now + 0.75
                             logger.info("✋ Dropping audio for 750ms to suppress alarm-cut-in transcript")
@@ -4670,7 +4715,11 @@ async def run_orchestrator() -> None:
                                 chunk_frames = prebuffer
                                 chunk_frames.append(frame)
                             last_speech_ts = now
-                            logger.info("Wake word detected → awake")
+                            logger.info(
+                                "🎙️ Wake word detected → awake (conf=%.4f, rms=%.4f, engine=%s) | timeout=%dms | listening | mic_btn=green",
+                                wake_result.confidence, frame_rms, active_wake_engine or "unknown",
+                                config.wake_word_timeout_ms,
+                            )
                             if wake_click_sound:
                                 try:
                                     play_feedback_async(
@@ -4766,6 +4815,10 @@ async def run_orchestrator() -> None:
                     chunk_frames = []
                     chunk_start_ts = None
                     last_speech_ts = None
+                    cut_in_triggered_ts = None
+                    ring_buffer.clear()
+                    if state == VoiceState.LISTENING:
+                        state = VoiceState.IDLE
                 elif chunk_frames and cut_in_triggered_ts is not None:
                     # Cut-in chunk in progress: keep appending frames and advance
                     # last_speech_ts so silence detection times out correctly.
@@ -4785,8 +4838,11 @@ async def run_orchestrator() -> None:
                     chunk_frames.append(processed_frame)
                     if state == VoiceState.IDLE:
                         state = VoiceState.LISTENING
-                        print("🎤 Speech detected → listening", flush=True)
-                        logger.info("Speech detected → listening")
+                        print("🎤 Speech detected → listening for transcription", flush=True)
+                        logger.info(
+                            "🎤 Speech detected → listening for transcription | wake=%s",
+                            wake_state.value,
+                        )
                 elif chunk_frames:
                     chunk_frames.append(processed_frame)
 
@@ -4874,6 +4930,10 @@ async def run_orchestrator() -> None:
                             logger.info("✋ Voice cut-in dismissed active alarm ringing")
                             alarm_cut_in_hits = 0
                             chunk_frames = []
+                            chunk_start_ts = None
+                            last_speech_ts = None
+                            cut_in_triggered_ts = None
+                            ring_buffer.clear()
                             state = VoiceState.IDLE
                             skip_audio_until = now + 0.75
                             logger.info("✋ Dropping audio for 750ms to suppress alarm-cut-in transcript")
@@ -5022,6 +5082,12 @@ async def run_orchestrator() -> None:
                                 music_auto_resume_timer = 0.0
                         except Exception as e:
                             logger.debug("Error stopping music on cut-in: %s", e)
+
+            if chunk_frames and chunk_start_ts is None:
+                chunk_start_ts = now
+                if last_speech_ts is None:
+                    last_speech_ts = now
+                logger.warning("Audio chunk had frames without start timestamp; recovering chunk timing")
             if tts_playing and last_speech_ts:
                 silence_ms = int(((now - last_speech_ts) * 1000))
                 if silence_ms >= config.vad_min_silence_ms and tts_gain != tts_base_gain:
@@ -5068,7 +5134,18 @@ async def run_orchestrator() -> None:
                     await asyncio.sleep(0)
                     continue
                 inactive_ms = int((now - last_activity_ts) * 1000)
-                if config.wake_word_timeout_ms > 0 and inactive_ms >= config.wake_word_timeout_ms:
+                timeout_ms = config.wake_word_timeout_ms
+                # Log inactivity progress at 50% and again at 90% of timeout (rate-limited to once per second)
+                if timeout_ms > 0 and inactive_ms > 0 and (now - last_timeout_progress_log_ts) >= 1.0:
+                    pct = inactive_ms / timeout_ms
+                    if pct >= 0.5:
+                        logger.info(
+                            "⏱ Listen timeout: %dms / %dms (%.0f%%) — still awake | state=%s tts=%s",
+                            inactive_ms, timeout_ms, pct * 100,
+                            state.value, tts_playing,
+                        )
+                        last_timeout_progress_log_ts = now
+                if timeout_ms > 0 and inactive_ms >= timeout_ms:
                     # Don't timeout if TTS is playing, queued, or we're actively processing
                     debounce_pending = debounce_task is not None and not debounce_task.done()
                     has_pending_transcripts = bool(pending_transcripts)
@@ -5083,8 +5160,10 @@ async def run_orchestrator() -> None:
                         wake_state = WakeState.ASLEEP
                         wake_sleep_ts = now
                         last_wake_detected_ts = None
-                        if web_service and web_service._ui_control_state.get("mic_enabled", False):
-                            web_service.update_ui_control_state(mic_enabled=False)
+                        last_timeout_progress_log_ts = 0.0
+                        if web_service:
+                            if web_service._ui_control_state.get("mic_enabled", False):
+                                web_service.update_ui_control_state(mic_enabled=False)
                             web_service.update_orchestrator_status(
                                 wake_state=wake_state.value,
                                 voice_state=state.value,
@@ -5093,7 +5172,10 @@ async def run_orchestrator() -> None:
                         # Reset wake detector state to prevent immediate re-detection
                         if wake_detector and hasattr(wake_detector, 'reset_state'):
                             wake_detector.reset_state()
-                        logger.info("Wake timeout reached → asleep")
+                        logger.info(
+                            "😴 Wake timeout: %dms inactive (limit %dms) → asleep | mic_btn=red",
+                            inactive_ms, timeout_ms,
+                        )
                         if timeout_swoosh_sound:
                             try:
                                 play_feedback_async(
@@ -5103,6 +5185,27 @@ async def run_orchestrator() -> None:
                                 )
                             except Exception as exc:
                                 logger.debug("Failed to play timeout sleep cue: %s", exc)
+                    else:
+                        # Timeout elapsed but guards are blocking sleep — log reason once per second
+                        if (now - last_timeout_progress_log_ts) >= 1.0:
+                            blocking = []
+                            if state not in (VoiceState.IDLE, VoiceState.LISTENING):
+                                blocking.append(f"state={state.value}")
+                            if tts_playing:
+                                blocking.append("tts_playing")
+                            if _tts_has_pending():
+                                blocking.append("tts_pending")
+                            if debounce_pending:
+                                blocking.append("debounce_pending")
+                            if has_pending_transcripts:
+                                blocking.append("pending_transcripts")
+                            if active_transcriptions > 0:
+                                blocking.append(f"active_transcriptions={active_transcriptions}")
+                            logger.info(
+                                "⏱ Timeout elapsed (%dms) but sleep blocked by: %s",
+                                inactive_ms, ", ".join(blocking) or "unknown",
+                            )
+                            last_timeout_progress_log_ts = now
 
             await asyncio.sleep(0)
     finally:

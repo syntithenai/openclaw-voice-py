@@ -69,7 +69,13 @@ class MusicFastPathParser:
     PLAY_ALBUM_PATTERN = r"^play\s+(?:the\s+)?album\s+['\"]?(.+?)['\"]?$"
     
     # Playlist patterns
-    LOAD_PLAYLIST_PATTERN = r"^(?:play|load)\s+(?:playlist\s+)?['\"]?(.+?)['\"]?$"
+    LOAD_PLAYLIST_PATTERNS = [
+        r"^(?:play|load)\s+playlist\s+['\"]?(.+?)['\"]?$",
+        r"^(?:play|load)\s+(?:the\s+)?['\"]?(.+?)['\"]?\s+playlist$",
+        r"^load\s+(?:the\s+)?['\"]?(.+?)['\"]?$",
+        r"^(?:switch|open)\s+(?:to\s+)?playlist\s+['\"]?(.+?)['\"]?$",
+        r"^(?:switch|open)\s+(?:to\s+)?(?:the\s+)?['\"]?(.+?)['\"]?\s+playlist$",
+    ]
     SAVE_PLAYLIST_PATTERN = r"^save\s+(?:playlist\s+)?(?:as\s+)?['\"]?(.+?)['\"]?$"
     
     # Library management patterns
@@ -104,7 +110,7 @@ class MusicFastPathParser:
         self.play_song_regex = re.compile(self.PLAY_SONG_PATTERN, re.IGNORECASE)
         self.play_album_regex = re.compile(self.PLAY_ALBUM_PATTERN, re.IGNORECASE)
         
-        self.load_playlist_regex = re.compile(self.LOAD_PLAYLIST_PATTERN, re.IGNORECASE)
+        self.load_playlist_regexes = [re.compile(p, re.IGNORECASE) for p in self.LOAD_PLAYLIST_PATTERNS]
         self.save_playlist_regex = re.compile(self.SAVE_PLAYLIST_PATTERN, re.IGNORECASE)
         
         self.library_regexes = [re.compile(p, re.IGNORECASE) for p in self.LIBRARY_PATTERNS]
@@ -156,7 +162,7 @@ class MusicFastPathParser:
 
         # Trim common trailing acknowledgement/filler fragments that often get
         # appended after a valid command in live STT, e.g. "play some jazz. all right. um".
-        filler_tail = r"(?:all\s+right|alright|okay|ok|um+|uh+|hmm+|mm+|mhm+)"
+        filler_tail = r"(?:all\s+right|alright|okay|ok|please|um+|uh+|hmm+|mm+|mhm+)"
         while True:
             trimmed = re.sub(
                 rf"(?:[\s,.;:!?-]+{filler_tail}[\s,.;:!?-]*)+$",
@@ -315,13 +321,21 @@ class MusicFastPathParser:
 
         
         # === Playlist Management ===
+
+        def _clean_playlist_name(value: str) -> str:
+            playlist = str(value or "").strip().strip('"').strip("'")
+            playlist = re.sub(r"^the\s+", "", playlist, flags=re.IGNORECASE).strip()
+            return playlist
         
         # Load playlist
-        if text.startswith("play playlist") or text.startswith("load playlist"):
-            match = self.load_playlist_regex.match(text)
-            if match:
-                playlist = match.group(1).strip()
-                return ("load_playlist", {"name": playlist})
+        if "playlist" in text or text.startswith("load ") or text.startswith("switch ") or text.startswith("open "):
+            for regex in self.load_playlist_regexes:
+                match = regex.match(text)
+                if not match:
+                    continue
+                playlist = _clean_playlist_name(match.group(1))
+                if playlist:
+                    return ("load_playlist", {"name": playlist})
         
         # Save playlist
         if text.startswith("save playlist") or text.startswith("save as"):

@@ -296,32 +296,24 @@ class AlarmManager:
         ]
     
     async def load_from_disk(self):
-        """Load alarms from disk on startup."""
+        """Load alarms from disk on startup.
+
+        Restores pending alarms and clears expired alarms.
+        """
         alarm_data_list = await self.state_manager.load_alarms()
         
         now = time.time()
         loaded_count = 0
-        missed_count = 0
-        MISSED_WINDOW = 3600  # 1 hour
+        expired_count = 0
         
         for data in alarm_data_list:
             alarm = Alarm.from_dict(data)
             
-            # Check if alarm was missed during downtime
-            if alarm.enabled and not alarm.triggered and alarm.trigger_time < now:
-                missed_delta = now - alarm.trigger_time
-                if missed_delta < MISSED_WINDOW:
-                    # Trigger now if within window
-                    alarm.triggered = True
-                    alarm.ringing = True
-                    self.ringing_alarms.add(alarm.id)
-                    missed_count += 1
-                    logger.info(f"Alarm: Alarm {alarm.id} ({alarm.label}) missed during downtime, triggering now")
-                else:
-                    # Too old, skip
-                    await self.state_manager.delete_alarm(alarm.id)
-                    logger.info(f"Alarm: Alarm {alarm.id} ({alarm.label}) missed during downtime (too old), skipping")
-                    continue
+            if alarm.triggered or alarm.trigger_time <= now:
+                expired_count += 1
+                await self.state_manager.delete_alarm(alarm.id)
+                logger.info(f"Alarm: Alarm {alarm.id} ({alarm.label}) expired during downtime, skipping")
+                continue
             
             self.alarms[alarm.id] = alarm
             
@@ -335,5 +327,5 @@ class AlarmManager:
             elif alarm.ringing:
                 logger.info(f"Alarm: Restored ringing alarm {alarm.id} ({alarm.label})")
         
-        logger.info(f"Alarm: Loaded {loaded_count} alarms, {missed_count} fired due to missed trigger")
-        return loaded_count, missed_count
+        logger.info(f"Alarm: Loaded {loaded_count} alarms, {expired_count} expired skipped")
+        return loaded_count, expired_count

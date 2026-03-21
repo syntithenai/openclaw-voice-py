@@ -158,6 +158,10 @@ function handleMsg(msg){
                 if(rev<=S.lastMusicRev) break;
                 S.lastMusicRev=rev;
             }
+            if(S._musicStateRetryTimer){
+                clearTimeout(S._musicStateRetryTimer);
+                S._musicStateRetryTimer = null;
+            }
             applyMusic(msg.music||msg);
             if(msg.queue!==undefined) S.musicQueue=msg.queue;
             else if(msg.music&&msg.music.queue!==undefined) S.musicQueue=msg.music.queue;
@@ -330,12 +334,18 @@ async function playFeedbackSound(b64, gain) {
     }
 }
 function applyOrch(o){
+  const prevWake = S.wake_state;
+  const prevMicEnabled = S.micEnabled;
   if(o.voice_state!==undefined) S.voice_state=o.voice_state;
   if(o.wake_state!==undefined)  S.wake_state=o.wake_state;
   if(o.hotword_active!==undefined) S.hotword_active=!!o.hotword_active;
   if(o.tts_playing!==undefined) S.tts_playing=!!o.tts_playing;
   if(o.mic_rms!==undefined)     S.mic_rms=Number(o.mic_rms)||0;
   if(o.mic_enabled!==undefined) S.micEnabled=!!o.mic_enabled;
+  if(o.recorder_active!==undefined) S.recorderActive=!!o.recorder_active;
+  if(S.wake_state !== prevWake || S.micEnabled !== prevMicEnabled){
+    console.log('[orch] wake_state:', prevWake, '→', S.wake_state, '| micEnabled:', prevMicEnabled, '→', S.micEnabled, '| voice='+S.voice_state);
+  }
   applyMicState();
 }
 function syncMusicFromQueue(){

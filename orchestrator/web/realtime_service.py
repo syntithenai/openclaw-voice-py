@@ -124,6 +124,7 @@ class EmbeddedVoiceWebService:
         self._music_queue: list[dict[str, Any]] = []
         self._music_playlists_cache: list[str] = []
         self._music_rev: int = 0
+        self._music_state_push_task: asyncio.Task | None = None
         self._timers_state: list[dict[str, Any]] = []
         self._timers_rev: int = 0
         self._ui_control_state: dict[str, Any] = {
@@ -510,7 +511,14 @@ class EmbeddedVoiceWebService:
         }
         asyncio.create_task(self.broadcast(payload))
 
-    def update_music_queue(self, queue: list[dict[str, Any]]) -> None:
+    def update_music_queue(
+        self,
+        queue: list[dict[str, Any]],
+        *,
+        trace_id: str = "",
+        voice_load_complete_ts: float | None = None,
+        sync_start_ts: float | None = None,
+    ) -> None:
         self._music_queue = list(queue)
         self._music_rev += 1
         payload: dict[str, Any] = {
@@ -518,7 +526,29 @@ class EmbeddedVoiceWebService:
             "music_rev": self._music_rev,
             "queue": list(self._music_queue),
         }
-        asyncio.create_task(self.broadcast(payload))
+        async def _broadcast_queue_payload() -> None:
+            await self.broadcast(payload)
+            if trace_id:
+                now = time.monotonic()
+                since_voice_ms = (
+                    (now - float(voice_load_complete_ts)) * 1000
+                    if voice_load_complete_ts is not None
+                    else None
+                )
+                since_sync_ms = (
+                    (now - float(sync_start_ts)) * 1000
+                    if sync_start_ts is not None
+                    else None
+                )
+                logger.info(
+                    "🧭 Voice playlist trace %s: first music_queue broadcast sent (queue=%d, since_voice_complete_ms=%s, since_sync_start_ms=%s)",
+                    trace_id,
+                    len(self._music_queue),
+                    f"{since_voice_ms:.1f}" if since_voice_ms is not None else "n/a",
+                    f"{since_sync_ms:.1f}" if since_sync_ms is not None else "n/a",
+                )
+
+        asyncio.create_task(_broadcast_queue_payload())
 
     def update_music_playlists(self, playlists: list[str]) -> None:
         playlist_names = [str(name).strip() for name in playlists if str(name).strip()]
@@ -889,12 +919,25 @@ class EmbeddedVoiceWebService:
                         return
                     await asyncio.sleep(0.1 * attempt)
 
+        def _schedule_music_state_push(reason: str) -> None:
+            current_task = self._music_state_push_task
+            if current_task is not None and not current_task.done():
+                logger.debug(
+                    "Skipping duplicate music state push (%s); refresh already running",
+                    reason,
+                )
+                return
+
+            async def _runner() -> None:
+                try:
+                    await _push_music_state_best_effort()
+                finally:
+                    self._music_state_push_task = None
+
+            self._music_state_push_task = asyncio.create_task(_runner())
+
         if msg_type == "music_get_state" and self._on_get_music_state:
-            try:
-                transport, queue = await self._on_get_music_state()
-                await self.push_music_state_now(queue=queue, **transport)
-            except Exception as exc:
-                logger.warning("music_get_state handler error: %s", exc)
+            _schedule_music_state_push("music_get_state")
             return
 
         if msg_type == "music_toggle" and self._on_music_toggle:
@@ -902,7 +945,7 @@ class EmbeddedVoiceWebService:
             try:
                 await self._on_music_toggle(client_id)
                 await _send_music_action_ack("music_toggle", action_id)
-                asyncio.create_task(_push_music_state_best_effort())
+                _schedule_music_state_push("music_toggle")
             except Exception as exc:
                 logger.warning("music_toggle handler error: %s", exc)
                 if action_id:
@@ -919,7 +962,7 @@ class EmbeddedVoiceWebService:
             try:
                 await self._on_music_stop(client_id)
                 await _send_music_action_ack("music_stop", action_id)
-                asyncio.create_task(_push_music_state_best_effort())
+                _schedule_music_state_push("music_stop")
             except Exception as exc:
                 logger.warning("music_stop handler error: %s", exc)
                 if action_id:
@@ -938,7 +981,7 @@ class EmbeddedVoiceWebService:
                 try:
                     await self._on_music_play_track(int(pos), client_id)
                     await _send_music_action_ack("music_play_track", action_id)
-                    asyncio.create_task(_push_music_state_best_effort())
+                    _schedule_music_state_push("music_play_track")
                 except Exception as exc:
                     logger.warning("music_play_track handler error: %s", exc)
                     if action_id:
@@ -957,7 +1000,7 @@ class EmbeddedVoiceWebService:
                 try:
                     await self._on_music_seek(float(seconds), client_id)
                     await _send_music_action_ack("music_seek", action_id)
-                    asyncio.create_task(_push_music_state_best_effort())
+                    _schedule_music_state_push("music_seek")
                 except Exception as exc:
                     logger.warning("music_seek handler error: %s", exc)
                     if action_id:
@@ -974,7 +1017,7 @@ class EmbeddedVoiceWebService:
             try:
                 await _send_music_action_ack("music_clear_queue", action_id)
                 await self._on_music_clear_queue(client_id)
-                asyncio.create_task(_push_music_state_best_effort())
+                _schedule_music_state_push("music_clear_queue")
             except Exception as exc:
                 logger.warning("music_clear_queue handler error: %s", exc)
                 if action_id:
@@ -1056,7 +1099,7 @@ class EmbeddedVoiceWebService:
                     # Push updated state/queue asynchronously to avoid blocking ACK timeout.
                     # Large playlists can take longer to materialize on MPD; retries handled
                     # inside _push_music_state_best_effort.
-                    asyncio.create_task(_push_music_state_best_effort())
+                    _schedule_music_state_push("music_load_playlist")
                     await _send_music_playlists_update()
             except Exception as exc:
                 logger.warning("music_load_playlist handler error: %s", exc)

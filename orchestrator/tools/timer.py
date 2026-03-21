@@ -220,23 +220,20 @@ class TimerManager:
         """Load timers from disk on startup."""
         timer_data_list = await self.state_manager.load_timers()
         
-        now = time.time()
         loaded_count = 0
         expired_count = 0
         
         for data in timer_data_list:
             timer = Timer.from_dict(data)
             
-            # Check if timer expired during downtime
             if timer.is_expired():
                 expired_count += 1
-                # Don't load, but we'll return this info to notify user
                 await self.state_manager.delete_timer(timer.id)
-                logger.info(f"Timer: Timer {timer.id} ({timer.label}) expired during downtime")
+                logger.info(f"Timer: Timer {timer.id} ({timer.label}) expired during downtime, skipping")
             else:
                 self.active_timers[timer.id] = timer
                 loaded_count += 1
                 logger.info(f"Timer: Restored timer {timer.id} ({timer.label}), {timer.time_remaining():.0f}s remaining")
         
-        logger.info(f"Timer: Loaded {loaded_count} active timers, {expired_count} expired")
+        logger.info(f"Timer: Loaded {loaded_count} active timers, {expired_count} expired skipped")
         return loaded_count, expired_count
