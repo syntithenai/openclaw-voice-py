@@ -17,6 +17,31 @@ _PIPELINE_MODEL = None
 _PIPELINE_DEVICE = "unknown"
 
 
+def _iter_diarization_tracks(diarization_obj):
+    if hasattr(diarization_obj, "itertracks"):
+        return diarization_obj.itertracks(yield_label=True)
+
+    candidate = getattr(diarization_obj, "speaker_diarization", None)
+    if candidate is None and isinstance(diarization_obj, dict):
+        candidate = diarization_obj.get("speaker_diarization")
+
+    if candidate is not None and hasattr(candidate, "itertracks"):
+        return candidate.itertracks(yield_label=True)
+
+    raise TypeError(f"Unsupported diarization output type: {type(diarization_obj).__name__}")
+
+
+def _load_pipeline_from_pretrained(model_ref: str, auth_token: str):
+    from pyannote.audio import Pipeline
+
+    if auth_token:
+        try:
+            return Pipeline.from_pretrained(model_ref, token=auth_token)
+        except TypeError:
+            return Pipeline.from_pretrained(model_ref, use_auth_token=auth_token)
+    return Pipeline.from_pretrained(model_ref)
+
+
 def _resolve_device() -> tuple[str, bool]:
     import torch
 
@@ -41,14 +66,12 @@ def _load_pipeline(model_id: str):
     if not AUTH_TOKEN and not use_local_model:
         raise RuntimeError("PYANNOTE_AUTH_TOKEN is missing")
 
-    from pyannote.audio import Pipeline
-
     target_device, _gpu_available = _resolve_device()
 
     if use_local_model:
-        pipeline = Pipeline.from_pretrained(str(model_ref))
+        pipeline = _load_pipeline_from_pretrained(str(model_ref), AUTH_TOKEN)
     else:
-        pipeline = Pipeline.from_pretrained(model_id, use_auth_token=AUTH_TOKEN)
+        pipeline = _load_pipeline_from_pretrained(model_id, AUTH_TOKEN)
 
     if target_device == "cuda":
         try:
@@ -102,7 +125,7 @@ async def diarize(file: UploadFile, model_id: str = Form(default="")) -> dict[st
         diarization = pipeline(temp_audio_path)
 
         segments: list[dict[str, Any]] = []
-        for segment, _, speaker in diarization.itertracks(yield_label=True):
+        for segment, _, speaker in _iter_diarization_tracks(diarization):
             segments.append(
                 {
                     "start": float(segment.start),

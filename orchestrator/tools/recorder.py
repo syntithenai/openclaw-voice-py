@@ -31,11 +31,36 @@ def _format_seconds(total_seconds: float) -> str:
     return f"{minutes:02d}:{seconds:05.2f}"
 
 
+def _pipeline_from_pretrained_with_token(model_ref: str, token: str):
+    from pyannote.audio import Pipeline
+
+    if token:
+        try:
+            return Pipeline.from_pretrained(model_ref, token=token)
+        except TypeError:
+            return Pipeline.from_pretrained(model_ref, use_auth_token=token)
+    return Pipeline.from_pretrained(model_ref)
+
+
+def _should_surface_diarization_note(note: str) -> bool:
+    value = (note or "").strip().lower()
+    if not value:
+        return False
+
+    suppressed_prefixes = (
+        "pyannote diarization disabled",
+        "pyannote.audio is not installed",
+        "pyannote enabled but pyannote_auth_token is missing",
+    )
+    return not any(value.startswith(prefix) for prefix in suppressed_prefixes)
+
+
 @dataclass
 class RecorderStopResult:
     response: str
     audio_path: str
     transcript_path: str
+    diarization_path: str = ""
 
 
 class RecorderTool:
@@ -129,6 +154,7 @@ class RecorderTool:
                 "response": stop_result.response,
                 "audio_path": stop_result.audio_path,
                 "transcript_path": stop_result.transcript_path,
+                "diarization_path": stop_result.diarization_path,
             }
         if self.should_report_status_from_transcript(transcript):
             return await self.execute_tool(action="status")
@@ -145,6 +171,7 @@ class RecorderTool:
                 "response": result.response,
                 "audio_path": result.audio_path,
                 "transcript_path": result.transcript_path,
+                "diarization_path": result.diarization_path,
             }
         if normalized == "status":
             if self._recording_active:
@@ -193,6 +220,7 @@ class RecorderTool:
                     response="Recorder is not currently active.",
                     audio_path="",
                     transcript_path="",
+                    diarization_path="",
                 )
 
             self._recording_active = False
@@ -216,12 +244,14 @@ class RecorderTool:
                 response="Stopped recording",
                 audio_path="",
                 transcript_path="",
+                diarization_path="",
             )
 
         wav_bytes = pcm_to_wav_bytes(pcm, self.sample_rate)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         audio_path = self.output_root / f"recording-{stamp}.wav"
-        transcript_path = self.output_root / f"recording-{stamp}.txt"
+        transcript_path = self.output_root / f"recording-{stamp}.transcript.txt"
+        diarization_path = self.output_root / f"recording-{stamp}.diarization.txt"
 
         audio_path.write_bytes(wav_bytes)
 
@@ -243,6 +273,14 @@ class RecorderTool:
             else:
                 diarization_note = diarization_err
 
+        diarization_path.write_text(
+            self._format_diarization_text(
+                diarization_rows=diarization_rows,
+                diarization_note=diarization_note,
+            ),
+            encoding="utf-8",
+        )
+
         duration_s = max(0.0, time.time() - started_ts)
         transcript_path.write_text(
             self._format_output_text(
@@ -256,13 +294,23 @@ class RecorderTool:
             encoding="utf-8",
         )
 
-        response = "Stopped recording"
-        logger.info("Recorder stopped: audio=%s transcript=%s", audio_path, transcript_path)
+        response = (
+            f"Stopped recording ({_format_seconds(duration_s)}). "
+            f"Created files: {audio_path.name}, {transcript_path.name}, {diarization_path.name}."
+        )
+        logger.info(
+            "Recorder stopped: audio=%s transcript=%s diarization=%s duration=%s",
+            audio_path,
+            transcript_path,
+            diarization_path,
+            _format_seconds(duration_s),
+        )
         await self._invoke_hook(self.on_recording_stopped)
         return RecorderStopResult(
             response=response,
             audio_path=str(audio_path),
             transcript_path=str(transcript_path),
+            diarization_path=str(diarization_path),
         )
 
     def _run_pyannote(self, audio_path: Path) -> tuple[list[dict[str, Any]], str]:
@@ -275,7 +323,13 @@ class RecorderTool:
                 rows.sort(key=lambda item: (item["start"], item["end"]))
                 return rows, ""
             except Exception as exc:
-                logger.warning("Recorder remote pyannote diarization failed: %s", exc)
+                msg = str(exc)
+                if "PYANNOTE_AUTH_TOKEN is missing" in msg:
+                    logger.info(
+                        "Recorder remote pyannote unavailable: PYANNOTE_AUTH_TOKEN is missing on backend; continuing without diarization"
+                    )
+                else:
+                    logger.warning("Recorder remote pyannote diarization failed: %s", exc)
                 remote_error = f"remote pyannote diarization failed: {exc}"
             else:
                 remote_error = ""
@@ -298,9 +352,9 @@ class RecorderTool:
 
         try:
             if use_local_model:
-                pipeline = Pipeline.from_pretrained(str(model_path))
+                pipeline = _pipeline_from_pretrained_with_token(str(model_path), token)
             else:
-                pipeline = Pipeline.from_pretrained(self.pyannote_model, use_auth_token=token)
+                pipeline = _pipeline_from_pretrained_with_token(self.pyannote_model, token)
             diarization = pipeline(str(audio_path))
             rows: list[dict[str, Any]] = []
             for segment, _, speaker in diarization.itertracks(yield_label=True):
@@ -329,6 +383,7 @@ class RecorderTool:
         diarization_rows: list[dict[str, Any]],
         diarization_note: str,
     ) -> str:
+        show_diarization_section = bool(diarization_rows) or _should_surface_diarization_note(diarization_note)
         lines: list[str] = []
         lines.append(f"audio_file: {audio_path}")
         lines.append(f"duration: {_format_seconds(duration_s)}")
@@ -336,17 +391,18 @@ class RecorderTool:
         lines.append("")
         lines.append("whisper_transcript:")
         lines.append(transcript_text if transcript_text else "(empty)")
-        lines.append("")
-        lines.append("pyannote_diarization:")
-        if diarization_rows:
-            for row in diarization_rows:
-                lines.append(
-                    f"[{_format_seconds(row['start'])} - {_format_seconds(row['end'])}] {row['speaker']}"
-                )
-        else:
-            lines.append("(none)")
+        if show_diarization_section:
+            lines.append("")
+            lines.append("pyannote_diarization:")
+            if diarization_rows:
+                for row in diarization_rows:
+                    lines.append(
+                        f"[{_format_seconds(row['start'])} - {_format_seconds(row['end'])}] {row['speaker']}"
+                    )
+            else:
+                lines.append("(none)")
 
-        if diarization_note:
+        if show_diarization_section and diarization_note and _should_surface_diarization_note(diarization_note):
             lines.append("")
             lines.append(f"note: {diarization_note}")
 
@@ -364,4 +420,23 @@ class RecorderTool:
                     f"- [{_format_seconds(row['start'])} - {_format_seconds(row['end'])}] {row['speaker']}"
                 )
 
+        return "\n".join(lines)
+
+    def _format_diarization_text(
+        self,
+        *,
+        diarization_rows: list[dict[str, Any]],
+        diarization_note: str,
+    ) -> str:
+        lines: list[str] = []
+        if diarization_rows:
+            for row in diarization_rows:
+                lines.append(
+                    f"[{_format_seconds(row['start'])} - {_format_seconds(row['end'])}] {row['speaker']}"
+                )
+        else:
+            lines.append("(none)")
+        if diarization_note:
+            lines.append("")
+            lines.append(f"note: {diarization_note}")
         return "\n".join(lines)

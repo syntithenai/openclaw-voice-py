@@ -2,14 +2,25 @@ import requests
 
 
 class PyannoteClient:
-    def __init__(self, base_url: str, model_id: str = "pyannote/speaker-diarization-3.1") -> None:
+    def __init__(self, base_url: str, model_id: str = "pyannote/speaker-diarization-3.1", auth_token: str = "") -> None:
         self.base_url = base_url.rstrip("/")
         self.model_id = (model_id or "pyannote/speaker-diarization-3.1").strip()
+        self.auth_token = (auth_token or "").strip()
 
     def diarize(self, wav_bytes: bytes) -> list[dict]:
         files = {"file": ("audio.wav", wav_bytes, "audio/wav")}
         data = {"model_id": self.model_id}
-        response = requests.post(f"{self.base_url}/diarize", files=files, data=data, timeout=300)
+        headers = {}
+        if self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
+            data["auth_token"] = self.auth_token
+        response = requests.post(
+            f"{self.base_url}/diarize",
+            files=files,
+            data=data,
+            headers=headers,
+            timeout=300,
+        )
         response.raise_for_status()
         payload = response.json()
         if payload.get("error"):

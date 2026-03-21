@@ -474,7 +474,8 @@ function applyMicState(){
         btn.classList.add('bg-gray-700','border-gray-500');
         return;
     }
-  const bw=S.micEnabled?Math.round(2+Math.min(8,Math.pow(rms,0.55)*40)):4;
+    const vuActive = !!(S.micEnabled || S.recorderActive);
+    const bw=vuActive?Math.round(2+Math.min(8,Math.pow(rms,0.55)*40)):4;
   btn.style.borderWidth=bw+'px';
   btn.classList.remove('bg-red-900','border-red-600','bg-green-900','border-green-500','bg-gray-700','border-gray-500');
     btn.classList.remove('border-transparent');
@@ -530,7 +531,8 @@ function applyMusicHeader(){
     const btn=document.getElementById('musicToggleBtn');
     if(!header||!titleEl||!artistEl||!btn) return;
     const pendingCount=Object.keys(S.pendingMusicActions||{}).length;
-    const active=m.state==='play'||(m.state==='pause'&&((m.title&&String(m.title).trim())||Number(m.queue_length||0)>0));
+    const pendingLoad=pendingCount>0&&Object.values(S.pendingMusicActions||{}).some(a=>a&&String(a.type||'').indexOf('music_load_playlist')>=0);
+    const active=m.state==='play'||(m.state==='pause'&&((m.title&&String(m.title).trim())||Number(m.queue_length||0)>0))||pendingLoad;
     header.classList.toggle('hidden',!active);
     titleEl.textContent=(m.title&&String(m.title).trim())||'—';
     artistEl.textContent=(m.artist&&String(m.artist).trim())||'—';

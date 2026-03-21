@@ -911,7 +911,12 @@ class EmbeddedVoiceWebService:
             for attempt in (1, 2, 3):
                 try:
                     transport, queue = await self._on_get_music_state()
-                    await self.push_music_state_now(queue=queue, **transport)
+                    # Send transport state immediately WITHOUT waiting for queue fetch
+                    # (queue fetch can take 43+ seconds after loading a large playlist)
+                    self.update_music_transport(**transport)
+                    # Queue will be updated on next broadcast or when client requests it
+                    if queue:
+                        self.update_music_queue(queue)
                     return
                 except Exception as exc:
                     if attempt == 3:
@@ -1172,30 +1177,27 @@ class EmbeddedVoiceWebService:
                     len(rows or []),
                     elapsed_ms,
                 )
-                if websocket is not None:
-                    await websocket.send(json.dumps({
-                        "type": "music_library_results",
-                        "query": query,
-                        "results": rows or [],
-                    }))
+                await _send_ws_json({
+                    "type": "music_library_results",
+                    "query": query,
+                    "results": rows or [],
+                })
             except asyncio.TimeoutError:
                 logger.warning("music_search_library timed out query='%s' limit=%d", query, limit)
-                if websocket is not None:
-                    await websocket.send(json.dumps({
-                        "type": "music_library_results",
-                        "query": query,
-                        "results": [],
-                        "error": "search timeout",
-                    }))
+                await _send_ws_json({
+                    "type": "music_library_results",
+                    "query": query,
+                    "results": [],
+                    "error": "search timeout",
+                })
             except Exception as exc:
                 logger.warning("music_search_library handler error: %s", exc)
-                if websocket is not None:
-                    await websocket.send(json.dumps({
-                        "type": "music_library_results",
-                        "query": query,
-                        "results": [],
-                        "error": str(exc),
-                    }))
+                await _send_ws_json({
+                    "type": "music_library_results",
+                    "query": query,
+                    "results": [],
+                    "error": str(exc),
+                })
             return
 
         if msg_type == "music_list_playlists" and self._on_music_list_playlists:
@@ -1207,11 +1209,10 @@ class EmbeddedVoiceWebService:
                 elif self._music_playlists_cache:
                     playlist_names = list(self._music_playlists_cache)
                 logger.info("Handled music_list_playlists for %s: count=%d", client_id, len(playlist_names))
-                if websocket is not None:
-                    await websocket.send(json.dumps({
-                        "type": "music_playlists",
-                        "playlists": playlist_names,
-                    }))
+                await _send_ws_json({
+                    "type": "music_playlists",
+                    "playlists": playlist_names,
+                })
             except Exception as exc:
                 logger.warning("music_list_playlists handler error: %s", exc)
             return
@@ -1222,23 +1223,23 @@ class EmbeddedVoiceWebService:
             if timer_id:
                 try:
                     await self._on_timer_cancel(str(timer_id), client_id)
-                    if websocket is not None and action_id:
-                        await websocket.send(json.dumps({
+                    if action_id:
+                        await _send_ws_json({
                             "type": "timer_action_ack",
                             "action": "timer_cancel",
                             "action_id": str(action_id),
                             "id": str(timer_id),
-                        }))
+                        })
                 except Exception as exc:
                     logger.warning("timer_cancel handler error: %s", exc)
-                    if websocket is not None and action_id:
-                        await websocket.send(json.dumps({
+                    if action_id:
+                        await _send_ws_json({
                             "type": "timer_action_error",
                             "action": "timer_cancel",
                             "action_id": str(action_id),
                             "id": str(timer_id),
                             "error": str(exc),
-                        }))
+                        })
             return
 
         if msg_type == "alarm_cancel" and self._on_alarm_cancel:
@@ -1247,23 +1248,23 @@ class EmbeddedVoiceWebService:
             if alarm_id:
                 try:
                     await self._on_alarm_cancel(str(alarm_id), client_id)
-                    if websocket is not None and action_id:
-                        await websocket.send(json.dumps({
+                    if action_id:
+                        await _send_ws_json({
                             "type": "timer_action_ack",
                             "action": "alarm_cancel",
                             "action_id": str(action_id),
                             "id": str(alarm_id),
-                        }))
+                        })
                 except Exception as exc:
                     logger.warning("alarm_cancel handler error: %s", exc)
-                    if websocket is not None and action_id:
-                        await websocket.send(json.dumps({
+                    if action_id:
+                        await _send_ws_json({
                             "type": "timer_action_error",
                             "action": "alarm_cancel",
                             "action_id": str(action_id),
                             "id": str(alarm_id),
                             "error": str(exc),
-                        }))
+                        })
             return
 
         if msg_type == "tts_mute_set" and self._on_tts_mute_set:
@@ -1271,21 +1272,21 @@ class EmbeddedVoiceWebService:
             enabled = bool(payload.get("enabled", False))
             try:
                 await self._on_tts_mute_set(enabled, client_id)
-                if websocket is not None and action_id:
-                    await websocket.send(json.dumps({
+                if action_id:
+                    await _send_ws_json({
                         "type": "setting_action_ack",
                         "action": "tts_mute_set",
                         "action_id": str(action_id),
-                    }))
+                    })
             except Exception as exc:
                 logger.warning("tts_mute_set handler error: %s", exc)
-                if websocket is not None and action_id:
-                    await websocket.send(json.dumps({
+                if action_id:
+                    await _send_ws_json({
                         "type": "setting_action_error",
                         "action": "tts_mute_set",
                         "action_id": str(action_id),
                         "error": str(exc),
-                    }))
+                    })
             return
 
         if msg_type == "browser_audio_set" and self._on_browser_audio_set:
@@ -1293,21 +1294,21 @@ class EmbeddedVoiceWebService:
             enabled = bool(payload.get("enabled", True))
             try:
                 await self._on_browser_audio_set(enabled, client_id)
-                if websocket is not None and action_id:
-                    await websocket.send(json.dumps({
+                if action_id:
+                    await _send_ws_json({
                         "type": "setting_action_ack",
                         "action": "browser_audio_set",
                         "action_id": str(action_id),
-                    }))
+                    })
             except Exception as exc:
                 logger.warning("browser_audio_set handler error: %s", exc)
-                if websocket is not None and action_id:
-                    await websocket.send(json.dumps({
+                if action_id:
+                    await _send_ws_json({
                         "type": "setting_action_error",
                         "action": "browser_audio_set",
                         "action_id": str(action_id),
                         "error": str(exc),
-                    }))
+                    })
             return
 
         if msg_type == "continuous_mode_set" and self._on_continuous_mode_set:
@@ -1315,21 +1316,21 @@ class EmbeddedVoiceWebService:
             enabled = bool(payload.get("enabled", False))
             try:
                 await self._on_continuous_mode_set(enabled, client_id)
-                if websocket is not None and action_id:
-                    await websocket.send(json.dumps({
+                if action_id:
+                    await _send_ws_json({
                         "type": "setting_action_ack",
                         "action": "continuous_mode_set",
                         "action_id": str(action_id),
-                    }))
+                    })
             except Exception as exc:
                 logger.warning("continuous_mode_set handler error: %s", exc)
-                if websocket is not None and action_id:
-                    await websocket.send(json.dumps({
+                if action_id:
+                    await _send_ws_json({
                         "type": "setting_action_error",
                         "action": "continuous_mode_set",
                         "action_id": str(action_id),
                         "error": str(exc),
-                    }))
+                    })
             return
 
         if msg_type == "chat_new" and self._on_chat_new:
@@ -1345,32 +1346,26 @@ class EmbeddedVoiceWebService:
             if text:
                 try:
                     await self._on_chat_text(text, client_id)
-                    if websocket is not None:
-                        await websocket.send(
-                            json.dumps(
-                                {
-                                    "type": "chat_text_ack",
-                                    "client_msg_id": client_msg_id,
-                                    "ok": True,
-                                }
-                            )
-                        )
+                    await _send_ws_json(
+                        {
+                            "type": "chat_text_ack",
+                            "client_msg_id": client_msg_id,
+                            "ok": True,
+                        }
+                    )
                 except Exception as exc:
                     logger.warning("chat_text handler error: %s", exc)
-                    if websocket is not None:
-                        try:
-                            await websocket.send(
-                                json.dumps(
-                                    {
-                                        "type": "chat_text_ack",
-                                        "client_msg_id": client_msg_id,
-                                        "ok": False,
-                                        "error": str(exc),
-                                    }
-                                )
-                            )
-                        except Exception:
-                            pass
+                    try:
+                        await _send_ws_json(
+                            {
+                                "type": "chat_text_ack",
+                                "client_msg_id": client_msg_id,
+                                "ok": False,
+                                "error": str(exc),
+                            }
+                        )
+                    except Exception:
+                        pass
             return
 
         if msg_type == "chat_delete":

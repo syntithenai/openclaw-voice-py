@@ -872,29 +872,32 @@ class QuickAnswerClient:
             logger.debug("Failed to push voice music transport: %s", exc)
             return
 
-        try:
-            queue = await manager.get_ui_playlist()
-            queue_ready_ts = time.monotonic()
-            if trace_id:
-                logger.info(
-                    "🧭 Voice playlist trace %s: queue snapshot ready in %.1fms (since sync start)",
-                    trace_id,
-                    (queue_ready_ts - sync_start_ts) * 1000,
+        async def _push_queue_async() -> None:
+            try:
+                queue = await manager.get_ui_playlist()
+                queue_ready_ts = time.monotonic()
+                if trace_id:
+                    logger.info(
+                        "🧭 Voice playlist trace %s: queue snapshot ready in %.1fms (since sync start)",
+                        trace_id,
+                        (queue_ready_ts - sync_start_ts) * 1000,
+                    )
+                self.web_service.update_music_queue(
+                    queue,
+                    trace_id=trace_id,
+                    voice_load_complete_ts=voice_load_complete_ts,
+                    sync_start_ts=sync_start_ts,
                 )
-            self.web_service.update_music_queue(
-                queue,
-                trace_id=trace_id,
-                voice_load_complete_ts=voice_load_complete_ts,
-                sync_start_ts=sync_start_ts,
-            )
-            if trace_id:
-                logger.info(
-                    "🧭 Voice playlist trace %s: queued music_queue broadcast handoff in %.1fms (since sync start)",
-                    trace_id,
-                    (time.monotonic() - sync_start_ts) * 1000,
-                )
-        except Exception as exc:
-            logger.debug("Failed to push voice music queue: %s", exc)
+                if trace_id:
+                    logger.info(
+                        "🧭 Voice playlist trace %s: queued music_queue broadcast handoff in %.1fms (since sync start)",
+                        trace_id,
+                        (time.monotonic() - sync_start_ts) * 1000,
+                    )
+            except Exception as exc:
+                logger.debug("Failed to push voice music queue: %s", exc)
+
+        asyncio.create_task(_push_queue_async())
 
         playlists_cb = getattr(self.web_service, "_on_music_list_playlists", None)
         if playlists_cb is not None:

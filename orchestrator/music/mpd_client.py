@@ -214,6 +214,7 @@ class MPDConnection:
         
         Args:
             send_cmd: MPD protocol command to send (if empty, just reads response)
+            timeout: Overall timeout for the entire command in seconds (applied to total elapsed time, not per-readline)
         
         Returns:
             List of dictionaries, one per item
@@ -222,6 +223,7 @@ class MPDConnection:
             op_timeout = float(timeout) if timeout is not None else self.timeout
             trace_command = _should_trace_command(send_cmd)
             started = time.monotonic()
+            deadline = started + op_timeout  # Track overall deadline instead of per-readline
             if not self.is_connected or self._reader is None or self._writer is None:
                 raise ConnectionError("Not connected to MPD")
             
@@ -236,9 +238,12 @@ class MPDConnection:
                             op_timeout,
                         )
                     self._writer.write(f"{send_cmd}\n".encode('utf-8'))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError("Timeout before sending command")
                     await asyncio.wait_for(
                         self._writer.drain(),
-                        timeout=op_timeout
+                        timeout=remaining
                     )
                 
                 items = []
@@ -249,9 +254,14 @@ class MPDConnection:
                     if self._reader is None:
                         raise ConnectionError("Connection lost to MPD during list read")
                     
+                    # Check if we've exceeded overall deadline
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError(f"Timeout reading MPD list response (got {len(items)} items so far)")
+                    
                     line = await asyncio.wait_for(
                         self._reader.readline(),
-                        timeout=op_timeout
+                        timeout=remaining
                     )
                     
                     if not line:
@@ -503,6 +513,9 @@ class MPDClientPool:
                 try:
                     return await conn.send_command_list(send_cmd=command, timeout=timeout)
                 except ConnectionError as exc:
+                    # Don't retry on timeout — MPD is just slow, retrying wastes 3× the time
+                    if "timeout" in str(exc).lower():
+                        raise
                     last_exc = exc
                     logger.warning(
                         "↻ MPD list retry %d/3 on %s for %s after connection error: %s",

@@ -640,6 +640,7 @@ async def run_orchestrator() -> None:
     wake_sleep_ts: float | None = None
     wake_sleep_cooldown_ms = max(0, config.wake_sleep_cooldown_ms)
     last_wake_detected_ts: float | None = None
+    recorder_stop_hotword_armed_ts: float | None = None
     last_wake_conf_log_ts = 0.0
     last_timeout_progress_log_ts = 0.0  # Rate-limit for inactivity progress logs
     warned_missing_playerctl = False
@@ -940,14 +941,17 @@ async def run_orchestrator() -> None:
             pyannote_client = PyannoteClient(
                 base_url=config.recorder_pyannote_url,
                 model_id=config.recorder_pyannote_model,
+                auth_token=config.recorder_pyannote_auth_token,
             )
 
         async def _on_recorder_started() -> None:
             nonlocal recording_blocks_tools, wake_state, wake_sleep_ts, last_wake_detected_ts, chunk_frames, chunk_start_ts, last_speech_ts
+            nonlocal recorder_stop_hotword_armed_ts
             recording_blocks_tools = True
             wake_state = WakeState.ASLEEP
             wake_sleep_ts = time.monotonic()
             last_wake_detected_ts = None
+            recorder_stop_hotword_armed_ts = None
             chunk_frames = []
             chunk_start_ts = None
             last_speech_ts = None
@@ -972,12 +976,37 @@ async def run_orchestrator() -> None:
 
         async def _on_recorder_stopped() -> None:
             nonlocal recording_blocks_tools, wake_state, wake_sleep_ts, last_wake_detected_ts
+            nonlocal recorder_stop_hotword_armed_ts
+            nonlocal last_timeout_progress_log_ts
             recording_blocks_tools = False
-            wake_state = WakeState.AWAKE if not config.wake_word_enabled else WakeState.ASLEEP
+            wake_state = WakeState.ASLEEP
             wake_sleep_ts = time.monotonic()
             last_wake_detected_ts = None
-            web_service.update_orchestrator_status(recorder_active=False)
-            logger.info("🎙️ Recorder stopped: timer/alarm processing resumes")
+            recorder_stop_hotword_armed_ts = None
+            last_timeout_progress_log_ts = 0.0
+            if web_service:
+                web_service.update_ui_control_state(mic_enabled=False)
+                web_service.update_orchestrator_status(
+                    recorder_active=False,
+                    wake_state=wake_state.value,
+                    voice_state=state.value,
+                    mic_enabled=False,
+                )
+            if wake_detector and hasattr(wake_detector, 'reset_state'):
+                try:
+                    wake_detector.reset_state()
+                except Exception:
+                    pass
+            if timeout_swoosh_sound:
+                try:
+                    play_feedback_async(
+                        timeout_swoosh_sound,
+                        float(max(0.1, config.sleep_feedback_gain)),
+                        "sleep swoosh (recorder stop)",
+                    )
+                except Exception as exc:
+                    logger.debug("Failed to play sleep swoosh (recorder stop): %s", exc)
+            logger.info("🎙️ Recorder stopped: timer/alarm processing resumes and system forced to sleep")
 
         print("→ Initializing Recorder tool...", flush=True)
         logger.info("→ Initializing Recorder tool...")
@@ -1949,32 +1978,20 @@ async def run_orchestrator() -> None:
                 # Publish transport state immediately (non-blocking) so UI responds instantly to actions
                 web_service.update_music_transport(**ms)
                 
-                # Fetch and publish queue asynchronously without blocking the action response
-                async def _fetch_and_publish_queue() -> None:
-                    try:
-                        q = await music_manager.get_ui_playlist()
-                        web_service.update_music_queue(q)
-                    except Exception as exc:
-                        logger.debug("Web UI %s queue refresh failed: %s", source, exc)
-
-                    try:
-                        playlists = await music_manager.list_playlists()
-                        web_service.update_music_playlists(playlists)
-                    except Exception as exc:
-                        logger.debug("Web UI %s playlists refresh failed: %s", source, exc)
-                
-                asyncio.create_task(_fetch_and_publish_queue())
+                # Queue and playlists are refreshed by the web_ui_publisher when it detects
+                # transport metadata (loaded_playlist, queue_length) changing. This avoids
+                # concurrent queue fetches that can saturate the MPD connection pool on
+                # large playlists.
 
             async def _ui_get_music_state_snapshot() -> tuple[dict[str, Any], list[dict[str, Any]]]:
                 if not music_manager:
                     return {"state": "stop", "queue_length": 0}, []
 
                 transport = await music_manager.get_ui_music_state()
-                try:
-                    queue = await music_manager.get_ui_playlist()
-                except Exception as exc:
-                    logger.warning("Web UI snapshot queue fetch failed; sending empty queue: %s", exc)
-                    queue = []
+                # Do not force a fresh queue fetch for ad-hoc snapshot requests.
+                # Large playlistinfo calls can take seconds and should be refreshed
+                # by the async queue publisher instead of blocking this snapshot.
+                queue = list(getattr(web_service, "_music_queue", []) or []) if web_service else []
                 return transport, queue
 
             async def _ui_music_toggle(client_id: str) -> None:
@@ -2213,14 +2230,56 @@ async def run_orchestrator() -> None:
             async def _web_ui_publisher() -> None:
                 last_music_transport_hash = ""
                 last_music_queue_hash = ""
+                last_music_queue_meta_hash = ""
                 last_schedule_hash = ""
                 last_schedule_shape_hash = ""
                 music_failures = 0
                 timer_failures = 0
                 music_poll = config.web_ui_music_poll_ms / 1000.0
+                music_queue_poll = max(5.0, music_poll * 10.0)
                 timer_poll = config.web_ui_timer_poll_ms / 1000.0
                 music_tick = 0.0
+                music_queue_tick = 0.0
                 timer_tick = 0.0
+                music_queue_task: asyncio.Task | None = None
+
+                async def _refresh_music_queue(reason: str) -> None:
+                    nonlocal last_music_queue_hash, music_queue_tick
+                    try:
+                        q = await music_manager.get_ui_playlist()
+                        qh = str([
+                            (
+                                item.get("id", ""),
+                                item.get("pos", -1),
+                                item.get("file", ""),
+                                item.get("title", ""),
+                                item.get("artist", ""),
+                                item.get("album", ""),
+                            )
+                            for item in q
+                        ])
+                        if qh != last_music_queue_hash:
+                            last_music_queue_hash = qh
+                            web_service.update_music_queue(q)
+                        music_queue_tick = time.monotonic()
+                    except Exception as exc:
+                        logger.debug("Web UI music queue refresh failed (%s): %s", reason, exc)
+                        music_queue_tick = time.monotonic()  # Back off — prevents tight retry loop on slow playlists
+
+                def _schedule_music_queue_refresh(reason: str) -> None:
+                    nonlocal music_queue_task
+                    if music_queue_task is not None and not music_queue_task.done():
+                        return
+
+                    async def _runner() -> None:
+                        nonlocal music_queue_task
+                        try:
+                            await _refresh_music_queue(reason)
+                        finally:
+                            music_queue_task = None
+
+                    music_queue_task = asyncio.create_task(_runner())
+
                 while True:
                     await asyncio.sleep(0.2)
                     if not web_service:
@@ -2276,31 +2335,21 @@ async def run_orchestrator() -> None:
                     if music_manager and (now - music_tick) >= music_poll:
                         music_tick = now
                         try:
-                            async def _fetch_music_state():
-                                ms = await music_manager.get_ui_music_state()
-                                q = await music_manager.get_ui_playlist()
-                                return ms, q
-
                             music_timeout_s = max(0.2, min(1.0, music_poll))
-                            ms, q = await asyncio.wait_for(_fetch_music_state(), timeout=music_timeout_s)
+                            ms = await asyncio.wait_for(music_manager.get_ui_music_state(), timeout=music_timeout_s)
                             th = str(sorted(ms.items()))
-                            qh = str([
-                                (
-                                    item.get("id", ""),
-                                    item.get("pos", -1),
-                                    item.get("file", ""),
-                                    item.get("title", ""),
-                                    item.get("artist", ""),
-                                    item.get("album", ""),
-                                )
-                                for item in q
-                            ])
                             if th != last_music_transport_hash:
                                 last_music_transport_hash = th
                                 web_service.update_music_transport(**ms)
-                            if qh != last_music_queue_hash:
-                                last_music_queue_hash = qh
-                                web_service.update_music_queue(q)
+                            queue_meta_hash = str((
+                                ms.get("queue_length", 0),
+                                ms.get("loaded_playlist", ""),
+                                ms.get("state", ""),
+                            ))
+                            queue_poll_due = (now - music_queue_tick) >= music_queue_poll
+                            if queue_meta_hash != last_music_queue_meta_hash or queue_poll_due:
+                                last_music_queue_meta_hash = queue_meta_hash
+                                _schedule_music_queue_refresh("publisher")
                             music_failures = 0
                         except asyncio.TimeoutError:
                             music_failures += 1
@@ -3102,11 +3151,13 @@ async def run_orchestrator() -> None:
         pcm: bytes,
         cut_in_ts: float | None = None,
         chunk_started_ts: float | None = None,
+        recorder_capture_mode: bool = False,
     ) -> None:
         nonlocal active_transcriptions, state, pending_transcripts, debounce_task
         nonlocal cut_in_tts_hold_active, cut_in_tts_hold_started_ts, cut_in_tts_hold_request_id
         nonlocal tts_playing, last_tts_text, last_tts_ts, current_tts_text
         nonlocal wake_state, wake_sleep_ts, last_wake_detected_ts
+        nonlocal recorder_stop_hotword_armed_ts
         nonlocal last_assistant_ts, last_assistant_was_question, last_assistant_expects_short_reply
         nonlocal last_user_went_upstream, last_upstream_assistant_ts, last_upstream_response_was_question
         nonlocal last_upstream_response_requested_confirmation
@@ -3209,7 +3260,7 @@ async def run_orchestrator() -> None:
                 "cutin_early_ms": float(config.ghost_filter_cutin_early_ms),
                 "has_fresh_prompt_context": has_fresh_prompt_context,
                 "has_inflight_user_request": bool(processing_request or len(pending_transcripts) > 0),
-                "recorder_active": bool(recorder_tool and recorder_tool.is_recording()),
+                "recorder_active": bool(recorder_capture_mode or (recorder_tool and recorder_tool.is_recording())),
             }
 
             ghost_filter_active = bool(config.ghost_filter_enabled and not config.ghost_filter_kill_switch)
@@ -3240,20 +3291,25 @@ async def run_orchestrator() -> None:
                 if is_short_transcript and last_user_went_upstream and last_upstream_response_was_question:
                     ghost_accepted_short_after_upstream_question += 1
 
-            if recorder_tool and recorder_tool.is_recording():
-                if recorder_tool.should_stop_from_transcript(transcript):
+            if recorder_tool and recorder_capture_mode:
+                recorder_stop_armed = recorder_stop_hotword_armed_ts is not None
+                if recorder_stop_armed and recorder_tool.should_stop_from_transcript(transcript):
                     stop_result = await recorder_tool.stop_recording(
                         reason="voice stop phrase",
                         trim_tail_seconds=1.6,
                     )
+                    recorder_stop_hotword_armed_ts = None
                     if stop_result.response:
                         await submit_tts(stop_result.response, request_id=current_request_id, kind="notification")
-                    logger.info("🎙️ Recorder stop phrase handled locally")
+                    logger.info("🎙️ Recorder stop phrase handled locally after hotword arm")
+                elif recorder_tool.should_stop_from_transcript(transcript):
+                    logger.info("🎙️ Recorder stop phrase ignored until hotword arm is active")
                 else:
-                    logger.info("🎙️ Recorder hotword window transcript ignored (no stop phrase)")
+                    logger.info("🎙️ Recorder transcript ignored for web chat/gateway while capture mode is active")
                 wake_state = WakeState.ASLEEP
                 wake_sleep_ts = now_ts
                 last_wake_detected_ts = None
+                recorder_stop_hotword_armed_ts = None
                 return
             
             # Emotion detection phase
@@ -4556,6 +4612,17 @@ async def run_orchestrator() -> None:
 
             alarm_ringing_now = bool(alarm_manager and alarm_manager.ringing_alarms)
             if (recorder_hotword_mode or (config.wake_word_enabled and (not continuous_mode))) and wake_state == WakeState.ASLEEP and not alarm_ringing_now:
+                if web_service:
+                    web_service.update_orchestrator_status(
+                        voice_state=state.value,
+                        wake_state=wake_state.value,
+                        speech_active=bool(chunk_frames),
+                        tts_playing=tts_playing,
+                        mic_rms=rms_raw,
+                        queue_depth=len(tts_queue),
+                        wake_word_enabled=config.wake_word_enabled,
+                    )
+
                 # While sleeping during music playback, use voice cut-in only to duck
                 # volume briefly so the hotword can be heard more reliably.
                 if (
@@ -4666,6 +4733,27 @@ async def run_orchestrator() -> None:
                                     wake_detector.reset_state()
                                 await asyncio.sleep(0)
                                 continue
+                            logger.info(
+                                "🔥 Hotword trigger detected (mode=%s, conf=%.4f, rms=%.4f, engine=%s)",
+                                "recording" if recorder_hotword_mode else "normal",
+                                wake_result.confidence,
+                                frame_rms,
+                                active_wake_engine or "unknown",
+                            )
+
+                            if recorder_hotword_mode and recorder_tool and recorder_tool.is_recording():
+                                if web_service:
+                                    web_service.note_hotword_detected()
+                                recorder_stop_hotword_armed_ts = now
+                                wake_state = WakeState.AWAKE
+                                wake_sleep_ts = None
+                                last_wake_detected_ts = now
+                                last_activity_ts = now
+                                state = VoiceState.LISTENING
+                                logger.info("🎙️ Recorder stop phrase armed by hotword; waiting for spoken stop command")
+                                await asyncio.sleep(0)
+                                continue
+
                             wake_state = WakeState.AWAKE
                             wake_sleep_ts = None
                             last_wake_detected_ts = now
@@ -5110,7 +5198,14 @@ async def run_orchestrator() -> None:
                         len(chunk_frames),
                         latency_ms,
                     )
-                    asyncio.create_task(process_chunk(pcm, cut_in_triggered_ts, chunk_start_ts))
+                    asyncio.create_task(
+                        process_chunk(
+                            pcm,
+                            cut_in_triggered_ts,
+                            chunk_start_ts,
+                            recorder_capture_mode=bool(recorder_tool and recorder_tool.is_recording()),
+                        )
+                    )
                     ring_buffer.clear()
                     chunk_frames = []
                     chunk_start_ts = None
@@ -5131,6 +5226,7 @@ async def run_orchestrator() -> None:
                 if last_wake_detected_ts is None:
                     wake_state = WakeState.ASLEEP
                     wake_sleep_ts = now
+                    recorder_stop_hotword_armed_ts = None
                     await asyncio.sleep(0)
                     continue
                 inactive_ms = int((now - last_activity_ts) * 1000)
@@ -5160,6 +5256,7 @@ async def run_orchestrator() -> None:
                         wake_state = WakeState.ASLEEP
                         wake_sleep_ts = now
                         last_wake_detected_ts = None
+                        recorder_stop_hotword_armed_ts = None
                         last_timeout_progress_log_ts = 0.0
                         if web_service:
                             if web_service._ui_control_state.get("mic_enabled", False):

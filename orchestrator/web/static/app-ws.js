@@ -125,6 +125,10 @@ function handleMsg(msg){
                 if(rev<=S.lastMusicRev) break;
                 S.lastMusicRev=rev;
             }
+            if(S._musicStateRetryTimer){
+                clearTimeout(S._musicStateRetryTimer);
+                S._musicStateRetryTimer = null;
+            }
             applyMusic(msg.music||msg);
             // Transport updates can arrive frequently (elapsed/position changes).
             // Avoid full page re-render on each tick, especially with large queues.
@@ -182,7 +186,13 @@ function handleMsg(msg){
             S.musicActionError='';
             S.musicActionErrorTs=0;
             if(String(msg.action||'')==='music_load_playlist'){
-                requestMusicStateRetry('music_load_playlist ack', 20, 750);
+                if(S._musicStateRetryTimer){
+                    clearTimeout(S._musicStateRetryTimer);
+                }
+                S._musicStateRetryTimer = setTimeout(()=>{
+                    S._musicStateRetryTimer = null;
+                    sendAction({type:'music_get_state'});
+                }, 1500);
             }
             if(S.page==='music') renderMusicPage(document.getElementById('main'));
             applyMusicHeader();
