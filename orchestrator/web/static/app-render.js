@@ -336,12 +336,16 @@ function renderRecordingsPage(main){
     +'</div>';
   }).join('');
 
+  const starting=!!S.recorderStartPending;
   main.innerHTML='<div class="max-w-5xl mx-auto px-2 py-4 space-y-3">'
     +'<div class="flex items-center justify-between gap-2 px-2 flex-wrap">'
       +'<h2 class="font-semibold text-lg">Recordings <span class="text-gray-400 font-normal text-sm ml-1">'+(S.recordings||[]).length+'</span></h2>'
-      +(selectedCount>0
-        ? '<button data-action="recordings-delete-selected" class="px-3 py-1.5 rounded-lg text-sm bg-red-800 hover:bg-red-700 transition-colors" '+(deleting?'disabled style="opacity:.6;cursor:not-allowed"':'')+'>'+(deleting?'Deleting…':'Delete Selected Recordings ('+selectedCount+')')+'</button>'
-        : '')
+      +'<div class="flex items-center gap-2">'
+        +(selectedCount>0
+          ? '<button data-action="recordings-delete-selected" class="px-3 py-1.5 rounded-lg text-sm bg-red-800 hover:bg-red-700 transition-colors" '+(deleting?'disabled style="opacity:.6;cursor:not-allowed"':'')+'>'+(deleting?'Deleting…':'Delete Selected Recordings ('+selectedCount+')')+'</button>'
+          : '')
+        +'<button data-action="recordings-start-recording" class="px-3 py-1.5 rounded-lg text-sm bg-green-700 hover:bg-green-600 transition-colors" '+(starting?'disabled style="opacity:.6;cursor:not-allowed"':'')+'>'+(starting?'Starting…':'Start Recording')+'</button>'
+      +'</div>'
     +'</div>'
     +(err?'<div class="px-2 text-xs text-red-300">⚠ '+esc(err)+'</div>':'')
     +(rows || '<div class="rounded-xl border border-gray-800 bg-gray-900/40 px-4 py-8 text-sm text-gray-400 text-center">No recordings found</div>')

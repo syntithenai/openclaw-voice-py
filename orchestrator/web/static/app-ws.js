@@ -166,6 +166,16 @@ function handleMsg(msg){
             S.recordingsActionError = String(msg.error||'Recordings action failed');
             if(S.page==='recordings') renderRecordingsPage(document.getElementById('main'));
             break;
+        case 'recorder_start_ack':
+            S.recorderStartPending = false;
+            S.recordingsActionError = '';
+            if(S.page==='recordings') renderRecordingsPage(document.getElementById('main'));
+            break;
+        case 'recorder_start_error':
+            S.recorderStartPending = false;
+            S.recordingsActionError = String(msg.error||'Failed to start recording');
+            if(S.page==='recordings') renderRecordingsPage(document.getElementById('main'));
+            break;
         case 'music_transport':
             if(msg.music_rev!==undefined){
                 const rev=Number(msg.music_rev)||0;

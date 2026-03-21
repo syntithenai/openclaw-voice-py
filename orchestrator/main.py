@@ -2278,6 +2278,11 @@ async def run_orchestrator() -> None:
                     return 0
                 return await recordings_catalog.delete_recordings(recording_ids)
 
+            async def _ui_recorder_start(client_id: str) -> dict[str, Any]:
+                if not recorder_tool:
+                    return {"success": False, "response": "Recording is not enabled on this device."}
+                return await recorder_tool.start_recording()
+
             web_service.set_action_handlers(
                 on_mic_toggle=_ui_mic_toggle,
                 on_music_toggle=_ui_music_toggle,
@@ -2297,6 +2302,7 @@ async def run_orchestrator() -> None:
                 on_recordings_list=_ui_recordings_list,
                 on_recording_get=_ui_recording_get,
                 on_recordings_delete_selected=_ui_recordings_delete_selected,
+                on_recorder_start=_ui_recorder_start,
                 on_resolve_recording_audio=recordings_catalog.resolve_audio_path,
                 on_timer_cancel=_ui_timer_cancel,
                 on_alarm_cancel=_ui_alarm_cancel,
@@ -2343,6 +2349,8 @@ async def run_orchestrator() -> None:
                 music_idle_connected = False
                 timer_tick = 0.0
                 music_queue_task: asyncio.Task | None = None
+                music_queue_pending_reason = ""
+                music_queue_pending_timeout_override: float | None = None
                 music_idle_task: asyncio.Task | None = None
 
                 def _mark_music_dirty(*subsystems: str) -> None:
@@ -2393,16 +2401,31 @@ async def run_orchestrator() -> None:
                         music_queue_tick = time.monotonic()  # Back off — prevents tight retry loop on slow playlists
 
                 def _schedule_music_queue_refresh(reason: str, timeout_override: float | None = None) -> None:
-                    nonlocal music_queue_task
+                    nonlocal music_queue_task, music_queue_pending_reason, music_queue_pending_timeout_override
                     if music_queue_task is not None and not music_queue_task.done():
+                        # Keep one follow-up refresh queued so a post-load urgent refresh
+                        # is not dropped behind an older in-flight queue fetch.
+                        if timeout_override is not None:
+                            music_queue_pending_reason = reason
+                            pending_timeout = music_queue_pending_timeout_override
+                            if pending_timeout is None or float(timeout_override) > float(pending_timeout):
+                                music_queue_pending_timeout_override = float(timeout_override)
+                        elif not music_queue_pending_reason:
+                            music_queue_pending_reason = reason
                         return
 
                     async def _runner() -> None:
-                        nonlocal music_queue_task
+                        nonlocal music_queue_task, music_queue_pending_reason, music_queue_pending_timeout_override
                         try:
                             await _refresh_music_queue(reason, timeout_override=timeout_override)
                         finally:
                             music_queue_task = None
+                            if music_queue_pending_reason:
+                                next_reason = music_queue_pending_reason
+                                next_timeout_override = music_queue_pending_timeout_override
+                                music_queue_pending_reason = ""
+                                music_queue_pending_timeout_override = None
+                                _schedule_music_queue_refresh(next_reason, timeout_override=next_timeout_override)
 
                     music_queue_task = asyncio.create_task(_runner())
 

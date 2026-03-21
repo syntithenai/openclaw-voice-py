@@ -32,7 +32,7 @@ const S = {
         recordings:[], recordingsDetail:null, recordingsDetailLoading:false,
         recordingsSelectionByIds:{}, recordingsLastCheckedId:null,
         recordingsActionError:'', recordingsActionErrorTs:0, lastRecordingsRev:0,
-        recordingsDeletePending:false,
+        recordingsDeletePending:false, recorderStartPending:false,
         timers:[], page:'home',
     audioCtx:null, mediaStream:null, processor:null, lastLevel:0,
     feedbackAudioCtx:null,

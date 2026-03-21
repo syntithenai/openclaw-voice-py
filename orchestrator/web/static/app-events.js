@@ -439,6 +439,16 @@ document.addEventListener('click', e => {
         return;
     }
 
+    const recordingsStartBtn = target.closest('[data-action="recordings-start-recording"]');
+    if (recordingsStartBtn) {
+        if(S.recorderStartPending) return;
+        S.recordingsActionError='';
+        S.recorderStartPending = true;
+        sendAction({type:'recorder_start'});
+        renderRecordingsPage(document.getElementById('main'));
+        return;
+    }
+
     const copyBlockBtn = target.closest('[data-action="recording-copy-block"]');
     if (copyBlockBtn) {
         const targetId = String(copyBlockBtn.dataset.copyTarget || '').trim();

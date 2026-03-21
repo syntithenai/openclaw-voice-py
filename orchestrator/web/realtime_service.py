@@ -157,6 +157,7 @@ class EmbeddedVoiceWebService:
         self._on_recordings_list: Callable[[str], Awaitable[list[dict[str, Any]]]] | None = None
         self._on_recording_get: Callable[[str, str], Awaitable[dict[str, Any] | None]] | None = None
         self._on_recordings_delete_selected: Callable[[list[str], str], Awaitable[int]] | None = None
+        self._on_recorder_start: Callable[[str], Awaitable[dict[str, Any]]] | None = None
         self._on_resolve_recording_audio: Callable[[str], Path | None] | None = None
         self._on_timer_cancel: Callable[[str, str], Awaitable[None]] | None = None
         self._on_alarm_cancel: Callable[[str, str], Awaitable[None]] | None = None
@@ -699,6 +700,7 @@ class EmbeddedVoiceWebService:
         on_recordings_list: Callable[[str], Awaitable[list[dict[str, Any]]]] | None = None,
         on_recording_get: Callable[[str, str], Awaitable[dict[str, Any] | None]] | None = None,
         on_recordings_delete_selected: Callable[[list[str], str], Awaitable[int]] | None = None,
+        on_recorder_start: Callable[[str], Awaitable[dict[str, Any]]] | None = None,
         on_resolve_recording_audio: Callable[[str], Path | None] | None = None,
         on_timer_cancel: Callable[[str, str], Awaitable[None]] | None = None,
         on_alarm_cancel: Callable[[str, str], Awaitable[None]] | None = None,
@@ -744,6 +746,8 @@ class EmbeddedVoiceWebService:
             self._on_recording_get = on_recording_get
         if on_recordings_delete_selected is not None:
             self._on_recordings_delete_selected = on_recordings_delete_selected
+        if on_recorder_start is not None:
+            self._on_recorder_start = on_recorder_start
         if on_resolve_recording_audio is not None:
             self._on_resolve_recording_audio = on_resolve_recording_audio
         if on_timer_cancel is not None:
@@ -1071,6 +1075,18 @@ class EmbeddedVoiceWebService:
                             "error": str(exc),
                         }
                     )
+            return
+
+        if msg_type == "recorder_start" and self._on_recorder_start:
+            try:
+                result = await self._on_recorder_start(client_id)
+                if result.get("success", True):
+                    await _send_ws_json({"type": "recorder_start_ack", "response": str(result.get("response", ""))})
+                else:
+                    await _send_ws_json({"type": "recorder_start_error", "error": str(result.get("response", "Failed to start recording"))})
+            except Exception as exc:
+                logger.warning("recorder_start handler error: %s", exc)
+                await _send_ws_json({"type": "recorder_start_error", "error": str(exc)})
             return
 
         if msg_type == "music_toggle" and self._on_music_toggle:
