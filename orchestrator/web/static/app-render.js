@@ -257,19 +257,119 @@ function renderMusicPage(main){
 function fmtDur(s){ if(!s) return '—'; const t=Math.round(Number(s)); return Math.floor(t/60)+':'+String(t%60).padStart(2,'0'); }
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
+function fmtDurationLong(seconds){
+  const safe=Math.max(0, Math.round(Number(seconds)||0));
+  const h=Math.floor(safe/3600);
+  const m=Math.floor((safe%3600)/60);
+  const s=safe%60;
+  if(h>0) return h+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');
+  return m+':'+String(s).padStart(2,'0');
+}
+
+function renderRecordingsPage(main){
+  main.dataset.page='recordings';
+  const selectedCount=Object.keys(S.recordingsSelectionByIds||{}).filter(k=>S.recordingsSelectionByIds[k]).length;
+  const detail=S.recordingsDetail;
+  const loading=!!S.recordingsDetailLoading;
+  const deleting=!!S.recordingsDeletePending;
+  const err=String(S.recordingsActionError||'').trim();
+
+  if(detail || loading){
+    const transcriptId='recordingTranscriptText';
+    const diarizationId='recordingDiarizationText';
+    const transcriptText=detail ? String(detail.transcript||'') : '';
+    const diarizationText=detail ? String(detail.diarization||'') : '';
+    main.innerHTML='<div class="max-w-5xl mx-auto px-2 py-4 space-y-3">'
+      +'<div class="flex items-center justify-between gap-2 px-2">'
+        +'<button data-action="recording-back-list" class="px-3 py-1.5 rounded-lg text-sm bg-gray-700 hover:bg-gray-600 transition-colors">Back to Recordings</button>'
+      +'</div>'
+      +(loading && !detail
+        ? '<div class="px-2 py-10 text-sm text-gray-400">Loading recording…</div>'
+        : '<div class="rounded-xl border border-gray-800 bg-gray-900/40 p-4 space-y-3">'
+          +'<div class="flex items-start justify-between gap-3 flex-wrap">'
+            +'<div>'
+              +'<h2 class="font-semibold text-lg">Recording '+esc(detail.id||'')+'</h2>'
+              +'<p class="text-sm text-gray-400">'+esc(detail.date||'')+' '+esc(detail.time||'')+' · '+esc(fmtDurationLong(detail.duration_seconds))+'</p>'
+            +'</div>'
+          +'</div>'
+          +'<audio controls class="w-full" src="'+esc(detail.audio_url||'')+'"></audio>'
+        +'</div>'
+        +'<div class="rounded-xl border border-gray-800 bg-gray-900/40">'
+          +'<div class="px-4 py-3 flex items-center justify-between gap-3">'
+            +'<span class="font-medium text-sm">Transcript</span>'
+            +'<button type="button" data-action="recording-copy-block" data-copy-target="'+transcriptId+'" class="px-2 py-1 rounded text-xs bg-gray-700 hover:bg-gray-600 transition-colors">Copy</button>'
+          +'</div>'
+          +'<pre id="'+transcriptId+'" class="px-4 pb-4 whitespace-pre-wrap text-sm text-gray-200">'+esc(transcriptText||'(empty)')+'</pre>'
+        +'</div>'
+        +'<div class="rounded-xl border border-gray-800 bg-gray-900/40">'
+          +'<div class="px-4 py-3 flex items-center justify-between gap-3">'
+            +'<span class="font-medium text-sm">Diarization</span>'
+            +'<button type="button" data-action="recording-copy-block" data-copy-target="'+diarizationId+'" class="px-2 py-1 rounded text-xs bg-gray-700 hover:bg-gray-600 transition-colors">Copy</button>'
+          +'</div>'
+          +'<pre id="'+diarizationId+'" class="px-4 pb-4 whitespace-pre-wrap text-sm text-gray-200">'+esc(diarizationText||'(empty)')+'</pre>'
+        +'</div>'
+      )
+      +(err?'<div class="px-2 text-xs text-red-300">⚠ '+esc(err)+'</div>':'')
+    +'</div>';
+    main.onscroll=()=>{ updateScrollUpButton(); };
+    updateScrollUpButton();
+    return;
+  }
+
+  const rows=(S.recordings||[]).map((item)=>{
+    const id=String(item.id||'').trim();
+    const checked=!!S.recordingsSelectionByIds[id];
+    const excerpt=String(item.excerpt||'').trim() || 'No transcript excerpt yet';
+    return '<div class="rounded-xl border border-gray-800 bg-gray-900/40 p-3 flex items-start gap-3">'
+      +'<div class="pt-1">'
+        +'<input type="checkbox" data-action="recording-select" data-recording-id="'+esc(id)+'" '+(checked?'checked':'')+' />'
+      +'</div>'
+      +'<button type="button" data-action="recording-open-detail" data-recording-id="'+esc(id)+'" class="flex-1 text-left min-w-0">'
+        +'<div class="flex items-center justify-between gap-2">'
+          +'<div class="font-medium text-sm truncate">'+esc(item.date||'')+' '+esc(item.time||'')+'</div>'
+          +'<div class="text-xs text-gray-400">'+esc(fmtDurationLong(item.duration_seconds))+'</div>'
+        +'</div>'
+        +'<p class="mt-1 text-sm text-gray-300 line-clamp-2">'+esc(excerpt)+'</p>'
+      +'</button>'
+    +'</div>';
+  }).join('');
+
+  main.innerHTML='<div class="max-w-5xl mx-auto px-2 py-4 space-y-3">'
+    +'<div class="flex items-center justify-between gap-2 px-2 flex-wrap">'
+      +'<h2 class="font-semibold text-lg">Recordings <span class="text-gray-400 font-normal text-sm ml-1">'+(S.recordings||[]).length+'</span></h2>'
+      +(selectedCount>0
+        ? '<button data-action="recordings-delete-selected" class="px-3 py-1.5 rounded-lg text-sm bg-red-800 hover:bg-red-700 transition-colors" '+(deleting?'disabled style="opacity:.6;cursor:not-allowed"':'')+'>'+(deleting?'Deleting…':'Delete Selected Recordings ('+selectedCount+')')+'</button>'
+        : '')
+    +'</div>'
+    +(err?'<div class="px-2 text-xs text-red-300">⚠ '+esc(err)+'</div>':'')
+    +(rows || '<div class="rounded-xl border border-gray-800 bg-gray-900/40 px-4 py-8 text-sm text-gray-400 text-center">No recordings found</div>')
+  +'</div>';
+
+  main.onscroll=()=>{ updateScrollUpButton(); };
+  updateScrollUpButton();
+}
+
 function wsUrl(){ return (location.protocol==='https:'?'wss':'ws')+'://'+location.hostname+':'+WS_PORT+'/ws'; }
 function sendAction(payload){ 
   if(S.ws&&S.ws.readyState===WebSocket.OPEN) {
     if(payload.type && payload.type.startsWith('music_')) console.log(`📤 Sending action:`, payload);
     S.ws.send(JSON.stringify(payload)); 
+    return true;
   } else {
     console.warn('⚠️ WebSocket not ready (state=' + (S.ws ? S.ws.readyState : 'null') + '). Dropped:', payload);
+    return false;
   }
 }
 function sendMusicAction(actionType, extraPayload={}){
     const actionId='m'+(S.nextMusicActionId++);
-    S.pendingMusicActions[actionId]={type:actionType, ts:Date.now()};
-    sendAction(Object.assign({type:actionType, action_id:actionId}, extraPayload||{}));
+  const sent=sendAction(Object.assign({type:actionType, action_id:actionId}, extraPayload||{}));
+  if(!sent){
+    recordInlineError('music','', 'Not connected - retry');
+    if(S.page==='music') renderMusicPage(document.getElementById('main'));
+    applyMusicHeader();
+    return null;
+  }
+  S.pendingMusicActions[actionId]={type:actionType, ts:Date.now()};
     if(S.page==='music') renderMusicPage(document.getElementById('main'));
     applyMusicHeader();
     return actionId;
@@ -277,17 +377,28 @@ function sendMusicAction(actionType, extraPayload={}){
 function sendTimerAction(actionType, idKey, idValue){
     const actionId='t'+(S.nextTimerActionId++);
     const pendingKey=String(actionType||'')+':'+String(idValue||'');
-    S.pendingTimerActions[pendingKey]={type:actionType, action_id:actionId, ts:Date.now()};
     const payload={type:actionType, action_id:actionId};
     payload[String(idKey||'id')]=idValue;
-    sendAction(payload);
+  const sent=sendAction(payload);
+  if(!sent){
+    recordInlineError('timer', pendingKey, 'Not connected - retry');
+    renderTimerBar();
+    return null;
+  }
+  S.pendingTimerActions[pendingKey]={type:actionType, action_id:actionId, ts:Date.now()};
     renderTimerBar();
     return actionId;
 }
 function sendSettingAction(actionType, enabled){
     const actionId='s'+(S.nextSettingActionId++);
-    S.pendingSettingActions[String(actionType)]={action_id:actionId, enabled:!!enabled, ts:Date.now()};
-    sendAction({type:String(actionType), action_id:actionId, enabled:!!enabled});
+  const key=String(actionType);
+  const sent=sendAction({type:key, action_id:actionId, enabled:!!enabled});
+  if(!sent){
+    recordInlineError('setting', key, 'Not connected - retry');
+    applyMicControlToggles();
+    return null;
+  }
+  S.pendingSettingActions[key]={action_id:actionId, enabled:!!enabled, ts:Date.now()};
     applyMicControlToggles();
     return actionId;
 }

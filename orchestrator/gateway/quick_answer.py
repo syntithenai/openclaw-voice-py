@@ -267,10 +267,8 @@ def classify_upstream_decision(
         return False, "music_local"
 
     recorder_intent = any(re.search(pattern, query) for pattern in RECORDER_INTENT_PATTERNS)
-    if recorder_enabled and recorder_intent:
-        return False, "recorder_local"
     if recorder_intent:
-        return True, "recording_action_disabled"
+        return False, "recorder_local"
 
     new_session_intent = any(re.search(pattern, query) for pattern in NEW_SESSION_INTENT_PATTERNS)
     if new_session_enabled and new_session_intent:

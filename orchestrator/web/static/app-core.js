@@ -29,6 +29,10 @@ const S = {
         musicAddSearchPending:false, musicAddPendingQuery:'',
         musicNewPlaylistName:'',
         musicPlaylistModalOpen:false, musicPlaylistModalMode:'', musicPlaylistModalName:'',
+        recordings:[], recordingsDetail:null, recordingsDetailLoading:false,
+        recordingsSelectionByIds:{}, recordingsLastCheckedId:null,
+        recordingsActionError:'', recordingsActionErrorTs:0, lastRecordingsRev:0,
+        recordingsDeletePending:false,
         timers:[], page:'home',
     audioCtx:null, mediaStream:null, processor:null, lastLevel:0,
     feedbackAudioCtx:null,
@@ -37,6 +41,7 @@ const S = {
     pendingChatSends:new Set(), nextClientMsgId:1,
     nextMusicActionId:1, pendingMusicActions:{},
     nextTimerActionId:1, pendingTimerActions:{},
+    nextRecordingsActionId:1,
     nextSettingActionId:1, pendingSettingActions:{},
     settingActionErrors:{}, timerActionErrors:{},
     musicActionError:'', musicActionErrorTs:0,
@@ -158,6 +163,7 @@ function queueOptimisticTimerFromText(text, sourceTag='user'){
 
     const id='optimistic-'+now+'-'+Math.random().toString(36).slice(2,7);
     const label=(parsed.label&&String(parsed.label).trim()) || (parsed.kind==='alarm'?'Alarm':'Timer');
+    const pendingServerAck=parsed.kind==='alarm';
     const optimisticEntry={
         id,
         kind:parsed.kind,
@@ -165,7 +171,8 @@ function queueOptimisticTimerFromText(text, sourceTag='user'){
         remaining_seconds:Number(parsed.durationSeconds)||0,
         ringing:false,
         _optimistic:true,
-        _clientAnchorTs:now/1000,
+        _pendingServerAck:pendingServerAck,
+        _clientAnchorTs:pendingServerAck?null:(now/1000),
         _clientAnchorRem:Number(parsed.durationSeconds)||0,
     };
     S.optimisticTimers[id]={
@@ -175,6 +182,7 @@ function queueOptimisticTimerFromText(text, sourceTag='user'){
         durationSeconds:parsed.durationSeconds,
         source:String(sourceTag||'user'),
         label,
+        pendingServerAck,
     };
 
     const currentTimers=Array.isArray(S.timers)?S.timers:[];
@@ -499,6 +507,7 @@ function updateScrollDownButton(){
 function getScrollUpArea(){
     if(S.page==='home') return document.getElementById('chatArea');
     if(S.page==='music') return document.getElementById('main');
+    if(S.page==='recordings') return document.getElementById('main');
     return null;
 }
 
@@ -531,7 +540,12 @@ function requestScrollToBottomBurst(){
     S.autoScrollUntilTs=Date.now()+12000;
 }
 
-function getPage(){ const h=location.hash.replace('#',''); return h==='/music'?'music':'home'; }
+function getPage(){
+    const h=location.hash.replace('#','');
+    if(h==='/music') return 'music';
+    if(h==='/recordings') return 'recordings';
+    return 'home';
+}
 function navigate(p){ location.hash='#/'+p; }
 function updateNavActiveState(){
     document.querySelectorAll('[data-nav]').forEach(el=>{

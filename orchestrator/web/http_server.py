@@ -149,6 +149,15 @@ def start_http_servers(service: Any, ssl_context: ssl.SSLContext | None) -> None
                     ).encode(),
                     content_type="application/json",
                 )
+            elif path.startswith("/recordings/audio/"):
+                audio_name = path.removeprefix("/recordings/audio/")
+                resolver = getattr(service, "resolve_recording_audio_path", None)
+                if callable(resolver):
+                    audio_path = resolver(audio_name)
+                    if isinstance(audio_path, Path) and audio_path.exists() and audio_path.is_file():
+                        self._send_file(audio_path)
+                        return
+                self._send(b"Not found", status=404, content_type="text/plain")
             elif workspace_enabled and workspace_root and self._serve_mount(path, "/files/workspace", workspace_root, workspace_list):
                 return
             elif media_enabled and media_root and self._serve_mount(path, "/files/media", media_root, media_list):

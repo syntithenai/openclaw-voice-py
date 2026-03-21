@@ -55,6 +55,7 @@ from orchestrator.gateway.message_extract import (
     strip_gateway_control_markers,
 )
 from orchestrator.tts.piper_client import PiperClient
+from orchestrator.tts_policy import tts_start_gate_block_reason
 from orchestrator.tts.text_progress import estimate_spoken_prefix, strip_spoken_prefix
 from orchestrator.audio.playback import AudioPlayback
 from orchestrator.audio.webrtc_aec import WebRTCAEC
@@ -1030,6 +1031,7 @@ async def run_orchestrator() -> None:
 
     # Embedded realtime web UI service handle (initialized later)
     web_service = None
+    recordings_catalog = None
 
     # Media Key Detector (optional - works without music system, but won't control music)
     media_key_detector = None
@@ -1814,6 +1816,17 @@ async def run_orchestrator() -> None:
         logger.info("→ Starting Embedded Voice Web UI service")
         try:
             from orchestrator.web import EmbeddedVoiceWebService
+            from orchestrator.web.recordings_catalog import RecordingsCatalog
+
+            def _on_recordings_changed(rows: list[dict[str, Any]]) -> None:
+                if web_service:
+                    web_service.update_recordings_state(rows)
+
+            recordings_catalog = RecordingsCatalog(
+                workspace_root / config.recorder_output_dir,
+                on_change=_on_recordings_changed,
+            )
+            await recordings_catalog.start()
 
             web_service = EmbeddedVoiceWebService(
                 host=config.web_ui_host,
@@ -1828,8 +1841,17 @@ async def run_orchestrator() -> None:
                 ssl_keyfile=config.web_ui_ssl_keyfile,
                 http_redirect_port=config.web_ui_http_redirect_port,
                 chat_persist_path=config.web_ui_chat_persist_path,
+                static_root=config.web_ui_static_root,
+                workspace_files_enabled=config.web_ui_workspace_files_enabled,
+                workspace_files_root=config.web_ui_workspace_files_root,
+                workspace_files_allow_listing=config.web_ui_workspace_files_allow_listing,
+                media_files_enabled=config.web_ui_media_files_enabled,
+                media_files_root=config.web_ui_media_files_root,
+                media_files_allow_listing=config.web_ui_media_files_allow_listing,
+                openclaw_workspace_root=str(workspace_root),
             )
             await web_service.start()
+            web_service.update_recordings_state(recordings_catalog.list_recordings())
             web_service.update_orchestrator_status(
                 voice_state=state.value,
                 wake_state=wake_state.value,
@@ -2191,6 +2213,21 @@ async def run_orchestrator() -> None:
                     debounce_task.cancel()
                 debounce_task = asyncio.create_task(send_debounced_transcripts(immediate=True))
 
+            async def _ui_recordings_list(client_id: str) -> list[dict[str, Any]]:
+                if not recordings_catalog:
+                    return []
+                return recordings_catalog.list_recordings()
+
+            async def _ui_recording_get(recording_id: str, client_id: str) -> dict[str, Any] | None:
+                if not recordings_catalog:
+                    return None
+                return recordings_catalog.get_recording_detail(recording_id)
+
+            async def _ui_recordings_delete_selected(recording_ids: list[str], client_id: str) -> int:
+                if not recordings_catalog:
+                    return 0
+                return await recordings_catalog.delete_recordings(recording_ids)
+
             web_service.set_action_handlers(
                 on_mic_toggle=_ui_mic_toggle,
                 on_music_toggle=_ui_music_toggle,
@@ -2207,6 +2244,10 @@ async def run_orchestrator() -> None:
                 on_music_search_library=_ui_music_search_library,
                 on_music_list_playlists=_ui_music_list_playlists,
                 on_get_music_state=_ui_get_music_state_snapshot,
+                on_recordings_list=_ui_recordings_list,
+                on_recording_get=_ui_recording_get,
+                on_recordings_delete_selected=_ui_recordings_delete_selected,
+                on_resolve_recording_audio=recordings_catalog.resolve_audio_path,
                 on_timer_cancel=_ui_timer_cancel,
                 on_alarm_cancel=_ui_alarm_cancel,
                 on_chat_new=_ui_chat_new,
@@ -2457,25 +2498,6 @@ async def run_orchestrator() -> None:
                 return item
             tts_queue_event.clear()
             await tts_queue_event.wait()
-
-    def _tts_start_gate_block_reason(now_ts: float, item_request_id: int = 0) -> str | None:
-        if cut_in_tts_hold_active:
-            return "cut_in_hold"
-        if tts_playing:
-            return "tts_playing"
-        # Continuation sentences (same request as last completed TTS item) should not be
-        # gated on listening_state or speech_recent — those checks are only meaningful for
-        # the very first sentence of a new request (preventing TTS diving in mid-speech).
-        is_continuation = item_request_id > 0 and item_request_id == tts_last_played_request_id
-        if not is_continuation:
-            if state == VoiceState.LISTENING:
-                return "listening_state"
-            if last_speech_ts is not None:
-                silence_ms = int((now_ts - last_speech_ts) * 1000)
-                required_silence = max(350, config.vad_min_silence_ms // 2)
-                if silence_ms < required_silence:
-                    return f"speech_recent:{silence_ms}ms"
-        return None
 
     def clean_text_for_tts(text: str) -> str:
         """Remove punctuation and icon symbols that should not be spoken by TTS.
@@ -3346,6 +3368,26 @@ async def run_orchestrator() -> None:
                 last_wake_detected_ts = None
                 recorder_stop_hotword_armed_ts = None
                 return
+
+            start_recording_intent = bool(
+                re.search(r"\b(start|begin)\s+(the\s+)?record(ing)?\b", canonical_transcript)
+                or re.search(r"\brecorder\s+on\b", canonical_transcript)
+            )
+            if start_recording_intent:
+                if recorder_tool:
+                    start_result = await recorder_tool.start_recording()
+                    spoken = str(start_result.get("response", "")).strip()
+                    if spoken:
+                        await submit_tts(spoken, request_id=current_request_id, kind="notification")
+                    logger.info("🎙️ Recorder start phrase handled locally before gateway routing")
+                else:
+                    await submit_tts(
+                        "Recording is not enabled on this device.",
+                        request_id=current_request_id,
+                        kind="notification",
+                    )
+                    logger.info("🎙️ Recorder start phrase handled locally (recorder disabled)")
+                return
             
             # Emotion detection phase
             emotion_tag = ""
@@ -3408,8 +3450,8 @@ async def run_orchestrator() -> None:
                 logger.info("🚫 Dropped stale reply before playback [req#%d < current#%d]", request_id, current_request_id)
                 continue
 
-            if web_service and bool(web_service._ui_control_state.get("tts_muted", False)):
-                logger.info("🔇 TTS muted by UI; skipping playback for req#%d", request_id)
+            if web_service and bool(web_service._ui_control_state.get("tts_muted", False)) and item.kind == "reply":
+                logger.info("🔇 Reply TTS muted by UI; skipping playback for req#%d", request_id)
                 continue
 
             while True:
@@ -3418,7 +3460,18 @@ async def run_orchestrator() -> None:
                     logger.info("🚫 Dropped stale reply during gate wait [req#%d < current#%d]", request_id, current_request_id)
                     text = ""
                     break
-                blocked_reason = _tts_start_gate_block_reason(now_ts, request_id)
+                blocked_reason = tts_start_gate_block_reason(
+                    item_kind=item.kind,
+                    now_ts=now_ts,
+                    cut_in_tts_hold_active=cut_in_tts_hold_active,
+                    tts_playing=tts_playing,
+                    item_request_id=request_id,
+                    tts_last_played_request_id=tts_last_played_request_id,
+                    state=state,
+                    listening_state=VoiceState.LISTENING,
+                    last_speech_ts=last_speech_ts,
+                    vad_min_silence_ms=config.vad_min_silence_ms,
+                )
                 if blocked_reason is None:
                     break
                 await asyncio.sleep(0.08)
@@ -3910,11 +3963,6 @@ async def run_orchestrator() -> None:
             while recording_blocks_tools:
                 await asyncio.sleep(0.2)
             logger.info("⏰ ALARM TRIGGERED: %s (%s)", name or alarm_id, alarm_id)
-            # Announce alarm
-            if name:
-                await submit_tts(f"Alarm {name}", kind="notification")
-            else:
-                await submit_tts("Alarm", kind="notification")
         
         async def on_alarm_ringing(alarm_id: str, name: str):
             """Called repeatedly while alarm is ringing (every few seconds)."""
@@ -5343,6 +5391,9 @@ async def run_orchestrator() -> None:
     finally:
         if 'local_capture_paused_for_browser' in locals() and local_capture_paused_for_browser and hasattr(capture, "set_muted"):
             capture.set_muted(local_capture_prev_muted)
+        if recordings_catalog:
+            logger.info("Stopping recordings catalog...")
+            await recordings_catalog.stop()
         if web_service:
             logger.info("Stopping embedded web UI service...")
             await web_service.stop()

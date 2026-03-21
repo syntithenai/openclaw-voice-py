@@ -125,6 +125,8 @@ class EmbeddedVoiceWebService:
         self._music_playlists_cache: list[str] = []
         self._music_rev: int = 0
         self._music_state_push_task: asyncio.Task | None = None
+        self._recordings: list[dict[str, Any]] = []
+        self._recordings_rev: int = 0
         self._timers_state: list[dict[str, Any]] = []
         self._timers_rev: int = 0
         self._ui_control_state: dict[str, Any] = {
@@ -140,6 +142,7 @@ class EmbeddedVoiceWebService:
         self._on_music_stop: Callable[[str], Awaitable[None]] | None = None
         self._on_music_play_track: Callable[[int, str], Awaitable[None]] | None = None
         self._on_music_seek: Callable[[float, str], Awaitable[None]] | None = None
+        self._on_music_clear_queue: Callable[[str], Awaitable[None]] | None = None
         self._on_music_remove_selected: Callable[[list[int], str, list[str] | None], Awaitable[None]] | None = None
         self._on_music_add_files: Callable[[list[str], str], Awaitable[None]] | None = None
         self._on_music_create_playlist: Callable[[str, list[int], str], Awaitable[None]] | None = None
@@ -149,6 +152,10 @@ class EmbeddedVoiceWebService:
         self._on_music_search_library: Callable[[str, str], Awaitable[list[dict[str, Any]]]] | None = None
         self._on_music_list_playlists: Callable[[str], Awaitable[list[str]]] | None = None
         self._on_get_music_state: Callable[[], Awaitable[tuple[dict[str, Any], list[dict[str, Any]]]]] | None = None
+        self._on_recordings_list: Callable[[str], Awaitable[list[dict[str, Any]]]] | None = None
+        self._on_recording_get: Callable[[str, str], Awaitable[dict[str, Any] | None]] | None = None
+        self._on_recordings_delete_selected: Callable[[list[str], str], Awaitable[int]] | None = None
+        self._on_resolve_recording_audio: Callable[[str], Path | None] | None = None
         self._on_timer_cancel: Callable[[str, str], Awaitable[None]] | None = None
         self._on_alarm_cancel: Callable[[str, str], Awaitable[None]] | None = None
         self._on_chat_new: Callable[[str], Awaitable[None]] | None = None
@@ -562,6 +569,19 @@ class EmbeddedVoiceWebService:
             )
         )
 
+    def update_recordings_state(self, recordings: list[dict[str, Any]]) -> None:
+        self._recordings = [dict(item) for item in recordings or []]
+        self._recordings_rev += 1
+        asyncio.create_task(
+            self.broadcast(
+                {
+                    "type": "recordings_state",
+                    "recordings_rev": self._recordings_rev,
+                    "recordings": list(self._recordings),
+                }
+            )
+        )
+
     def update_music_state(self, queue: list[dict[str, Any]] | None = None, **state: Any) -> None:
         self._music_state.update(state)
         if queue is not None:
@@ -613,12 +633,20 @@ class EmbeddedVoiceWebService:
 
     def navigate_ui_page(self, page: str) -> None:
         page_name = str(page or "").strip().lower()
-        if page_name not in ("home", "music"):
+        if page_name not in ("home", "music", "recordings"):
             return
         asyncio.create_task(self.broadcast({
             "type": "navigate",
             "page": page_name,
         }))
+
+    def resolve_recording_audio_path(self, audio_filename: str) -> Path | None:
+        if self._on_resolve_recording_audio is None:
+            return None
+        try:
+            return self._on_resolve_recording_audio(str(audio_filename or ""))
+        except Exception:
+            return None
 
     def has_active_client(self) -> bool:
         return self._active_client is not None and self._active_client in self._clients
@@ -666,6 +694,10 @@ class EmbeddedVoiceWebService:
         on_music_search_library: Callable[[str, str], Awaitable[list[dict[str, Any]]]] | None = None,
         on_music_list_playlists: Callable[[str], Awaitable[list[str]]] | None = None,
         on_get_music_state: Callable[[], Awaitable[tuple[dict[str, Any], list[dict[str, Any]]]]] | None = None,
+        on_recordings_list: Callable[[str], Awaitable[list[dict[str, Any]]]] | None = None,
+        on_recording_get: Callable[[str, str], Awaitable[dict[str, Any] | None]] | None = None,
+        on_recordings_delete_selected: Callable[[list[str], str], Awaitable[int]] | None = None,
+        on_resolve_recording_audio: Callable[[str], Path | None] | None = None,
         on_timer_cancel: Callable[[str, str], Awaitable[None]] | None = None,
         on_alarm_cancel: Callable[[str, str], Awaitable[None]] | None = None,
         on_chat_new: Callable[[str], Awaitable[None]] | None = None,
@@ -704,6 +736,14 @@ class EmbeddedVoiceWebService:
             self._on_music_list_playlists = on_music_list_playlists
         if on_get_music_state is not None:
             self._on_get_music_state = on_get_music_state
+        if on_recordings_list is not None:
+            self._on_recordings_list = on_recordings_list
+        if on_recording_get is not None:
+            self._on_recording_get = on_recording_get
+        if on_recordings_delete_selected is not None:
+            self._on_recordings_delete_selected = on_recordings_delete_selected
+        if on_resolve_recording_audio is not None:
+            self._on_resolve_recording_audio = on_resolve_recording_audio
         if on_timer_cancel is not None:
             self._on_timer_cancel = on_timer_cancel
         if on_alarm_cancel is not None:
@@ -773,6 +813,12 @@ class EmbeddedVoiceWebService:
                     self._music_state.update(transport)
                     self._music_queue = list(queue)
                     self._music_rev += 1
+                except Exception:
+                    pass
+            if self._on_recordings_list and not self._recordings:
+                try:
+                    self._recordings = list(await self._on_recordings_list(client_id))
+                    self._recordings_rev += 1
                 except Exception:
                     pass
             await websocket.send(json.dumps(self._build_state_snapshot()))
@@ -943,6 +989,73 @@ class EmbeddedVoiceWebService:
 
         if msg_type == "music_get_state" and self._on_get_music_state:
             _schedule_music_state_push("music_get_state")
+            return
+
+        if msg_type == "recordings_list" and self._on_recordings_list:
+            try:
+                rows = await self._on_recordings_list(client_id)
+                self._recordings = list(rows or [])
+                self._recordings_rev += 1
+                await _send_ws_json(
+                    {
+                        "type": "recordings_state",
+                        "recordings_rev": self._recordings_rev,
+                        "recordings": list(self._recordings),
+                    }
+                )
+            except Exception as exc:
+                logger.warning("recordings_list handler error: %s", exc)
+            return
+
+        if msg_type == "recording_get" and self._on_recording_get:
+            recording_id = str(payload.get("recording_id", "")).strip()
+            try:
+                row = await self._on_recording_get(recording_id, client_id)
+                await _send_ws_json(
+                    {
+                        "type": "recording_detail",
+                        "recording_id": recording_id,
+                        "recording": row,
+                    }
+                )
+            except Exception as exc:
+                logger.warning("recording_get handler error: %s", exc)
+                await _send_ws_json(
+                    {
+                        "type": "recording_detail",
+                        "recording_id": recording_id,
+                        "recording": None,
+                        "error": str(exc),
+                    }
+                )
+            return
+
+        if msg_type == "recordings_delete_selected" and self._on_recordings_delete_selected:
+            action_id = payload.get("action_id")
+            recording_ids = payload.get("recording_ids")
+            ids = [str(item).strip() for item in (recording_ids or []) if str(item).strip()]
+            try:
+                deleted_count = await self._on_recordings_delete_selected(ids, client_id)
+                if action_id:
+                    await _send_ws_json(
+                        {
+                            "type": "recordings_action_ack",
+                            "action": "recordings_delete_selected",
+                            "action_id": str(action_id),
+                            "deleted_count": int(deleted_count),
+                        }
+                    )
+            except Exception as exc:
+                logger.warning("recordings_delete_selected handler error: %s", exc)
+                if action_id:
+                    await _send_ws_json(
+                        {
+                            "type": "recordings_action_error",
+                            "action": "recordings_delete_selected",
+                            "action_id": str(action_id),
+                            "error": str(exc),
+                        }
+                    )
             return
 
         if msg_type == "music_toggle" and self._on_music_toggle:
@@ -1470,6 +1583,8 @@ class EmbeddedVoiceWebService:
             "music": dict(self._music_state),
             "music_queue": list(self._music_queue),
             "music_rev": self._music_rev,
+            "recordings": list(self._recordings),
+            "recordings_rev": self._recordings_rev,
             "timers": list(self._timers_state),
             "timers_rev": self._timers_rev,
             "chat": list(self._chat_messages[-50:]),

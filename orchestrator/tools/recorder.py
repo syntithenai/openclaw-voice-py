@@ -281,7 +281,6 @@ class RecorderTool:
         bytes_per_second = max(1, int(self.sample_rate) * 2)
         duration_s = float(len(pcm)) / float(bytes_per_second)
         transcript_path.write_text("", encoding="utf-8")
-        diarization_path.write_text("", encoding="utf-8")
 
         self._schedule_postprocess(
             wav_bytes=wav_bytes,
@@ -292,10 +291,10 @@ class RecorderTool:
 
         response = (
             f"Finished recording {_format_spoken_duration(duration_s)} of audio. "
-            f"Created files: {audio_path.name}, {transcript_path.name}, {diarization_path.name}."
+            f"Created files: {audio_path.name}, {transcript_path.name}."
         )
         logger.info(
-            "Recorder stopped: audio=%s transcript=%s diarization=%s duration=%s (post-processing queued)",
+            "Recorder stopped: audio=%s transcript=%s diarization_target=%s duration=%s (post-processing queued)",
             audio_path,
             transcript_path,
             diarization_path,
@@ -339,6 +338,7 @@ class RecorderTool:
         transcript_text = ""
         transcript_segments: list[WhisperTranscriptSegment] = []
         diarization_rows: list[dict[str, Any]] = []
+        diarization_error = ""
 
         try:
             transcript_result = await asyncio.to_thread(self.whisper_client.transcribe_detailed, wav_bytes)
@@ -348,23 +348,33 @@ class RecorderTool:
             logger.warning("Recorder whisper transcription failed: %s", exc)
 
         try:
-            diarization_rows, _diarization_err = await asyncio.to_thread(self._run_pyannote, audio_path)
+            diarization_rows, diarization_error = await asyncio.to_thread(self._run_pyannote, audio_path)
         except Exception as exc:
             diarization_rows = []
             logger.warning("Recorder diarization post-process failed: %s", exc)
+            diarization_error = str(exc)
 
         transcript_path.write_text((transcript_text or "").strip(), encoding="utf-8")
-        diarization_path.write_text(
-            self._format_diarization_text(
-                diarization_rows=diarization_rows,
-                transcript_segments=transcript_segments,
-            ),
-            encoding="utf-8",
+
+        diarization_text = self._format_diarization_text(
+            diarization_rows=diarization_rows,
+            transcript_segments=transcript_segments,
         )
+        if diarization_text.strip():
+            diarization_path.write_text(diarization_text, encoding="utf-8")
+        else:
+            try:
+                if diarization_path.exists():
+                    diarization_path.unlink()
+            except Exception:
+                pass
+
         logger.info(
-            "Recorder post-processing complete: transcript=%s diarization=%s",
+            "Recorder post-processing complete: transcript=%s diarization=%s diarization_available=%s diarization_error=%s",
             transcript_path,
             diarization_path,
+            bool(diarization_text.strip()),
+            bool(diarization_error),
         )
 
     def _run_pyannote(self, audio_path: Path) -> tuple[list[dict[str, Any]], str]:

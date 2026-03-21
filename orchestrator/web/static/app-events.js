@@ -378,6 +378,76 @@ document.addEventListener('click', e => {
     if (musicToggle && !musicToggle.disabled) {
         const isCurrentlyPlaying = normalizeMusicState(S.music.state) === 'play';
         sendMusicAction(isCurrentlyPlaying ? 'music_stop' : 'music_toggle');
+        return;
+    }
+
+    const recordingBackBtn = target.closest('[data-action="recording-back-list"]');
+    if (recordingBackBtn) {
+        S.recordingsDetail = null;
+        S.recordingsDetailLoading = false;
+        renderRecordingsPage(document.getElementById('main'));
+        return;
+    }
+
+    const recordingOpenBtn = target.closest('[data-action="recording-open-detail"]');
+    if (recordingOpenBtn) {
+        const recordingId = String(recordingOpenBtn.dataset.recordingId || '').trim();
+        if(!recordingId) return;
+        S.recordingsActionError='';
+        S.recordingsDetail = null;
+        S.recordingsDetailLoading = true;
+        sendAction({type:'recording_get', recording_id: recordingId});
+        renderRecordingsPage(document.getElementById('main'));
+        return;
+    }
+
+    const recordingCb = target.closest('[data-action="recording-select"]');
+    if (recordingCb) {
+        const recordingId = String(recordingCb.dataset.recordingId || '').trim();
+        if(!recordingId) return;
+        const checked = !!recordingCb.checked;
+        if (e.shiftKey && S.recordingsLastCheckedId) {
+            const boxes=[...document.querySelectorAll('[data-action="recording-select"]')];
+            const ids=boxes.map(x=>String(x.dataset.recordingId||'').trim());
+            const a=ids.indexOf(String(S.recordingsLastCheckedId));
+            const b=ids.indexOf(recordingId);
+            if(a>=0 && b>=0){
+                const lo=Math.min(a,b), hi=Math.max(a,b);
+                for(let i=lo;i<=hi;i++){ const id=ids[i]; if(id) S.recordingsSelectionByIds[id]=checked; }
+            } else {
+                S.recordingsSelectionByIds[recordingId]=checked;
+            }
+        } else {
+            S.recordingsSelectionByIds[recordingId]=checked;
+        }
+        S.recordingsLastCheckedId=recordingId;
+        if(!checked) delete S.recordingsSelectionByIds[recordingId];
+        renderRecordingsPage(document.getElementById('main'));
+        return;
+    }
+
+    const recordingsDeleteBtn = target.closest('[data-action="recordings-delete-selected"]');
+    if (recordingsDeleteBtn) {
+        if(S.recordingsDeletePending) return;
+        const recordingIds = Object.keys(S.recordingsSelectionByIds||{}).filter(k=>S.recordingsSelectionByIds[k]);
+        if(!recordingIds.length) return;
+        const actionId='r'+(S.nextRecordingsActionId++);
+        S.recordingsActionError='';
+        S.recordingsDeletePending = true;
+        sendAction({type:'recordings_delete_selected', action_id: actionId, recording_ids: recordingIds});
+        renderRecordingsPage(document.getElementById('main'));
+        return;
+    }
+
+    const copyBlockBtn = target.closest('[data-action="recording-copy-block"]');
+    if (copyBlockBtn) {
+        const targetId = String(copyBlockBtn.dataset.copyTarget || '').trim();
+        if(!targetId) return;
+        const node = document.getElementById(targetId);
+        if(!node) return;
+        const text = String(node.textContent || '');
+        if(!text) return;
+        navigator.clipboard.writeText(text).catch(()=>{});
     }
 });
 
@@ -593,6 +663,11 @@ function renderPage(){
     if(S.page==='music'){
         renderMusicPage(main);
         sendAction({type:'music_list_playlists'});
+    } else if(S.page==='recordings'){
+        renderRecordingsPage(main);
+        if(!Array.isArray(S.recordings) || S.recordings.length===0){
+            sendAction({type:'recordings_list'});
+        }
     } else {
         renderHomePage(main);
     }

@@ -36,6 +36,16 @@ function handleMsg(msg){
     }
     if(Array.isArray(msg.music_playlists)) S.musicPlaylists = msg.music_playlists;
     if(msg.music_rev!==undefined) S.lastMusicRev=Math.max(S.lastMusicRev, Number(msg.music_rev)||0);
+    if(Array.isArray(msg.recordings)){
+        S.recordings = msg.recordings;
+        const alive = new Set((S.recordings||[]).map(item=>String((item&&item.id)||'')));
+        Object.keys(S.recordingsSelectionByIds||{}).forEach((id)=>{ if(!alive.has(id)) delete S.recordingsSelectionByIds[id]; });
+        if(S.recordingsDetail && !alive.has(String((S.recordingsDetail&&S.recordingsDetail.id)||''))){
+            S.recordingsDetail = null;
+            S.recordingsDetailLoading = false;
+        }
+    }
+    if(msg.recordings_rev!==undefined) S.lastRecordingsRev=Math.max(S.lastRecordingsRev, Number(msg.recordings_rev)||0);
     if(Array.isArray(msg.timers)) applyTimers(msg.timers);
     if(msg.timers_rev!==undefined) S.lastTimersRev=Math.max(S.lastTimersRev, Number(msg.timers_rev)||0);
             applyServerChatState(msg.chat, msg.chat_threads, msg.active_chat_id);
@@ -115,9 +125,46 @@ function handleMsg(msg){
             if(S.page==='home') updateChatComposerState();
             break;
         case 'navigate':
-            if(msg.page==='music' || msg.page==='home'){
+            if(msg.page==='music' || msg.page==='home' || msg.page==='recordings'){
                 navigate(msg.page);
             }
+            break;
+        case 'recordings_state':
+            if(msg.recordings_rev!==undefined){
+                const rev=Number(msg.recordings_rev)||0;
+                if(rev<=S.lastRecordingsRev) break;
+                S.lastRecordingsRev=rev;
+            }
+            if(Array.isArray(msg.recordings)){
+                S.recordings = msg.recordings;
+                const alive = new Set((S.recordings||[]).map(item=>String((item&&item.id)||'')));
+                Object.keys(S.recordingsSelectionByIds||{}).forEach((id)=>{ if(!alive.has(id)) delete S.recordingsSelectionByIds[id]; });
+                if(S.recordingsDetail && !alive.has(String((S.recordingsDetail&&S.recordingsDetail.id)||''))){
+                    S.recordingsDetail = null;
+                    S.recordingsDetailLoading = false;
+                }
+            }
+            if(S.page==='recordings') renderRecordingsPage(document.getElementById('main'));
+            break;
+        case 'recording_detail':
+            S.recordingsDetailLoading = false;
+            if(msg.error){
+                S.recordingsActionError = String(msg.error||'Failed to load recording');
+            } else {
+                S.recordingsActionError = '';
+                S.recordingsDetail = msg.recording || null;
+            }
+            if(S.page==='recordings') renderRecordingsPage(document.getElementById('main'));
+            break;
+        case 'recordings_action_ack':
+            S.recordingsDeletePending = false;
+            S.recordingsActionError = '';
+            if(S.page==='recordings') renderRecordingsPage(document.getElementById('main'));
+            break;
+        case 'recordings_action_error':
+            S.recordingsDeletePending = false;
+            S.recordingsActionError = String(msg.error||'Recordings action failed');
+            if(S.page==='recordings') renderRecordingsPage(document.getElementById('main'));
             break;
         case 'music_transport':
             if(msg.music_rev!==undefined){
@@ -416,9 +463,12 @@ function applyTimers(t){
     Object.keys(optimistic).forEach((id)=>{
         const it=optimistic[id];
         if(!it) return;
+        const pendingServerAck=!!it.pendingServerAck;
         const ageSec=Math.max(0, (Date.now()-Number(it.createdAtMs||Date.now()))/1000);
-        const expectedRem=Math.max(0, Number(it.durationSeconds||0)-ageSec);
-        if(expectedRem<=0 || ageSec>20){
+        const expectedRem=pendingServerAck
+            ? Math.max(0, Number(it.durationSeconds)||0)
+            : Math.max(0, Number(it.durationSeconds||0)-ageSec);
+        if((!pendingServerAck && expectedRem<=0) || ageSec>20){
             delete S.optimisticTimers[id];
             return;
         }
@@ -439,7 +489,8 @@ function applyTimers(t){
             remaining_seconds:expectedRem,
             ringing:false,
             _optimistic:true,
-            _clientAnchorTs:now,
+            _pendingServerAck:pendingServerAck,
+            _clientAnchorTs:pendingServerAck?null:now,
             _clientAnchorRem:expectedRem,
         });
     });
@@ -612,7 +663,7 @@ loadUiPrefs();
 hydrateChatCache();
 S.page=getPage(); renderPage(); updateNavActiveState(); applyMicState(); applyMicControlToggles(); updateWsDebugBanner(); updateMicInteractivity(); connectWs();
 setupServerRefreshWatcher();
-setInterval(()=>{ expirePendingActions(); applyTopMusicProgress(); if(!S.timers.length) return; const now=Date.now()/1000; S.timers.forEach(t=>{ if(t._clientAnchorTs===undefined){ t._clientAnchorTs=now; t._clientAnchorRem=t.remaining_seconds; } t.remaining_seconds=Math.max(0, t._clientAnchorRem-(now-t._clientAnchorTs)); }); renderTimerBar(); },500);
+setInterval(()=>{ expirePendingActions(); applyTopMusicProgress(); if(!S.timers.length) return; const now=Date.now()/1000; S.timers.forEach(t=>{ if(t&&t._pendingServerAck) return; if(t._clientAnchorTs===undefined||t._clientAnchorTs===null){ t._clientAnchorTs=now; t._clientAnchorRem=t.remaining_seconds; } t.remaining_seconds=Math.max(0, t._clientAnchorRem-(now-t._clientAnchorTs)); }); renderTimerBar(); },500);
 startBrowserCapture().catch((err)=>{
     reportCaptureFailure(err,'startup');
 });
