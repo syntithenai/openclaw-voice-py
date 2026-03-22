@@ -38,3 +38,5 @@ docker/pyannote-models/speaker-diarization-3.1/
 docker/pyannote-models/hub/
 
 docker/pyannote-models/xet/
+.media/library.sqlite3
+.media/library.sqlite3-journal
