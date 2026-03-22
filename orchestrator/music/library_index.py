@@ -590,9 +590,16 @@ class LibraryIndex:
         return self._run_with_recovery("checking rebuild marker", _detect)
     
     def cleanup_incomplete_rebuild(self) -> None:
-        """Remove incomplete rebuild marker to allow fresh scan on next update."""
+        """Remove incomplete rebuild marker and clear directory cache so the next
+        incremental scan re-visits every directory.  Track records that were already
+        committed are kept – their mtime/size fingerprints prevent redundant ffprobe
+        calls, so the resumed scan is still fast."""
         def _cleanup() -> None:
-            self._conn.execute("DELETE FROM directories WHERE path = ?", ("__rebuild_in_progress__",))
+            # Remove ALL directory entries (including the in-progress marker).
+            # This forces the incremental scan to treat every directory as new and
+            # re-scan it, picking up files that were not yet processed when the
+            # rebuild was interrupted.
+            self._conn.execute("DELETE FROM directories")
             self._conn.commit()
 
         self._run_with_recovery("cleaning rebuild marker", _cleanup)

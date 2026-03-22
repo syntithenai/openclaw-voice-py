@@ -6,7 +6,7 @@ import mimetypes
 from pathlib import Path
 import ssl
 import threading
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
@@ -20,6 +20,20 @@ def start_http_servers(service: Any, ssl_context: ssl.SSLContext | None) -> None
 
         def _parse_request_path(self) -> str:
             return unquote(urlsplit(self.path).path or "/")
+
+        def _parse_query_params(self) -> dict[str, list[str]]:
+            return parse_qs(urlsplit(self.path).query or "")
+
+        def _request_is_https(self) -> bool:
+            return ssl_context is not None
+
+        def _request_host(self) -> str:
+            raw_host = str(self.headers.get("Host", "") or "").strip()
+            if raw_host:
+                return raw_host
+            if service.ui_port in (80, 443):
+                return str(service.host)
+            return f"{service.host}:{service.ui_port}"
 
         def _safe_join(self, root: Path, relative: str) -> Path | None:
             rel = relative.lstrip("/")
@@ -67,11 +81,15 @@ def start_http_servers(service: Any, ssl_context: ssl.SSLContext | None) -> None
             self._send(data, content_type=content_type or "application/octet-stream")
 
         def _render_ui_index(self) -> bytes:
+            auth_bootstrap = service.auth_bootstrap_from_headers(self.headers)
             template_values = {
                 "__WS_PORT__": str(service.ws_port),
                 "__MIC_STARTS_DISABLED__": "true" if service.mic_starts_disabled else "false",
                 "__AUDIO_AUTHORITY__": str(service.audio_authority),
                 "__SERVER_INSTANCE_ID__": str(service._instance_id),
+                "__AUTH_MODE__": str(auth_bootstrap.get("mode", "disabled")),
+                "__AUTHENTICATED__": "true" if auth_bootstrap.get("authenticated") else "false",
+                "__AUTH_USER_JSON__": json.dumps(auth_bootstrap.get("user"), separators=(",", ":")),
             }
             static_root = Path(getattr(service, "static_root", Path(__file__).resolve().parent / "static")).resolve()
             index_path = static_root / "index.html"
@@ -107,7 +125,13 @@ def start_http_servers(service: Any, ssl_context: ssl.SSLContext | None) -> None
             self._send(b"Not found", status=404, content_type="text/plain")
             return True
 
-        def _send(self, body: bytes, status: int = 200, content_type: str = "text/html; charset=utf-8") -> None:
+        def _send(
+            self,
+            body: bytes,
+            status: int = 200,
+            content_type: str = "text/html; charset=utf-8",
+            extra_headers: list[tuple[str, str]] | None = None,
+        ) -> None:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
@@ -116,38 +140,143 @@ def start_http_servers(service: Any, ssl_context: ssl.SSLContext | None) -> None
             self.send_header("Expires", "0")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Headers", "*")
-            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            for key, value in (extra_headers or []):
+                self.send_header(key, value)
             self.end_headers()
             self.wfile.write(body)
+
+        def _send_json(
+            self,
+            payload: dict[str, Any],
+            status: int = 200,
+            extra_headers: list[tuple[str, str]] | None = None,
+        ) -> None:
+            self._send(
+                json.dumps(payload).encode("utf-8"),
+                status=status,
+                content_type="application/json",
+                extra_headers=extra_headers,
+            )
+
+        def _send_redirect(
+            self,
+            location: str,
+            status: int = 303,
+            extra_headers: list[tuple[str, str]] | None = None,
+        ) -> None:
+            headers = [("Location", location)] + (extra_headers or [])
+            self._send(b"", status=status, content_type="text/plain", extra_headers=headers)
+
+        def _is_authenticated(self) -> bool:
+            session = service.session_user_from_headers(self.headers)
+            return session is not None
+
+        def _handle_auth_get(self, path: str, query: dict[str, list[str]]) -> bool:
+            if path == "/auth/session":
+                self._send_json(service.auth_bootstrap_from_headers(self.headers))
+                return True
+
+            if path == "/auth/google/login":
+                if not service.auth_enabled():
+                    self._send_json({"error": "web ui auth is disabled"}, status=404)
+                    return True
+                if not service.oauth_ready():
+                    self._send_json({"error": "google oauth not configured"}, status=503)
+                    return True
+                next_path = str((query.get("next") or ["/"])[0] or "/")
+                auth_url = service.begin_google_login(
+                    request_host=self._request_host(),
+                    request_is_https=self._request_is_https(),
+                    next_path=next_path,
+                )
+                if not auth_url:
+                    self._send_json({"error": "google oauth login unavailable"}, status=503)
+                    return True
+                self._send_redirect(auth_url, status=302)
+                return True
+
+            if path == "/auth/google/callback":
+                state = str((query.get("state") or [""])[0] or "")
+                code = str((query.get("code") or [""])[0] or "")
+                error = str((query.get("error") or [""])[0] or "")
+                ok, session_id, next_path, err = service.complete_google_login(
+                    request_host=self._request_host(),
+                    request_is_https=self._request_is_https(),
+                    state=state,
+                    code=code,
+                    error=error,
+                )
+                if not ok:
+                    target = "/?auth_error=" + quote(err or "authentication failed")
+                    self._send_redirect(target, status=303)
+                    return True
+
+                cookie_value = service.build_session_set_cookie(
+                    session_id=session_id,
+                    request_is_https=self._request_is_https(),
+                )
+                self._send_redirect(
+                    next_path,
+                    status=303,
+                    extra_headers=[("Set-Cookie", cookie_value)],
+                )
+                return True
+
+            if path == "/auth/logout":
+                service.logout_from_headers(self.headers)
+                cookie_value = service.build_session_clear_cookie(request_is_https=self._request_is_https())
+                next_path = service._sanitize_next_path(str((query.get("next") or ["/"])[0] or "/"))
+                self._send_redirect(
+                    next_path,
+                    status=303,
+                    extra_headers=[("Set-Cookie", cookie_value)],
+                )
+                return True
+
+            return False
 
         def do_OPTIONS(self) -> None:  # noqa: N802
             self._send(b"", status=204, content_type="text/plain")
 
         def do_GET(self) -> None:  # noqa: N802
             path = self._parse_request_path()
+            query = self._parse_query_params()
+
+            if self._handle_auth_get(path, query):
+                return
 
             static_root = Path(getattr(service, "static_root", Path(__file__).resolve().parent / "static")).resolve()
             workspace_enabled = bool(getattr(service, "workspace_files_enabled", False))
-            workspace_root = Path(str(getattr(service, "workspace_files_root", ""))).expanduser().resolve() if workspace_enabled else None
+            workspace_root = (
+                Path(str(getattr(service, "workspace_files_root", ""))).expanduser().resolve()
+                if workspace_enabled
+                else None
+            )
             workspace_list = bool(getattr(service, "workspace_files_allow_listing", False))
             media_enabled = bool(getattr(service, "media_files_enabled", False))
-            media_root = Path(str(getattr(service, "media_files_root", ""))).expanduser().resolve() if media_enabled else None
+            media_root = (
+                Path(str(getattr(service, "media_files_root", ""))).expanduser().resolve()
+                if media_enabled
+                else None
+            )
             media_list = bool(getattr(service, "media_files_allow_listing", False))
+
+            if service.should_protect_http_path(path) and not self._is_authenticated():
+                self._send(b"Authentication required", status=401, content_type="text/plain")
+                return
 
             if path in ("/", "/index.html"):
                 self._send(self._render_ui_index())
             elif path == "/favicon.ico":
                 self._send(b"", status=204, content_type="image/x-icon")
             elif path == "/health":
-                self._send(
-                    json.dumps(
-                        {
-                            "status": "ok",
-                            "service": "embedded-voice-ui",
-                            "instance_id": self.server._embedded_instance_id,
-                        }
-                    ).encode(),
-                    content_type="application/json",
+                self._send_json(
+                    {
+                        "status": "ok",
+                        "service": "embedded-voice-ui",
+                        "instance_id": self.server._embedded_instance_id,
+                    }
                 )
             elif path.startswith("/recordings/audio/"):
                 audio_name = path.removeprefix("/recordings/audio/")
@@ -158,7 +287,11 @@ def start_http_servers(service: Any, ssl_context: ssl.SSLContext | None) -> None
                         self._send_file(audio_path)
                         return
                 self._send(b"Not found", status=404, content_type="text/plain")
-            elif workspace_enabled and workspace_root and self._serve_mount(path, "/files/workspace", workspace_root, workspace_list):
+            elif (
+                workspace_enabled
+                and workspace_root
+                and self._serve_mount(path, "/files/workspace", workspace_root, workspace_list)
+            ):
                 return
             elif media_enabled and media_root and self._serve_mount(path, "/files/media", media_root, media_list):
                 return
@@ -168,6 +301,19 @@ def start_http_servers(service: Any, ssl_context: ssl.SSLContext | None) -> None
                     self._send_file(static_target)
                 else:
                     self._send(b"Not found", status=404, content_type="text/plain")
+
+        def do_POST(self) -> None:  # noqa: N802
+            path = self._parse_request_path()
+            if path == "/auth/logout":
+                service.logout_from_headers(self.headers)
+                cookie_value = service.build_session_clear_cookie(request_is_https=self._request_is_https())
+                self._send_json(
+                    {"ok": True},
+                    status=200,
+                    extra_headers=[("Set-Cookie", cookie_value)],
+                )
+                return
+            self._send_json({"error": "Not found"}, status=404)
 
     class RedirectHandler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A003

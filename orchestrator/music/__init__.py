@@ -4,7 +4,7 @@ from .native_client import (
     NativeMusicConnection,
     NativeMusicClientPool,
 )
-from .mpd_client import MPDConnection, MPDClientPool
+from .native_backend import MPDConnection, MPDClientPool
 from .library_index import LibraryIndex
 from .playlist_store import PlaylistStore
 from .native_player import NativePlayer

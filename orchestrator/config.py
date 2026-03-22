@@ -90,7 +90,13 @@ class VoiceConfig(BaseSettings):
             return int(s)
         return s
 
-    @field_validator("web_ui_ssl_certfile", "web_ui_ssl_keyfile", "web_ui_static_root", mode="before")
+    @field_validator(
+        "web_ui_ssl_certfile",
+        "web_ui_ssl_keyfile",
+        "web_ui_static_root",
+        "web_ui_google_client_secret_file",
+        mode="before",
+    )
     @classmethod
     def _normalize_web_ui_repo_paths(cls, value):
         return _resolve_repo_relative_path(value)
@@ -291,6 +297,15 @@ class VoiceConfig(BaseSettings):
     web_ui_ssl_keyfile: str = Field("")   # Path to TLS private key file (PEM)
     web_ui_http_redirect_port: int = Field(0)  # Port for HTTP→HTTPS redirector (0 = disabled)
     web_ui_static_root: str = Field("orchestrator/web/static")  # Root directory for embedded web UI static assets
+    web_ui_auth_mode: str = Field("disabled")  # disabled|optional|required
+    web_ui_google_client_secret_file: str = Field("../google_client_secret.json")  # OAuth client secret JSON path
+    web_ui_google_client_id: str = Field("")  # Optional explicit Google OAuth client ID override
+    web_ui_google_client_secret: str = Field("")  # Optional explicit Google OAuth client secret override
+    web_ui_google_redirect_uri: str = Field("")  # Optional explicit OAuth redirect URI
+    web_ui_google_allowed_domain: str = Field("")  # Optional email domain allowlist (single domain)
+    web_ui_auth_session_cookie_name: str = Field("openclaw_ui_session")
+    web_ui_auth_session_ttl_hours: int = Field(24)
+    web_ui_auth_cookie_secure: bool = Field(True)
     web_ui_workspace_files_enabled: bool = Field(False)  # Serve files under /files/workspace
     web_ui_workspace_files_root: str = Field("")  # Root directory for /files/workspace; empty = OPENCLAW_WORKSPACE_DIR
     web_ui_workspace_files_allow_listing: bool = Field(False)  # Allow directory listing for /files/workspace
@@ -603,6 +618,32 @@ class VoiceConfig(BaseSettings):
                 errors.append(f"WEB_UI_MUSIC_POLL_MS={self.web_ui_music_poll_ms} must be >= 100 ms")
             if self.web_ui_timer_poll_ms < 100:
                 errors.append(f"WEB_UI_TIMER_POLL_MS={self.web_ui_timer_poll_ms} must be >= 100 ms")
+            auth_mode = str(self.web_ui_auth_mode or "").strip().lower()
+            if auth_mode not in ("disabled", "optional", "required"):
+                errors.append("WEB_UI_AUTH_MODE must be 'disabled', 'optional', or 'required'")
+            if auth_mode != "disabled":
+                secret_file = str(self.web_ui_google_client_secret_file or "").strip()
+                has_file = bool(secret_file and Path(secret_file).exists())
+                has_inline = bool(
+                    str(self.web_ui_google_client_id or "").strip()
+                    and str(self.web_ui_google_client_secret or "").strip()
+                )
+                if not has_file and not has_inline:
+                    errors.append(
+                        "WEB_UI_AUTH_MODE requires Google OAuth credentials: set WEB_UI_GOOGLE_CLIENT_SECRET_FILE "
+                        "or both WEB_UI_GOOGLE_CLIENT_ID and WEB_UI_GOOGLE_CLIENT_SECRET"
+                    )
+                if self.web_ui_auth_session_ttl_hours <= 0:
+                    errors.append("WEB_UI_AUTH_SESSION_TTL_HOURS must be > 0")
+                if not str(self.web_ui_auth_session_cookie_name or "").strip():
+                    errors.append("WEB_UI_AUTH_SESSION_COOKIE_NAME must not be empty")
+                if self.web_ui_google_redirect_uri:
+                    redirect_uri = str(self.web_ui_google_redirect_uri).strip()
+                    if not (
+                        redirect_uri.startswith("http://")
+                        or redirect_uri.startswith("https://")
+                    ):
+                        errors.append("WEB_UI_GOOGLE_REDIRECT_URI must start with http:// or https://")
 
         # Log and exit if critical errors found
         if errors:

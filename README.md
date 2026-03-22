@@ -1,6 +1,29 @@
 # OpenClaw Voice Orchestrator
 
-**Production-ready voice interface for AI assistants with advanced audio processing, wake word detection, and flexible deployment options.**
+**A voice-first AI assistant experience — like Alexa or Google Home, but locally-run, open, and tightly integrated with [OpenClaw](https://github.com/yourusername/openclaw).**
+
+---
+
+## What Is This?
+
+OpenClaw Voice is a low-latency voice assistant orchestrator built around a **two-tier intelligence model**:
+
+### Tier 1 — Fast Local Response
+Incoming voice requests are first handled by a **small, specialised model running locally** (IBM Granite is recommended for local hardware). This tier is optimised for minimal latency and handles a focused set of built-in skills that are tightly coupled to the audio system:
+
+- **Alarms & Timers** — set, cancel, and announce alarms with natural voice interaction
+- **Music Playback** — play, pause, skip, change volume, and load playlists via MPD
+- **Recording Mode** — start/stop audio capture sessions by voice
+
+For these tasks, the assistant responds in under a second without ever hitting the network.
+
+### Tier 2 — Upstream OpenClaw Gateway
+When a request falls outside the local skill set, the voice orchestrator **forwards it to an upstream OpenClaw gateway**. The gateway is backed by a more capable model (MiniMax is recommended) and can access OpenClaw's full skill library, persistent memory, and tool-calling capabilities — making it suitable for complex, open-ended questions and multi-step tasks.
+
+This split keeps everyday interactions snappy while still supporting the full power of an AI assistant when needed.
+
+### Hardware Target
+The system is **built and optimised for the GMKTEK EVO-X2** mini PC, which runs local inference for STT (Whisper), TTS (Piper), and the fast-response model. However it works with any Linux host and scales up well with faster hardware or cloud-hosted models.
 
 ---
 

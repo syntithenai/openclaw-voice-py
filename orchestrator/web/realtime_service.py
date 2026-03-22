@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from http.cookies import SimpleCookie
 import json
 import logging
 import math
 import os
+import secrets
 import ssl
 import tempfile
 import threading
@@ -16,7 +18,9 @@ import uuid
 from http.server import HTTPServer
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlencode
 
+import requests
 import websockets
 from orchestrator.observability.latency_trace import emit as emit_latency_trace
 from orchestrator.observability.latency_trace import scoped_action
@@ -43,6 +47,15 @@ class EmbeddedVoiceWebService:
         http_redirect_port: int = 0,
         chat_persist_path: str = "",
         static_root: str = "",
+        auth_mode: str = "disabled",
+        google_client_secret_file: str = "",
+        google_client_id: str = "",
+        google_client_secret: str = "",
+        google_redirect_uri: str = "",
+        google_allowed_domain: str = "",
+        auth_session_cookie_name: str = "openclaw_ui_session",
+        auth_session_ttl_hours: int = 24,
+        auth_cookie_secure: bool = True,
         workspace_files_enabled: bool = False,
         workspace_files_root: str = "",
         workspace_files_allow_listing: bool = False,
@@ -62,6 +75,18 @@ class EmbeddedVoiceWebService:
         self.ssl_certfile = ssl_certfile
         self.ssl_keyfile = ssl_keyfile
         self.http_redirect_port = http_redirect_port
+        self.auth_mode = str(auth_mode or "disabled").strip().lower() or "disabled"
+        self.google_client_secret_file = str(google_client_secret_file or "").strip()
+        self.google_client_id = str(google_client_id or "").strip()
+        self.google_client_secret = str(google_client_secret or "").strip()
+        self.google_redirect_uri = str(google_redirect_uri or "").strip()
+        self.google_allowed_domain = str(google_allowed_domain or "").strip().lower()
+        self.auth_session_cookie_name = str(auth_session_cookie_name or "openclaw_ui_session").strip()
+        self.auth_session_ttl_s = max(3600, int(auth_session_ttl_hours) * 3600)
+        self.auth_cookie_secure = bool(auth_cookie_secure)
+        self._oauth_state_ttl_s = 300
+        self._oauth_states: dict[str, dict[str, Any]] = {}
+        self._auth_sessions: dict[str, dict[str, Any]] = {}
         self._instance_id = uuid.uuid4().hex
 
         default_static_root = Path(__file__).resolve().parent / "static"
@@ -80,6 +105,8 @@ class EmbeddedVoiceWebService:
         self.media_files_enabled = bool(media_files_enabled)
         self.media_files_root = str(media_root.resolve())
         self.media_files_allow_listing = bool(media_files_allow_listing)
+
+        self._load_google_oauth_credentials()
 
         self._http_server: HTTPServer | None = None
         self._http_thread: threading.Thread | None = None
@@ -679,6 +706,303 @@ class EmbeddedVoiceWebService:
         return dict(self._latest_browser_audio)
 
     # ------------------------------------------------------------------
+    # Web UI authentication helpers
+    # ------------------------------------------------------------------
+
+    def _load_google_oauth_credentials(self) -> None:
+        secret_file = self.google_client_secret_file
+        if secret_file and Path(secret_file).exists():
+            try:
+                raw = json.loads(Path(secret_file).read_text(encoding="utf-8"))
+                section = raw.get("web") if isinstance(raw, dict) else None
+                if not isinstance(section, dict):
+                    section = raw.get("installed") if isinstance(raw, dict) else None
+                if isinstance(section, dict):
+                    file_client_id = str(section.get("client_id", "")).strip()
+                    file_client_secret = str(section.get("client_secret", "")).strip()
+                    if file_client_id and not self.google_client_id:
+                        self.google_client_id = file_client_id
+                    if file_client_secret and not self.google_client_secret:
+                        self.google_client_secret = file_client_secret
+                    if not self.google_redirect_uri:
+                        redirect_uris = section.get("redirect_uris")
+                        if isinstance(redirect_uris, list) and redirect_uris:
+                            first_redirect = str(redirect_uris[0] or "").strip()
+                            if first_redirect:
+                                self.google_redirect_uri = first_redirect
+            except Exception as exc:
+                logger.warning("Failed to read Google client secret file '%s': %s", secret_file, exc)
+
+    def auth_enabled(self) -> bool:
+        return self.auth_mode in ("optional", "required")
+
+    def auth_required(self) -> bool:
+        return self.auth_mode == "required"
+
+    def oauth_ready(self) -> bool:
+        return bool(self.google_client_id and self.google_client_secret)
+
+    def _cleanup_auth_state(self) -> None:
+        now = time.time()
+        stale_states = [
+            token
+            for token, entry in self._oauth_states.items()
+            if float(entry.get("expires_at", 0.0)) <= now
+        ]
+        for token in stale_states:
+            self._oauth_states.pop(token, None)
+
+        stale_sessions = [
+            sid
+            for sid, entry in self._auth_sessions.items()
+            if float(entry.get("expires_at", 0.0)) <= now
+        ]
+        for sid in stale_sessions:
+            self._auth_sessions.pop(sid, None)
+
+    def _parse_cookie_header(self, cookie_header: str) -> dict[str, str]:
+        try:
+            jar = SimpleCookie()
+            jar.load(cookie_header or "")
+            return {key: morsel.value for key, morsel in jar.items()}
+        except Exception:
+            return {}
+
+    def _session_user_from_cookie_header(self, cookie_header: str) -> dict[str, Any] | None:
+        self._cleanup_auth_state()
+        sid = self._parse_cookie_header(cookie_header).get(self.auth_session_cookie_name, "")
+        if not sid:
+            return None
+        entry = self._auth_sessions.get(sid)
+        if not entry:
+            return None
+        if float(entry.get("expires_at", 0.0)) <= time.time():
+            self._auth_sessions.pop(sid, None)
+            return None
+        user = entry.get("user")
+        if not isinstance(user, dict):
+            return None
+        return dict(user)
+
+    def session_user_from_headers(self, headers: Any) -> dict[str, Any] | None:
+        cookie_header = ""
+        try:
+            cookie_header = str(headers.get("Cookie", headers.get("cookie", "")) or "")
+        except Exception:
+            cookie_header = ""
+        return self._session_user_from_cookie_header(cookie_header)
+
+    def auth_bootstrap_from_headers(self, headers: Any) -> dict[str, Any]:
+        user = self.session_user_from_headers(headers)
+        return {
+            "mode": self.auth_mode,
+            "authenticated": user is not None,
+            "user": user,
+        }
+
+    def should_protect_http_path(self, path: str) -> bool:
+        if not self.auth_required():
+            return False
+        if not path:
+            return False
+        return path.startswith("/files/workspace") or path.startswith("/files/media") or path.startswith(
+            "/recordings/audio/"
+        )
+
+    def _sanitize_next_path(self, next_path: str) -> str:
+        raw = str(next_path or "").strip()
+        if not raw:
+            return "/"
+        if raw.startswith("/"):
+            return raw
+        return "/"
+
+    def resolve_google_redirect_uri(self, request_host: str, request_is_https: bool) -> str:
+        configured = str(self.google_redirect_uri or "").strip()
+        if configured:
+            return configured
+        scheme = "https" if request_is_https else "http"
+        host = str(request_host or "").strip() or f"{self.host}:{self.ui_port}"
+        return f"{scheme}://{host}/auth/google/callback"
+
+    def begin_google_login(self, request_host: str, request_is_https: bool, next_path: str) -> str:
+        if not self.auth_enabled() or not self.oauth_ready():
+            return ""
+        self._cleanup_auth_state()
+        state = secrets.token_urlsafe(24)
+        self._oauth_states[state] = {
+            "expires_at": time.time() + self._oauth_state_ttl_s,
+            "next": self._sanitize_next_path(next_path),
+        }
+        redirect_uri = self.resolve_google_redirect_uri(request_host=request_host, request_is_https=request_is_https)
+        params = {
+            "client_id": self.google_client_id,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": "openid email profile",
+            "state": state,
+            "access_type": "online",
+            "include_granted_scopes": "true",
+            "prompt": "select_account",
+        }
+        return "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+
+    def complete_google_login(
+        self,
+        *,
+        request_host: str,
+        request_is_https: bool,
+        state: str,
+        code: str,
+        error: str,
+    ) -> tuple[bool, str, str, str]:
+        if error:
+            return (False, "", "/", f"Google OAuth error: {error}")
+        if not self.auth_enabled() or not self.oauth_ready():
+            return (False, "", "/", "Google OAuth is not configured")
+
+        self._cleanup_auth_state()
+        state_entry = self._oauth_states.pop(str(state or ""), None)
+        if not state_entry:
+            return (False, "", "/", "Invalid or expired OAuth state")
+        if float(state_entry.get("expires_at", 0.0)) <= time.time():
+            return (False, "", "/", "Expired OAuth state")
+        next_path = self._sanitize_next_path(str(state_entry.get("next", "/")))
+        if not code:
+            return (False, "", next_path, "Missing OAuth code")
+
+        redirect_uri = self.resolve_google_redirect_uri(request_host=request_host, request_is_https=request_is_https)
+        try:
+            token_resp = requests.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "code": code,
+                    "client_id": self.google_client_id,
+                    "client_secret": self.google_client_secret,
+                    "redirect_uri": redirect_uri,
+                    "grant_type": "authorization_code",
+                },
+                timeout=12,
+            )
+        except Exception as exc:
+            return (False, "", next_path, f"OAuth token request failed: {exc}")
+
+        if token_resp.status_code != 200:
+            return (False, "", next_path, f"OAuth token exchange failed ({token_resp.status_code})")
+
+        try:
+            token_payload = token_resp.json()
+        except Exception:
+            return (False, "", next_path, "OAuth token response was not valid JSON")
+
+        access_token = str(token_payload.get("access_token", "")).strip()
+        if not access_token:
+            return (False, "", next_path, "OAuth token response missing access_token")
+
+        try:
+            user_resp = requests.get(
+                "https://openidconnect.googleapis.com/v1/userinfo",
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=12,
+            )
+        except Exception as exc:
+            return (False, "", next_path, f"OAuth user profile request failed: {exc}")
+
+        if user_resp.status_code != 200:
+            return (False, "", next_path, f"OAuth user profile failed ({user_resp.status_code})")
+
+        try:
+            user_payload = user_resp.json()
+        except Exception:
+            return (False, "", next_path, "OAuth user profile response was not valid JSON")
+
+        sub = str(user_payload.get("sub", "")).strip()
+        email = str(user_payload.get("email", "")).strip().lower()
+        email_verified = bool(user_payload.get("email_verified", False))
+        if not sub or not email:
+            return (False, "", next_path, "OAuth profile missing sub/email")
+        if not email_verified:
+            return (False, "", next_path, "Google account email is not verified")
+
+        if self.google_allowed_domain:
+            domain = email.split("@", 1)[1] if "@" in email else ""
+            if domain != self.google_allowed_domain:
+                return (
+                    False,
+                    "",
+                    next_path,
+                    f"Account domain '{domain}' is not allowed",
+                )
+
+        user = {
+            "sub": sub,
+            "email": email,
+            "email_verified": email_verified,
+            "name": str(user_payload.get("name", "")).strip(),
+            "picture": str(user_payload.get("picture", "")).strip(),
+            "given_name": str(user_payload.get("given_name", "")).strip(),
+            "family_name": str(user_payload.get("family_name", "")).strip(),
+        }
+        session_id = secrets.token_urlsafe(32)
+        self._auth_sessions[session_id] = {
+            "created_at": time.time(),
+            "expires_at": time.time() + self.auth_session_ttl_s,
+            "user": user,
+        }
+        return (True, session_id, next_path, "")
+
+    def build_session_set_cookie(self, session_id: str, request_is_https: bool) -> str:
+        secure_flag = self.auth_cookie_secure and request_is_https
+        parts = [
+            f"{self.auth_session_cookie_name}={session_id}",
+            "Path=/",
+            "HttpOnly",
+            "SameSite=Lax",
+            f"Max-Age={self.auth_session_ttl_s}",
+        ]
+        if secure_flag:
+            parts.append("Secure")
+        return "; ".join(parts)
+
+    def build_session_clear_cookie(self, request_is_https: bool) -> str:
+        secure_flag = self.auth_cookie_secure and request_is_https
+        parts = [
+            f"{self.auth_session_cookie_name}=",
+            "Path=/",
+            "HttpOnly",
+            "SameSite=Lax",
+            "Max-Age=0",
+        ]
+        if secure_flag:
+            parts.append("Secure")
+        return "; ".join(parts)
+
+    def logout_from_headers(self, headers: Any) -> None:
+        cookie_header = ""
+        try:
+            cookie_header = str(headers.get("Cookie", headers.get("cookie", "")) or "")
+        except Exception:
+            cookie_header = ""
+        sid = self._parse_cookie_header(cookie_header).get(self.auth_session_cookie_name, "")
+        if sid:
+            self._auth_sessions.pop(sid, None)
+
+    def ws_session_user(self, websocket: Any) -> dict[str, Any] | None:
+        cookie_header = ""
+        try:
+            req_headers = getattr(websocket, "request_headers", None)
+            if req_headers is not None:
+                cookie_header = str(req_headers.get("Cookie", req_headers.get("cookie", "")) or "")
+            if not cookie_header:
+                request = getattr(websocket, "request", None)
+                request_headers = getattr(request, "headers", None) if request is not None else None
+                if request_headers is not None:
+                    cookie_header = str(request_headers.get("Cookie", request_headers.get("cookie", "")) or "")
+        except Exception:
+            cookie_header = ""
+        return self._session_user_from_cookie_header(cookie_header)
+
+    # ------------------------------------------------------------------
     # Action handler registration
     # ------------------------------------------------------------------
 
@@ -809,6 +1133,14 @@ class EmbeddedVoiceWebService:
 
     async def _ws_handler(self, websocket: Any) -> None:
         client_id = uuid.uuid4().hex[:8]
+        session_user = self.ws_session_user(websocket)
+        if self.auth_required() and session_user is None:
+            try:
+                await websocket.close(code=4401, reason="authentication required")
+            except Exception:
+                pass
+            logger.info("Web UI websocket denied (%s): authentication required", client_id)
+            return
 
         self._clients.add(websocket)
         self._active_client = websocket
@@ -819,6 +1151,11 @@ class EmbeddedVoiceWebService:
                 "client_id": client_id,
                 "ws_port": self.ws_port,
                 "ui_port": self.ui_port,
+                "auth": {
+                    "mode": self.auth_mode,
+                    "authenticated": session_user is not None,
+                    "user": session_user,
+                },
             }))
             # Fetch fresh music state if cache is empty (ensures page load shows current playback state)
             if self._on_get_music_state and (not self._music_state or not self._music_queue):
@@ -841,7 +1178,7 @@ class EmbeddedVoiceWebService:
                     self._recordings_rev += 1
                 except Exception:
                     pass
-            await websocket.send(json.dumps(self._build_state_snapshot()))
+            await websocket.send(json.dumps(self._build_state_snapshot(session_user=session_user)))
             if self._on_music_list_playlists is not None:
                 try:
                     names = await self._on_music_list_playlists(client_id)
@@ -1665,7 +2002,7 @@ class EmbeddedVoiceWebService:
             "browser_audio": dict(self._latest_browser_audio),
         }
 
-    def _build_state_snapshot(self) -> dict[str, Any]:
+    def _build_state_snapshot(self, session_user: dict[str, Any] | None = None) -> dict[str, Any]:
         now = time.monotonic()
         hotword_active = (
             self._last_hotword_ts is not None
@@ -1676,6 +2013,11 @@ class EmbeddedVoiceWebService:
         orch["status_rev"] = self._status_rev
         return {
             "type": "state_snapshot",
+            "auth": {
+                "mode": self.auth_mode,
+                "authenticated": session_user is not None,
+                "user": session_user,
+            },
             "orchestrator": orch,
             "ui_control": dict(self._ui_control_state),
             "ui_control_rev": self._ui_control_rev,

@@ -3,6 +3,9 @@ const WS_PORT = Number(RUNTIME.wsPort || 0);
 const MIC_STARTS_DISABLED = !!RUNTIME.micStartsDisabled;
 const AUDIO_AUTHORITY = String(RUNTIME.audioAuthority || 'native');
 const SERVER_INSTANCE_ID = String(RUNTIME.serverInstanceId || '');
+const AUTH_MODE_BOOTSTRAP = String(RUNTIME.authMode || 'disabled').toLowerCase();
+const AUTHENTICATED_BOOTSTRAP = !!RUNTIME.authenticated;
+const AUTH_USER_BOOTSTRAP = (RUNTIME.authUser && typeof RUNTIME.authUser === 'object') ? RUNTIME.authUser : null;
 const PREF_TTS_MUTED = 'openclaw.ui.ttsMuted';
 const PREF_BROWSER_AUDIO = 'openclaw.ui.browserAudioEnabled';
 const PREF_CONTINUOUS = 'openclaw.ui.continuousMode';
@@ -57,7 +60,91 @@ const S = {
     lastAudioInputCount:null,
     scrollToBottomPending:false,
     autoScrollUntilTs:0,
+    authMode: AUTH_MODE_BOOTSTRAP,
+    isAuthenticated: AUTHENTICATED_BOOTSTRAP,
+    authUser: AUTH_USER_BOOTSTRAP,
 };
+
+function authRequiresLogin(){
+    return String(S.authMode||'disabled')==='required';
+}
+
+function wsAuthAllowed(){
+    return !(authRequiresLogin() && !S.isAuthenticated);
+}
+
+function buildAuthLoginUrl(){
+    const next = String(location.pathname||'/') + String(location.search||'') + String(location.hash||'');
+    return '/auth/google/login?next=' + encodeURIComponent(next || '/');
+}
+
+function renderAuthButton(){
+    const btn = document.getElementById('loginBtn');
+    if(!btn) return;
+
+    if(String(S.authMode||'disabled')==='disabled'){
+        btn.classList.add('hidden');
+        return;
+    }
+
+    btn.classList.remove('hidden');
+    if(S.isAuthenticated){
+        const displayName = String((S.authUser&&S.authUser.given_name) || (S.authUser&&S.authUser.name) || (S.authUser&&S.authUser.email) || 'Account');
+        const compact = displayName.length > 18 ? (displayName.slice(0, 17) + '…') : displayName;
+        btn.textContent = compact;
+        btn.setAttribute('title', 'Signed in as ' + String((S.authUser&&S.authUser.email)||displayName) + '. Click to sign out');
+        btn.dataset.action = 'auth-logout';
+        btn.classList.remove('bg-gray-800','hover:bg-gray-700','border-gray-700');
+        btn.classList.add('bg-emerald-800','hover:bg-emerald-700','border-emerald-600');
+    } else {
+        btn.textContent = 'Sign in';
+        btn.setAttribute('title', 'Sign in with Google');
+        btn.dataset.action = 'auth-login';
+        btn.classList.remove('bg-emerald-800','hover:bg-emerald-700','border-emerald-600');
+        btn.classList.add('bg-gray-800','hover:bg-gray-700','border-gray-700');
+    }
+}
+
+async function refreshAuthSession(opts={}){
+    const shouldRender = opts.render!==false;
+    const shouldAdjustWs = opts.adjustWs!==false;
+    try{
+        const resp = await fetch('/auth/session', { method:'GET', credentials:'same-origin', cache:'no-store' });
+        if(resp.ok){
+            const data = await resp.json();
+            S.authMode = String((data&&data.mode)||S.authMode||'disabled').toLowerCase();
+            S.isAuthenticated = !!(data&&data.authenticated);
+            S.authUser = (data&&data.user&&typeof data.user==='object') ? data.user : null;
+        }
+    }catch(_ ){}
+
+    renderAuthButton();
+
+    if(shouldAdjustWs){
+        if(!wsAuthAllowed()){
+            if(typeof disconnectWs==='function'){
+                try{ await disconnectWs(true); }catch(_ ){}
+            }
+        } else if(typeof connectWs==='function'){
+            S.wsManualDisconnect=false;
+            connectWs();
+        }
+    }
+
+    if(shouldRender && typeof renderPage==='function') renderPage();
+    if(typeof updateMicInteractivity==='function') updateMicInteractivity();
+}
+
+function triggerGoogleLogin(){
+    window.location.assign(buildAuthLoginUrl());
+}
+
+async function triggerGoogleLogout(){
+    try{
+        await fetch('/auth/logout', { method:'POST', credentials:'same-origin' });
+    }catch(_ ){}
+    await refreshAuthSession({ render:true, adjustWs:true });
+}
 
 const SIMPLE_NUMBER_WORDS = {
     zero:0, one:1, two:2, three:3, four:4, five:5, six:6, seven:7, eight:8, nine:9,

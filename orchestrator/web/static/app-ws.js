@@ -7,8 +7,21 @@ function handleMsg(msg){
   if (isLargePlaylist) console.time('🎵 music_queue render');
   
   switch(msg.type){
-    case 'hello': break;
+    case 'hello':
+        if(msg.auth){
+            S.authMode = String(msg.auth.mode || S.authMode || 'disabled').toLowerCase();
+            S.isAuthenticated = !!msg.auth.authenticated;
+            S.authUser = (msg.auth.user && typeof msg.auth.user==='object') ? msg.auth.user : null;
+            renderAuthButton();
+        }
+        break;
     case 'state_snapshot':
+    if(msg.auth){
+        S.authMode = String(msg.auth.mode || S.authMode || 'disabled').toLowerCase();
+        S.isAuthenticated = !!msg.auth.authenticated;
+        S.authUser = (msg.auth.user && typeof msg.auth.user==='object') ? msg.auth.user : null;
+        renderAuthButton();
+    }
     if(msg.orchestrator){
         const rev = Number(msg.orchestrator.status_rev||0);
         if(!Number.isNaN(rev) && rev>0) S.lastStatusRev = Math.max(S.lastStatusRev, rev);
@@ -777,7 +790,8 @@ function setupServerRefreshWatcher(){
 
 loadUiPrefs();
 hydrateChatCache();
-S.page=getPage(); renderPage(); updateNavActiveState(); applyMicState(); applyMicControlToggles(); updateWsDebugBanner(); updateMicInteractivity(); connectWs();
+S.page=getPage(); renderPage(); updateNavActiveState(); applyMicState(); applyMicControlToggles(); updateWsDebugBanner(); updateMicInteractivity(); renderAuthButton(); if(wsAuthAllowed()) connectWs();
+refreshAuthSession({render:true, adjustWs:true}).catch(()=>{});
 setupServerRefreshWatcher();
 setInterval(()=>{ expirePendingActions(); applyTopMusicProgress(); if(!S.timers.length) return; const now=Date.now()/1000; S.timers.forEach(t=>{ if(t&&t._pendingServerAck) return; if(t._clientAnchorTs===undefined||t._clientAnchorTs===null){ t._clientAnchorTs=now; t._clientAnchorRem=t.remaining_seconds; } t.remaining_seconds=Math.max(0, t._clientAnchorRem-(now-t._clientAnchorTs)); }); renderTimerBar(); },500);
 startBrowserCapture().catch((err)=>{

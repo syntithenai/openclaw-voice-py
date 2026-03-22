@@ -62,6 +62,7 @@
   </div>
 
   <div class="relative flex items-center flex-none gap-3" id="micControlWrap">
+    <button id="loginBtn" data-action="auth-login" class="px-3 py-2 rounded-lg text-xs font-medium bg-gray-800 border border-gray-700 hover:bg-gray-700 transition-colors" title="Sign in with Google">Sign in</button>
     <button id="micBtn" class="mic-btn w-11 h-11 flex items-center justify-center font-bold text-xl rounded-full border-4 border-transparent" title="Microphone">&#127908;</button>
     <button id="micMenuBtn" class="w-7 h-7 flex items-center justify-center rounded-full text-gray-300 bg-gray-800/60 border border-gray-700 hover:bg-gray-700 transition-colors" title="Microphone options">&#9662;</button>
     <div id="micControlDropdown" class="hidden absolute right-0 top-12 w-72 bg-gray-800 border border-gray-700 rounded-xl shadow-xl z-50 p-2 flex flex-col gap-2">
@@ -110,6 +111,9 @@
     micStartsDisabled: __MIC_STARTS_DISABLED__,
     audioAuthority: '__AUDIO_AUTHORITY__',
     serverInstanceId: '__SERVER_INSTANCE_ID__',
+    authMode: '__AUTH_MODE__',
+    authenticated: __AUTHENTICATED__,
+    authUser: __AUTH_USER_JSON__,
   };
 </script>
 <script src="/app-core.js"></script>

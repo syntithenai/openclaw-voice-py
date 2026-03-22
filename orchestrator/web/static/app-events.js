@@ -9,6 +9,18 @@ document.addEventListener('click', e => {
     const target = (e.target && typeof e.target.closest==='function') ? e.target : (e.target && e.target.parentElement ? e.target.parentElement : null);
     if(!target) return;
 
+    const authLoginBtn = target.closest('[data-action="auth-login"]');
+    if (authLoginBtn) {
+        triggerGoogleLogin();
+        return;
+    }
+
+    const authLogoutBtn = target.closest('[data-action="auth-logout"]');
+    if (authLogoutBtn) {
+        void triggerGoogleLogout();
+        return;
+    }
+
     const newChatBtn = target.closest('[data-action="chat-new"]');
     if (newChatBtn) {
         sendAction({type:'chat_new'});
@@ -343,7 +355,10 @@ document.addEventListener('click', e => {
         S.musicPlaylistModalName = '';
         S.musicPlaylistModalOriginalName = '';
         renderMusicPage(document.getElementById('main'));
-        return; = target.closest('[data-action="music-load-playlist"]');
+        return;
+    }
+
+    const loadPlaylistBtn = target.closest('[data-action="music-load-playlist"]');
     if (loadPlaylistBtn) {
         const name = String(loadPlaylistBtn.dataset.playlistName || '').trim();
         if(name){
@@ -701,6 +716,30 @@ function renderPage(){
   const main=document.getElementById('main');
     const dock=document.getElementById('chatComposerDock');
         if(main) main.onscroll=null;
+
+    renderAuthButton();
+
+    if(authRequiresLogin() && !S.isAuthenticated){
+        if(dock) dock.classList.add('hidden');
+        if(main){
+            main.dataset.page='auth-required';
+            main.innerHTML=''
+                +'<div class="w-full h-full flex items-start justify-center px-4 py-10">'
+                    +'<div class="max-w-xl w-full rounded-xl border border-red-700 bg-red-950/40 p-5 text-red-100">'
+                        +'<div class="text-lg font-semibold mb-2">Authentication required</div>'
+                        +'<p class="text-sm text-red-200">Google sign-in is required before this web UI can be used.</p>'
+                        +'<p class="text-xs text-red-300 mt-2">Use the sign-in button below or in the header.</p>'
+                        +'<div class="mt-4">'
+                            +'<button data-action="auth-login" class="px-3 py-2 rounded-lg text-sm font-medium bg-red-700 hover:bg-red-600 transition-colors">Sign in with Google</button>'
+                        +'</div>'
+                    +'</div>'
+                +'</div>';
+        }
+        applyMusicHeader();
+        updateScrollUpButton();
+        return;
+    }
+
     if(dock) dock.classList.remove('hidden');
     if(S.page==='music'){
         renderMusicPage(main);
