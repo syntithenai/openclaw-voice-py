@@ -2,31 +2,33 @@
 """
 Test script for music control system.
 
-Tests MPD client, manager, parser, and router functionality.
+Tests native music client, manager, parser, and router functionality.
 """
 
 import asyncio
 import sys
 from pathlib import Path
+import pytest
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from orchestrator.music import MPDClientPool, MusicManager, MusicFastPathParser, MusicRouter
+from orchestrator.music import NativeMusicClientPool, MusicManager, MusicFastPathParser, MusicRouter
 
 
+@pytest.mark.asyncio
 async def test_connection(host: str = "localhost", port: int = 6600):
-    """Test basic MPD connection."""
-    print(f"\n=== Testing MPD Connection to {host}:{port} ===")
+    """Test basic music backend connection."""
+    print(f"\n=== Testing Music Backend Connection to {host}:{port} ===")
     
     try:
-        pool = MPDClientPool(host, port, pool_size=1, timeout=5.0)
+        pool = NativeMusicClientPool(host, port, pool_size=1, timeout=5.0)
         await pool.initialize()
         print("✓ Connection successful")
         
         # Test basic command
         status = await pool.execute("status")
-        print(f"✓ MPD Status: {status}")
+        print(f"✓ Music status: {status}")
         
         await pool.close()
         return True
@@ -35,12 +37,13 @@ async def test_connection(host: str = "localhost", port: int = 6600):
         return False
 
 
+@pytest.mark.asyncio
 async def test_manager(host: str = "localhost", port: int = 6600):
     """Test music manager operations."""
     print(f"\n=== Testing Music Manager ===")
     
     try:
-        pool = MPDClientPool(host, port, pool_size=3, timeout=5.0)
+        pool = NativeMusicClientPool(host, port, pool_size=3, timeout=5.0)
         await pool.initialize()
         
         manager = MusicManager(pool)
@@ -73,6 +76,7 @@ async def test_manager(host: str = "localhost", port: int = 6600):
         return False
 
 
+@pytest.mark.asyncio
 async def test_parser():
     """Test fast-path parser."""
     print(f"\n=== Testing Fast-Path Parser ===")
@@ -108,12 +112,13 @@ async def test_parser():
     return failed == 0
 
 
+@pytest.mark.asyncio
 async def test_router(host: str = "localhost", port: int = 6600):
     """Test music router."""
     print(f"\n=== Testing Music Router ===")
     
     try:
-        pool = MPDClientPool(host, port, pool_size=3, timeout=5.0)
+        pool = NativeMusicClientPool(host, port, pool_size=3, timeout=5.0)
         await pool.initialize()
         
         manager = MusicManager(pool)
@@ -147,8 +152,8 @@ async def main():
     import argparse
     
     parser = argparse.ArgumentParser(description="Test music control system")
-    parser.add_argument("--host", default="localhost", help="MPD host (default: localhost)")
-    parser.add_argument("--port", type=int, default=6600, help="MPD port (default: 6600)")
+    parser.add_argument("--host", default="localhost", help="Backend host for compatibility client (default: localhost)")
+    parser.add_argument("--port", type=int, default=6600, help="Backend port for compatibility client (default: 6600)")
     parser.add_argument("--test", choices=["all", "connection", "manager", "parser", "router"], 
                         default="all", help="Which test to run")
     
@@ -160,11 +165,11 @@ async def main():
     
     results = {}
     
-    # Parser test doesn't need MPD connection
+    # Parser test doesn't need a backend connection
     if args.test in ["all", "parser"]:
         results["parser"] = await test_parser()
     
-    # Tests that need MPD connection
+    # Tests that need backend connection
     if args.test in ["all", "connection"]:
         results["connection"] = await test_connection(args.host, args.port)
     

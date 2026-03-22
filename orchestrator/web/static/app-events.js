@@ -354,12 +354,6 @@ document.addEventListener('click', e => {
         return;
     }
 
-    const refreshPlaylistsBtn = target.closest('[data-action="music-refresh-playlists"]');
-    if (refreshPlaylistsBtn) {
-        sendAction({type:'music_list_playlists'});
-        return;
-    }
-
     const clearQueueBtn = target.closest('[data-action="music-clear-queue"]');
     if (clearQueueBtn) {
         sendMusicAction('music_clear_queue', {});
@@ -445,6 +439,16 @@ document.addEventListener('click', e => {
         S.recordingsActionError='';
         S.recorderStartPending = true;
         sendAction({type:'recorder_start'});
+        renderRecordingsPage(document.getElementById('main'));
+        return;
+    }
+
+    const recordingsStopBtn = target.closest('[data-action="recordings-stop-recording"]');
+    if (recordingsStopBtn) {
+        if(S.recorderStopPending) return;
+        S.recordingsActionError='';
+        S.recorderStopPending = true;
+        sendAction({type:'recorder_stop'});
         renderRecordingsPage(document.getElementById('main'));
         return;
     }

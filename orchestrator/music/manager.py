@@ -1,13 +1,4 @@
-"""
-Music Manager - High-level operations for MPD control.
-
-Provides user-friendly methods that map to MPD commands:
-- Playback control (play, pause, stop, skip)
-- Volume control
-- Search and browse
-- Playlist management
-- Library management
-"""
+"""Music manager with high-level operations for native backend control."""
 
 import asyncio
 import logging
@@ -17,19 +8,19 @@ import shutil
 import time
 from collections import defaultdict, deque
 from typing import Dict, List, Optional
-from .mpd_client import MPDClientPool
+from .native_client import NativeMusicClientPool
 from orchestrator.observability.latency_trace import emit as emit_latency_trace
 
 logger = logging.getLogger(__name__)
 
 
 class MusicManager:
-    """High-level music control interface wrapping MPD client pool."""
+    """High-level music control interface wrapping the native music client pool."""
     
     def __init__(
         self,
-        pool: MPDClientPool,
-        control_pool: MPDClientPool | None = None,
+        pool: NativeMusicClientPool,
+        control_pool: NativeMusicClientPool | None = None,
         genre_queue_limit: int = 120,
         pipewire_stream_normalize_enabled: bool = True,
         pipewire_stream_target_percent: int = 100,
@@ -72,13 +63,8 @@ class MusicManager:
     async def _control_execute_list(self, command: str, timeout: float | None = None) -> List[Dict[str, str]]:
         return await self.control_pool.execute_list(command, timeout=timeout)
 
-    async def _normalize_pipewire_mpd_stream_volume(self) -> None:
-        """Best-effort: set PipeWire per-app stream volume for MPD to target percent.
-
-        MPD's internal volume (setvol/status volume) can diverge from PipeWire's
-        sink-input volume for the MPD stream, causing silent playback despite MPD
-        reporting normal playback. This method normalizes the MPD sink-input level.
-        """
+    async def _normalize_pipewire_music_stream_volume(self) -> None:
+        """Best-effort: set PipeWire per-app stream volume for the music app to target percent."""
         if not self.pipewire_stream_normalize_enabled:
             return
 
@@ -101,12 +87,12 @@ class MusicManager:
             )
             stdout, stderr = await proc.communicate()
             if proc.returncode != 0:
-                logger.debug("Skipping PipeWire MPD stream normalize: pactl list failed: %s", stderr.decode("utf-8", errors="ignore").strip())
+                logger.debug("Skipping PipeWire music stream normalize: pactl list failed: %s", stderr.decode("utf-8", errors="ignore").strip())
                 return
 
             text = stdout.decode("utf-8", errors="ignore")
             blocks = text.split("Sink Input #")
-            mpd_ids: List[str] = []
+            stream_ids: List[str] = []
 
             for block in blocks[1:]:
                 lines = block.splitlines()
@@ -115,14 +101,18 @@ class MusicManager:
                 sink_input_id = lines[0].strip()
                 if not sink_input_id:
                     continue
-                if 'application.name = "Music Player Daemon"' in block:
-                    mpd_ids.append(sink_input_id)
+                if (
+                    'application.name = "Music Player Daemon"' in block
+                    or 'application.name = "ffplay"' in block
+                    or 'application.process.binary = "ffplay"' in block
+                ):
+                    stream_ids.append(sink_input_id)
 
-            if not mpd_ids:
+            if not stream_ids:
                 return
 
             target = f"{self.pipewire_stream_target_percent}%"
-            for sink_input_id in mpd_ids:
+            for sink_input_id in stream_ids:
                 set_proc = await asyncio.create_subprocess_exec(
                     "pactl",
                     "set-sink-input-volume",
@@ -134,19 +124,19 @@ class MusicManager:
                 _, set_err = await set_proc.communicate()
                 if set_proc.returncode != 0:
                     logger.debug(
-                        "Failed to normalize MPD PipeWire stream volume (sink-input=%s): %s",
+                        "Failed to normalize music PipeWire stream volume (sink-input=%s): %s",
                         sink_input_id,
                         set_err.decode("utf-8", errors="ignore").strip(),
                     )
                     continue
 
                 logger.info(
-                    "🎚️ Normalized MPD PipeWire stream volume: sink-input=%s target=%s",
+                    "🎚️ Normalized music PipeWire stream volume: sink-input=%s target=%s",
                     sink_input_id,
                     target,
                 )
         except Exception as exc:
-            logger.debug("PipeWire MPD stream normalize skipped: %s", exc)
+            logger.debug("PipeWire music stream normalize skipped: %s", exc)
     
     # ========== Playback Control ==========
     
@@ -172,11 +162,11 @@ class MusicManager:
         try:
             if position is not None:
                 await self.pool.execute(f"play {position}")
-                await self._normalize_pipewire_mpd_stream_volume()
+                await self._normalize_pipewire_music_stream_volume()
                 return f"Playing track {position + 1}"
             else:
                 await self.pool.execute("play")
-                await self._normalize_pipewire_mpd_stream_volume()
+                await self._normalize_pipewire_music_stream_volume()
                 return "Playback started"
         except Exception as e:
             logger.error(f"Failed to play: {e}")
@@ -226,7 +216,7 @@ class MusicManager:
         """Stop playback."""
         try:
             await self.pool.execute("stop")
-            # Verify stop actually took effect; if MPD state still reports play,
+            # Verify stop actually took effect; if state still reports play,
             # force a pause and issue stop again as a fallback.
             status = await self.pool.execute("status")
             state = status.get("state", "stop") if status else "stop"
@@ -236,7 +226,7 @@ class MusicManager:
                 status = await self.pool.execute("status")
                 state = status.get("state", "stop") if status else "stop"
                 if state == "play":
-                    logger.warning("MPD stop fallback executed but state is still 'play'")
+                    logger.warning("Music stop fallback executed but state is still 'play'")
                     return "Error: failed to stop playback"
             return "Stopped"
         except Exception as e:
@@ -334,7 +324,7 @@ class MusicManager:
             return {}
 
     async def get_outputs(self) -> List[Dict[str, str]]:
-        """Return configured MPD audio outputs."""
+        """Return configured music outputs."""
         try:
             return await self.pool.execute_list("outputs")
         except Exception as e:
@@ -342,7 +332,7 @@ class MusicManager:
             return []
 
     async def get_enabled_output_names(self) -> List[str]:
-        """Return enabled output names from MPD outputs list."""
+        """Return enabled output names from output list."""
         outputs = await self.get_outputs()
         enabled: List[str] = []
         for output in outputs:
@@ -415,7 +405,7 @@ class MusicManager:
     async def add_songs_to_queue(self, query: str, count: int = 5) -> str:
         """Append matching songs to the END of the current queue without clearing it.
 
-        Tries a genre-specific MPD search first; falls back to any-field search.
+        Tries a genre-specific search first; falls back to any-field search.
         Picks up to *count* random tracks from the results.
         """
         import random
@@ -485,7 +475,7 @@ class MusicManager:
         Add a track or directory to the queue.
         
         Args:
-            uri: MPD URI (e.g., "Artist/Album/track.mp3")
+            uri: Track URI (e.g., "Artist/Album/track.mp3")
         
         Returns:
             Success message
@@ -498,7 +488,7 @@ class MusicManager:
             return f"Error: {e}"
 
     async def add_many_to_queue(self, uris: List[str], batch_size: int = 40) -> str:
-        """Add multiple tracks to the queue efficiently using MPD command lists."""
+        """Add multiple tracks to the queue efficiently using backend command batches."""
         cleaned = [str(uri).strip() for uri in uris if str(uri).strip()]
         if not cleaned:
             return "No tracks to add"
@@ -518,13 +508,13 @@ class MusicManager:
         
         Args:
             limit: Maximum number of items to fetch (default 500). Use None for unlimited.
-            timeout: Optional MPD query timeout override in seconds.
+            timeout: Optional query timeout override in seconds.
         
         Returns:
             List of queue items
         """
         try:
-            # For huge queues, MPD closes connection on full playlistinfo
+            # For huge queues, full playlistinfo can be expensive.
             # So we always limit the response. Clients can paginate if needed.
             t0 = time.monotonic()
             if limit is None:
@@ -551,7 +541,7 @@ class MusicManager:
     ) -> str:
         """Remove selected queue items.
 
-        Prefers stable MPD song IDs (`deleteid`) when available to avoid position drift.
+        Prefers stable song IDs (`deleteid`) when available to avoid position drift.
         If the currently playing item is removed, playback advances to the next item.
         """
         try:
@@ -631,9 +621,9 @@ class MusicManager:
             if added == 0:
                 return "Error: Failed to add selected tracks to queue"
 
-            # MPD has no direct "select queue item without playback side effects"
+            # The backend has no direct "select queue item without playback side effects"
             # command, so move focus to the new head and then restore the prior
-            # non-playing state as closely as MPD allows.
+            # non-playing state as closely as possible.
             await self.pool.execute("play 0")
             if state_before == "pause":
                 await self.pool.execute("pause 1")
@@ -703,9 +693,9 @@ class MusicManager:
     def _ensure_fts_conn(self) -> sqlite3.Connection:
         if self._fts_conn is None:
             workspace_dir = os.getenv("OPENCLAW_WORKSPACE_DIR", os.path.join(os.getcwd(), ".openclaw"))
-            mpd_dir = os.path.join(workspace_dir, ".mpd")
-            os.makedirs(mpd_dir, exist_ok=True)
-            db_path = os.path.join(mpd_dir, "music_search_idx.sqlite3")
+            media_dir = os.path.join(workspace_dir, ".media")
+            os.makedirs(media_dir, exist_ok=True)
+            db_path = os.path.join(media_dir, "music_search_idx.sqlite3")
             conn = sqlite3.connect(db_path)
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
@@ -826,7 +816,7 @@ class MusicManager:
             self._ui_prefix_cache.clear()
             logger.info("🔎 Built music FTS index: %d rows (revision=%s)", inserted, self._fts_last_revision)
         except Exception as exc:
-            logger.warning("Music FTS index build failed; falling back to MPD search: %s", exc)
+            logger.warning("Music FTS index build failed; falling back to direct search: %s", exc)
             self._fts_ready = False
         finally:
             self._fts_building = False
@@ -969,7 +959,7 @@ class MusicManager:
                         return out
 
                     # FTS may return zero rows for some tokenization edge-cases;
-                    # use local SQLite LIKE fallback before touching MPD network search.
+                    # use local SQLite LIKE fallback before direct backend search.
                     like = f"%{q_norm}%"
                     cursor = self._fts_conn.execute(
                         "SELECT file,title,artist,album FROM music_search_idx WHERE searchable LIKE ? LIMIT ?",
@@ -999,7 +989,7 @@ class MusicManager:
                 except Exception as exc:
                     logger.warning("FTS query failed for '%s': %s", q, exc)
 
-            # Bounded MPD fallback: used only when local index returns no results.
+            # Bounded backend fallback: used only when local index returns no results.
             if self._fts_building or not self._fts_ready:
                 raise RuntimeError(self._fts_progress_text())
 
@@ -1076,7 +1066,7 @@ class MusicManager:
                 self._loading_playlist_event.set()  # Signal load complete (even though it failed)
                 return "Playlist name is required"
 
-            # Fast path: resolve from cache first to avoid MPD list calls on every load.
+            # Fast path: resolve from cache first to avoid list calls on every load.
             cached = self._playlist_names_cache if (time.monotonic() - self._playlist_names_cache_ts) <= self._playlist_names_cache_ttl_s else []
             actual_playlist_name = await self.resolve_playlist_name(playlist_name, refresh_if_miss=True)
             emit_latency_trace(
@@ -1291,7 +1281,7 @@ class MusicManager:
         """Play tracks from a genre."""
         start_ms = time.monotonic() * 1000
         try:
-            # Use server-side MPD query+enqueue to avoid client-side per-track loops
+            # Use server-side query+enqueue to avoid client-side per-track loops
             # that can stall for very large genres.
             clear_start = time.monotonic() * 1000
             await self.clear_queue()
@@ -1310,7 +1300,7 @@ class MusicManager:
                 try:
                     rows = await self.pool.execute_list(cmd)
                 except Exception as window_exc:
-                    # Compatibility fallback for older MPD versions without window support.
+                    # Compatibility fallback for backends without window support.
                     if offset == 0:
                         logger.debug(
                             "Genre window query failed, falling back to full search for '%s': %s",
@@ -1378,13 +1368,13 @@ class MusicManager:
             if volume_after_play is not None and volume_after_play <= 0:
                 await self.set_volume(100)
                 logger.warning(
-                    "MPD volume was 0 during genre playback; auto-raised to 100%% to avoid silent playback"
+                    "Music volume was 0 during genre playback; auto-raised to 100%% to avoid silent playback"
                 )
                 return f"Playing {queue_len} {genre} tracks (volume was muted, set to 100%)"
             
             enabled_outputs = await self.get_enabled_output_names()
             if not enabled_outputs:
-                return f"Playing {queue_len} {genre} tracks, but MPD has no enabled audio outputs"
+                return f"Playing {queue_len} {genre} tracks, but no audio outputs are enabled"
 
             return f"Playing {queue_len} {genre} tracks"
         except Exception as e:
@@ -1597,27 +1587,34 @@ class MusicManager:
     async def get_ui_playlist(self, limit: int = 200, timeout: float = 6.0) -> list:
         """Return a compact queue list for the web UI music page."""
         t0 = time.monotonic()
-        try:
-            # Fetch only as many items as we'll display to avoid connection timeouts on huge queues
-            query_timeout = max(0.5, float(timeout))
-            queue = await self.get_queue(limit=limit, timeout=query_timeout)
-            t_queue = time.monotonic()
-            result = []
-            for i, item in enumerate(queue[:limit]):
+        query_timeout = max(0.5, float(timeout))
+
+        def _to_ui_rows(queue_items: list[dict], out_limit: int) -> list[dict]:
+            rows: list[dict] = []
+            for i, item in enumerate((queue_items or [])[:out_limit]):
                 raw_dur = item.get("duration") or item.get("time") or item.get("Time") or 0
                 try:
                     dur = float(raw_dur)
                 except (TypeError, ValueError):
                     dur = 0.0
-                result.append({
-                    "pos": int(item.get("pos", item.get("Pos", i)) or i),
-                    "id": item.get("id", item.get("Id", "")),
-                    "title": item.get("title") or item.get("Title") or item.get("file", "").split("/")[-1],
-                    "artist": item.get("artist") or item.get("Artist", ""),
-                    "album": item.get("album") or item.get("Album", ""),
-                    "file": item.get("file", ""),
-                    "duration": dur,
-                })
+                rows.append(
+                    {
+                        "pos": int(item.get("pos", item.get("Pos", i)) or i),
+                        "id": item.get("id", item.get("Id", "")),
+                        "title": item.get("title") or item.get("Title") or item.get("file", "").split("/")[-1],
+                        "artist": item.get("artist") or item.get("Artist", ""),
+                        "album": item.get("album") or item.get("Album", ""),
+                        "file": item.get("file", ""),
+                        "duration": dur,
+                    }
+                )
+            return rows
+
+        try:
+            # Fetch only as many items as we'll display to avoid connection timeouts on huge queues.
+            queue = await self.get_queue(limit=limit, timeout=query_timeout)
+            t_queue = time.monotonic()
+            result = _to_ui_rows(queue, limit)
             t_loop = time.monotonic()
             elapsed_ms = (t_loop - t0) * 1000
             queue_ms = (t_queue - t0) * 1000
@@ -1626,5 +1623,26 @@ class MusicManager:
                 logger.info(f"⏱️ get_ui_playlist({limit}): {elapsed_ms:.1f}ms total (queue:{queue_ms:.1f}ms, loop:{loop_ms:.1f}ms)")
             return result
         except Exception as e:
-            logger.error(f"Failed to get UI playlist: {e}")
-            return []
+            preview_limit = max(1, min(40, int(limit)))
+            preview_timeout = min(query_timeout, 2.0)
+            logger.warning(
+                "get_ui_playlist full fetch failed (limit=%d timeout=%.1fs): %s; retrying preview limit=%d timeout=%.1fs",
+                limit,
+                query_timeout,
+                e,
+                preview_limit,
+                preview_timeout,
+            )
+            try:
+                preview = await self.get_queue(limit=preview_limit, timeout=preview_timeout)
+                result = _to_ui_rows(preview, preview_limit)
+                logger.info(
+                    "⏱️ get_ui_playlist preview fallback returned %d rows (limit=%d timeout=%.1fs)",
+                    len(result),
+                    preview_limit,
+                    preview_timeout,
+                )
+                return result
+            except Exception as preview_exc:
+                logger.error(f"Failed to get UI playlist: {preview_exc}")
+                return []

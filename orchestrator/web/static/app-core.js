@@ -32,7 +32,8 @@ const S = {
         recordings:[], recordingsDetail:null, recordingsDetailLoading:false,
         recordingsSelectionByIds:{}, recordingsLastCheckedId:null,
         recordingsActionError:'', recordingsActionErrorTs:0, lastRecordingsRev:0,
-        recordingsDeletePending:false, recorderStartPending:false,
+        recordingsDeletePending:false, recorderStartPending:false, recorderStopPending:false,
+        recorderActive:false,
         timers:[], page:'home',
     audioCtx:null, mediaStream:null, processor:null, lastLevel:0,
     feedbackAudioCtx:null,
@@ -458,6 +459,9 @@ function startWsPingTimer(){
     S.wsPingTimer=setInterval(()=>{
         if(S.ws && S.ws.readyState === WebSocket.OPEN){
             try { S.ws.send(JSON.stringify({type:'ping'})); } catch(_) {}
+            if(S.page==='music' && typeof sendAction==='function'){
+                sendAction({type:'music_list_playlists'});
+            }
         }
     }, 30000);
 }
@@ -555,7 +559,15 @@ function updateNavActiveState(){
         el.classList.toggle('text-gray-300', !isActive);
     });
 }
-window.addEventListener('hashchange',()=>{ S.page=getPage(); renderPage(); updateNavActiveState(); closeMenu(); });
+window.addEventListener('hashchange',()=>{
+    S.page=getPage();
+    renderPage();
+    updateNavActiveState();
+    closeMenu();
+    if(S.page==='music' && typeof sendAction==='function'){
+        sendAction({type:'music_list_playlists'});
+    }
+});
 
 function closeMenu(){ document.getElementById('menuDropdown').classList.add('hidden'); }
 function closeMicControlMenu(){ const m=document.getElementById('micControlDropdown'); if(m) m.classList.add('hidden'); }

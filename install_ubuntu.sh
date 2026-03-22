@@ -132,10 +132,8 @@ PACKAGES+=(
     "pulseaudio-utils"
 )
 
-# Music player (MPD for voice-controlled playlist creation)
+# Music/audio helpers for native backend
 PACKAGES+=(
-    "mpd"
-    "mpc"
     "alsa-utils"
 )
 
@@ -245,24 +243,20 @@ config[AUDIO_CAPTURE_DEVICE]="${config[AUDIO_CAPTURE_DEVICE]:-default}"
 read -p "Audio playback device (default: 'default'): " -r -e config[AUDIO_PLAYBACK_DEVICE]
 config[AUDIO_PLAYBACK_DEVICE]="${config[AUDIO_PLAYBACK_DEVICE]:-default}"
 
-# Music Player (MPD) configuration
+# Music backend configuration
 echo ""
-echo -e "${YELLOW}Music Player (MPD) Configuration:${NC}"
-read -p "Enable MPD music player? (y/n, default: y): " -r -e config[ENABLE_MPD]
-config[ENABLE_MPD]="${config[ENABLE_MPD]:-y}"
+echo -e "${YELLOW}Music Backend Configuration:${NC}"
+read -p "Enable music backend? (y/n, default: y): " -r -e config[ENABLE_MUSIC]
+config[ENABLE_MUSIC]="${config[ENABLE_MUSIC]:-y}"
 
-if [[ "${config[ENABLE_MPD]}" =~ ^[Yy] ]]; then
-    read -p "Music library directory (default: ~/Music): " -r -e config[MPD_MUSIC_DIRECTORY]
-    config[MPD_MUSIC_DIRECTORY]="${config[MPD_MUSIC_DIRECTORY]:-~/Music}"
-    read -p "MPD port (default: 6600): " -r -e config[MPD_PORT]
-    config[MPD_PORT]="${config[MPD_PORT]:-6600}"
-    
-    # Update MPD library after configuration
-    echo -e "${YELLOW}Updating MPD library... (this may take a minute)${NC}"
-    mpc update 2>/dev/null || echo "Note: Run 'mpc update' manually after starting MPD"
+if [[ "${config[ENABLE_MUSIC]}" =~ ^[Yy] ]]; then
+    read -p "Music library directory (default: ~/Music): " -r -e config[MEDIA_LIBRARY_ROOT]
+    config[MEDIA_LIBRARY_ROOT]="${config[MEDIA_LIBRARY_ROOT]:-~/Music}"
+    read -p "Playlist directory (default: playlists): " -r -e config[PLAYLIST_ROOT]
+    config[PLAYLIST_ROOT]="${config[PLAYLIST_ROOT]:-playlists}"
 else
-    config[MPD_MUSIC_DIRECTORY]=""
-    config[MPD_PORT]="6600"
+    config[MEDIA_LIBRARY_ROOT]=""
+    config[PLAYLIST_ROOT]="playlists"
 fi
 
 # Gateway configuration
@@ -350,11 +344,13 @@ AUDIO_PLAYBACK_DEVICE=${config[AUDIO_PLAYBACK_DEVICE]}
 AUDIO_SAMPLE_RATE=16000
 AUDIO_FRAME_MS=20
 
-# Music Player Configuration (MPD)
-MPD_ENABLED=${config[ENABLE_MPD]:-y}
-MPD_MUSIC_DIRECTORY=${config[MPD_MUSIC_DIRECTORY]:-~/Music}
-MPD_PORT=${config[MPD_PORT]:-6600}
-MPD_HOST=localhost
+# Music Backend Configuration (native)
+MUSIC_ENABLED=${config[ENABLE_MUSIC]:-y}
+MEDIA_PLAYER_BACKEND=native
+MEDIA_LIBRARY_ROOT=${config[MEDIA_LIBRARY_ROOT]:-~/Music}
+MEDIA_INDEX_DB_PATH=.media/library.sqlite3
+PLAYLIST_ROOT=${config[PLAYLIST_ROOT]:-playlists}
+MUSIC_COMMAND_TIMEOUT_S=8.0
 
 # Gateway Configuration
 GATEWAY_URL=${config[GATEWAY_URL]}

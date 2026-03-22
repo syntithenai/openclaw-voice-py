@@ -31,6 +31,16 @@ UI_PORT = 18950
 WS_PORT = 18951
 
 
+def test_state_snapshot_includes_music_playlists() -> None:
+    service = EmbeddedVoiceWebService(host=HOST, ui_port=UI_PORT, ws_port=WS_PORT)
+    service._music_playlists_cache = ["Default", "Rock Classics"]
+
+    snapshot = service._build_state_snapshot()
+
+    assert snapshot["type"] == "state_snapshot"
+    assert snapshot["music_playlists"] == ["Default", "Rock Classics"]
+
+
 def _chrome_options() -> Options:
     options = Options()
     options.add_argument("--headless=new")

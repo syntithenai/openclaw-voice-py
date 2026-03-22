@@ -118,10 +118,8 @@ PACKAGES+=(
     "pulseaudio-utils"
 )
 
-# Music player (MPD for voice-controlled playlist creation)
+# Music/audio helpers for native backend
 PACKAGES+=(
-    "mpd"
-    "mpc"
     "alsa-utils"
     "snapserver"
     "snapclient"
@@ -313,24 +311,20 @@ config[AUDIO_CAPTURE_DEVICE]="${config[AUDIO_CAPTURE_DEVICE]:-pulse}"
 read -p "Audio playback device (default: 'pulse'): " -r -e config[AUDIO_PLAYBACK_DEVICE]
 config[AUDIO_PLAYBACK_DEVICE]="${config[AUDIO_PLAYBACK_DEVICE]:-pulse}"
 
-# Music Player (MPD) configuration
+# Music backend configuration
 echo ""
-echo -e "${YELLOW}Music Player (MPD) Configuration:${NC}"
-read -p "Enable MPD music player? (y/n, default: y): " -r -e config[ENABLE_MPD]
-config[ENABLE_MPD]="${config[ENABLE_MPD]:-y}"
+echo -e "${YELLOW}Music Backend Configuration:${NC}"
+read -p "Enable music backend? (y/n, default: y): " -r -e config[ENABLE_MUSIC]
+config[ENABLE_MUSIC]="${config[ENABLE_MUSIC]:-y}"
 
-if [[ "${config[ENABLE_MPD]}" =~ ^[Yy] ]]; then
-    read -p "Music library directory (default: ~/Music): " -r -e config[MPD_MUSIC_DIRECTORY]
-    config[MPD_MUSIC_DIRECTORY]="${config[MPD_MUSIC_DIRECTORY]:-~/Music}"
-    read -p "MPD port (default: 6600): " -r -e config[MPD_PORT]
-    config[MPD_PORT]="${config[MPD_PORT]:-6600}"
-    
-    # Update MPD library after configuration
-    echo -e "${YELLOW}Updating MPD library... (this may take a minute)${NC}"
-    mpc update 2>/dev/null || echo "Note: Run 'mpc update' manually after starting MPD"
+if [[ "${config[ENABLE_MUSIC]}" =~ ^[Yy] ]]; then
+    read -p "Music library directory (default: ~/Music): " -r -e config[MEDIA_LIBRARY_ROOT]
+    config[MEDIA_LIBRARY_ROOT]="${config[MEDIA_LIBRARY_ROOT]:-~/Music}"
+    read -p "Playlist directory (default: playlists): " -r -e config[PLAYLIST_ROOT]
+    config[PLAYLIST_ROOT]="${config[PLAYLIST_ROOT]:-playlists}"
 else
-    config[MPD_MUSIC_DIRECTORY]=""
-    config[MPD_PORT]="6600"
+    config[MEDIA_LIBRARY_ROOT]=""
+    config[PLAYLIST_ROOT]="playlists"
 fi
 
 # Gateway configuration
@@ -470,23 +464,13 @@ AUDIO_PLAYBACK_DEVICE=${config[AUDIO_PLAYBACK_DEVICE]}
 AUDIO_SAMPLE_RATE=16000
 AUDIO_FRAME_MS=20
 
-# Music Player Configuration (MPD)
-MPD_ENABLED=${config[ENABLE_MPD]:-y}
+# Music Backend Configuration (native)
 MUSIC_ENABLED=$MUSIC_ENABLED_VALUE
-MPD_MUSIC_DIRECTORY=${config[MPD_MUSIC_DIRECTORY]:-~/Music}
-MPD_PORT=${config[MPD_PORT]:-6600}
-MPD_HOST=localhost
-MPD_FIFO_HOST_PATH=/tmp/openclaw-mpd-fifo
-MPD_FIFO_ENABLED=false
-MPD_FIFO_PATH=/tmp/openclaw-mpd-fifo/music.pcm
-MPD_FIFO_SAMPLE_RATE=44100
-MPD_FIFO_CHANNELS=2
-MPD_FIFO_BITS_PER_SAMPLE=16
-MPD_FIFO_CHUNK_BYTES=16384
-MPD_MIX_GAIN=1.0
-MPD_MIX_DUCK_TTS_GAIN=0.30
-MPD_MIX_DUCK_ALARM_GAIN=0.12
-MPD_MIX_DUCK_LISTENING_GAIN=0.25
+MEDIA_PLAYER_BACKEND=native
+MEDIA_LIBRARY_ROOT=${config[MEDIA_LIBRARY_ROOT]:-~/Music}
+MEDIA_INDEX_DB_PATH=.media/library.sqlite3
+PLAYLIST_ROOT=${config[PLAYLIST_ROOT]:-playlists}
+MUSIC_COMMAND_TIMEOUT_S=8.0
 SNAPCAST_ENABLED=true
 SNAPCAST_HOST=localhost
 SNAPCAST_PORT=1705
@@ -580,14 +564,6 @@ apply_wakeword_engine_config() {
 
 apply_wakeword_engine_config "$ENV_FILE"
 echo -e "${GREEN}✓ Enforced wake word engine: ${config[WAKE_WORD_ENGINE]}${NC}"
-
-mkdir -p /tmp/openclaw-mpd-fifo || true
-chmod 0777 /tmp/openclaw-mpd-fifo || true
-if [ ! -p /tmp/openclaw-mpd-fifo/music.pcm ]; then
-    rm -f /tmp/openclaw-mpd-fifo/music.pcm || true
-    mkfifo -m 0666 /tmp/openclaw-mpd-fifo/music.pcm || true
-fi
-chmod 0666 /tmp/openclaw-mpd-fifo/music.pcm || true
 
 echo ""
 echo -e "${BLUE}Ensuring wakeword resources...${NC}"

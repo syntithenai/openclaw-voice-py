@@ -1,10 +1,10 @@
 # Music Control System - Quick Start Guide
 
-This guide helps you get the music control system up and running with MPD (Music Player Daemon).
+This guide helps you get the music control system up and running with the native backend.
 
 ## Overview
 
-The music control system provides voice-controlled music playback via MPD with:
+The music control system provides voice-controlled music playback via the native backend with:
 - **Fast-path parsing** for instant responses (<200ms)
 - **LLM fallback** for complex queries
 - **Automatic library scanning** on first run
@@ -19,8 +19,10 @@ Add to your `.env` file:
 ```bash
 # Music Control
 MUSIC_ENABLED=true
-MPD_HOST=127.0.0.1
-MPD_PORT=6600
+MEDIA_PLAYER_BACKEND=native
+MEDIA_LIBRARY_ROOT=music
+MEDIA_INDEX_DB_PATH=.media/library.sqlite3
+PLAYLIST_ROOT=playlists
 MUSIC_LIBRARY_HOST_PATH=/home/stever/Music
 ```
 
@@ -31,7 +33,7 @@ docker-compose up -d
 ```
 
 The system will automatically:
-- Start orchestrator-managed MPD with your music library mounted
+- Start the in-process native music backend
 - Scan the library if empty (first run)
 - Initialize the music router with fast-path parsing
 
@@ -50,24 +52,24 @@ Try these commands:
 
 ```
 User Voice Input
-       ↓
-Fast-Path Parser (regex patterns) →  Match? → MusicManager → MPD
-       ↓                                              ↓
-    No match                                      Response
-       ↓
+   ↓
+Fast-Path Parser (regex patterns) → Match? → MusicManager → Native Backend
+   ↓                                             ↓
+    No match                                     Response
+   ↓
 LLM with Tool Calling → music_play_genre() → MusicRouter → Response
 ```
 
 ### Components
 
-1. **MPDClient** (`orchestrator/music/mpd_client.py`)
-   - Low-level MPD protocol communication
-   - Connection pooling for instant command execution
-   - Automatic reconnection on connection loss
+1. **NativeMusicClient** (`orchestrator/music/native_client.py`)
+   - In-process command compatibility layer
+   - Connection-style pooling interface
+   - Native queue/search/playback control
 
 2. **MusicManager** (`orchestrator/music/manager.py`)
    - High-level operations (play, pause, search, etc.)
-   - Wraps MPD commands in user-friendly methods
+   - Wraps backend commands in user-friendly methods
    - Handles library management (auto-scan on empty)
 
 3. **MusicFastPathParser** (`orchestrator/music/parser.py`)
@@ -82,7 +84,7 @@ LLM with Tool Calling → music_play_genre() → MusicRouter → Response
 
 ## Manual Testing
 
-### Test MPD Connection
+### Test Backend Connection
 
 ```bash
 python test_music_system.py --test connection
@@ -108,15 +110,15 @@ python test_music_system.py
 2. Voice command: "update library" or "scan music"
 3. Wait ~2 seconds for scan to complete
 
-Or manually:
+Or manually via validator:
 ```bash
-docker-compose exec orchestrator-linux-alsa mpc update
+./.venv_orchestrator/bin/python validate_native_music_integration.py
 ```
 
 ### Check Library Status
 
 ```bash
-docker-compose exec orchestrator-linux-alsa mpc stats
+docker-compose exec orchestrator-linux-alsa ./.venv_orchestrator/bin/python validate_native_music_integration.py
 ```
 
 ### View Orchestrator Logs
@@ -125,7 +127,7 @@ docker-compose exec orchestrator-linux-alsa mpc stats
 docker-compose logs orchestrator-linux-alsa
 ```
 
-### Clear MPD State (Fresh Start)
+### Clear Backend State (Fresh Start)
 
 ```bash
 docker-compose down
@@ -171,14 +173,14 @@ docker-compose up -d
 2. Voice command: "update library"
 3. Verify: `docker-compose exec orchestrator-linux-alsa mpc stats`
 
-### MPD Connection Failed
+### Backend Initialization Failed
 
-**Symptom:** "Failed to connect to MPD at mpd:6600"
+**Symptom:** music commands return backend initialization error
 
 **Solution:**
 1. Check orchestrator is running: `docker-compose ps orchestrator-linux-alsa`
-2. Check MPD inside the orchestrator container: `docker-compose exec orchestrator-linux-alsa mpc status`
-3. Verify environment: `echo $MPD_HOST` (should be `127.0.0.1` in Docker)
+2. Run validator in container: `docker-compose exec orchestrator-linux-alsa ./.venv_orchestrator/bin/python validate_native_music_integration.py`
+3. Verify environment: `echo $MEDIA_PLAYER_BACKEND` (should be `native`)
 
 ### Library Not Updating
 
@@ -206,16 +208,14 @@ docker-compose up -d
 ```
 orchestrator/music/
 ├── __init__.py           # Module exports
-├── mpd_client.py         # TCP client + connection pool
+├── native_client.py      # Native client surface
+├── mpd_client.py         # Compatibility command layer
 ├── manager.py            # High-level operations
 ├── parser.py             # Fast-path regex patterns
 └── router.py             # Request routing + tool handling
 
-orchestrator/services/
-├── mpd_manager.py        # MPD lifecycle management
-└── mpd.conf              # Bundled MPD configuration
-
 test_music_system.py      # Test suite
+validate_native_music_integration.py
 ```
 
 ## Next Steps
@@ -227,7 +227,7 @@ test_music_system.py      # Test suite
 
 ## Additional Resources
 
-- [MPD Protocol Reference](https://mpd.readthedocs.io/en/latest/protocol.html)
+- [FFmpeg Documentation](https://ffmpeg.org/documentation.html)
 - [MUSIC_CONTROL_PLAN.md](MUSIC_CONTROL_PLAN.md) - Full implementation plan
 - [.env.example](.env.example) - All configuration options (baseline)
 - [.env.docker.example](.env.docker.example) - Docker profile template

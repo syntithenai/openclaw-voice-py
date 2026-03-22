@@ -1,1 +1,1 @@
-"""Orchestrator service management (MPD, etc.)."""
+"""Orchestrator service management package."""

@@ -18,10 +18,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libportaudio2 \
     portaudio19-dev \
     libsndfile1 \
-    mpd \
-    mpc \
     alsa-utils \
     pulseaudio-utils \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt requirements-optional.txt ./
@@ -30,7 +29,6 @@ RUN pip install --no-cache-dir -r requirements.txt && \
 
 COPY orchestrator ./orchestrator
 
-RUN mkdir -p /tmp/openclaw-mpd/playlists /tmp/mpd-fifo /music && \
-    touch /tmp/openclaw-mpd/database /tmp/openclaw-mpd/state /tmp/openclaw-mpd/sticker.sql
+RUN mkdir -p /music /app/workspace/.media /app/workspace/playlists
 
 CMD ["python", "-m", "orchestrator.main"]

@@ -176,6 +176,16 @@ function handleMsg(msg){
             S.recordingsActionError = String(msg.error||'Failed to start recording');
             if(S.page==='recordings') renderRecordingsPage(document.getElementById('main'));
             break;
+        case 'recorder_stop_ack':
+            S.recorderStopPending = false;
+            S.recordingsActionError = '';
+            if(S.page==='recordings') renderRecordingsPage(document.getElementById('main'));
+            break;
+        case 'recorder_stop_error':
+            S.recorderStopPending = false;
+            S.recordingsActionError = String(msg.error||'Failed to stop recording');
+            if(S.page==='recordings') renderRecordingsPage(document.getElementById('main'));
+            break;
         case 'music_transport':
             if(msg.music_rev!==undefined){
                 const rev=Number(msg.music_rev)||0;
@@ -210,7 +220,10 @@ function handleMsg(msg){
                 const t0 = performance.now();
                 renderMusicPage(document.getElementById('main'));
                 const elapsed = performance.now() - t0;
-                if(msg.queue && msg.queue.length > 50) console.timeEnd('🎵 music_queue render'), console.log(`  → renderMusicPage: ${elapsed.toFixed(1)}ms for ${msg.queue.length} items`);
+                if(msg.queue && msg.queue.length > 50){
+                    console.timeEnd('🎵 music_queue render');
+                    console.log(`  → renderMusicPage: ${elapsed.toFixed(1)}ms for ${msg.queue.length} items`);
+                }
             }
             applyMusicHeader();
             break;
@@ -249,6 +262,9 @@ function handleMsg(msg){
                 // music_queue broadcast once the queue is ready, but we also poll as
                 // belt-and-suspenders in case the broadcast is missed.
                 requestMusicStateRetry('post_load_ack', 8, 2000);
+            }
+            if(['music_save_playlist','music_create_playlist','music_delete_playlist'].includes(String(msg.action||''))){
+                sendAction({type:'music_list_playlists'});
             }
             if(S.page==='music') renderMusicPage(document.getElementById('main'));
             applyMusicHeader();
@@ -410,7 +426,13 @@ function applyOrch(o){
   if(o.tts_playing!==undefined) S.tts_playing=!!o.tts_playing;
   if(o.mic_rms!==undefined)     S.mic_rms=Number(o.mic_rms)||0;
   if(o.mic_enabled!==undefined) S.micEnabled=!!o.mic_enabled;
-  if(o.recorder_active!==undefined) S.recorderActive=!!o.recorder_active;
+  if(o.recorder_active!==undefined) {
+    const wasActive = S.recorderActive;
+    S.recorderActive=!!o.recorder_active;
+    if(S.recorderActive && !wasActive) { S.recorderStartPending=false; }
+    if(!S.recorderActive && wasActive) { S.recorderStopPending=false; }
+    if(S.recorderActive !== wasActive && S.page==='recordings') renderRecordingsPage(document.getElementById('main'));
+  }
   if(S.wake_state !== prevWake || S.micEnabled !== prevMicEnabled){
     console.log('[orch] wake_state:', prevWake, '→', S.wake_state, '| micEnabled:', prevMicEnabled, '→', S.micEnabled, '| voice='+S.voice_state);
   }
@@ -428,7 +450,10 @@ function syncMusicFromQueue(){
     if(title) S.music.title = title;
     if(artist) S.music.artist = artist;
     if(album) S.music.album = album;
-    if(current.file) S.music.file = current.file;
+    if(current.file){
+        const hasBrowserOverride = String(S.music.file||'').includes('/.openclaw-transcoded/');
+        if(!(S.browserAudioEnabled && hasBrowserOverride)) S.music.file = current.file;
+    }
 }
 function applyMusicQueueHighlight(){
     if(S.page!=='music') return;
@@ -453,9 +478,62 @@ function applyMusic(m){
     S.music.state=normalizeMusicState(S.music.state);
     reconcilePendingMusicLoads();
     syncMusicFromQueue();
+    syncBrowserMusicPlayback();
     applyTopMusicProgress();
     applyMusicHeader();
     applyMusicQueueHighlight();
+}
+
+function _ensureBrowserMusicAudio(){
+    if(S._browserMusicAudio) return S._browserMusicAudio;
+    const audio = new Audio();
+    audio.preload = 'metadata';
+    audio.crossOrigin = 'anonymous';
+    S._browserMusicAudio = audio;
+    return audio;
+}
+
+function _mediaUrlForFile(filePath){
+    const raw = String(filePath||'').trim();
+    if(!raw) return '';
+    const parts = raw.split('/').map(p=>encodeURIComponent(p));
+    return '/files/media/' + parts.join('/');
+}
+
+function syncBrowserMusicPlayback(){
+    try{
+        const browserEnabled = !!S.browserAudioEnabled;
+        const music = S.music || {};
+        const state = normalizeMusicState(music.state);
+        const filePath = String(music.file||'').trim();
+        const audio = _ensureBrowserMusicAudio();
+
+        if(!browserEnabled){
+            if(!audio.paused) audio.pause();
+            return;
+        }
+
+        if(!filePath){
+            if(!audio.paused) audio.pause();
+            return;
+        }
+
+        const src = _mediaUrlForFile(filePath);
+        if(src && audio.dataset.currentSrc !== src){
+            audio.src = src;
+            audio.dataset.currentSrc = src;
+        }
+
+        if(state === 'play'){
+            const playPromise = audio.play();
+            if(playPromise && typeof playPromise.catch === 'function') playPromise.catch(()=>{});
+        } else if(state === 'pause'){
+            if(!audio.paused) audio.pause();
+        } else {
+            if(!audio.paused) audio.pause();
+            try { audio.currentTime = 0; } catch {}
+        }
+    }catch {}
 }
 
 function reconcilePendingMusicLoads(){

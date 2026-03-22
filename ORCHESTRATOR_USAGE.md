@@ -10,7 +10,6 @@ docker compose up -d
 This starts:
 - ✅ whisper (auto backend: CPU by default, GPU if exposed)
 - ✅ piper (auto backend: CPU by default, GPU if exposed)
-- ✅ mpd
 - ✅ **orchestrator-linux-alsa** (ALSA direct hardware)
 
 ## Why ALSA is Default

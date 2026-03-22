@@ -6,11 +6,12 @@ import logging
 import time
 import sys
 import os
+import pytest
 
 # Add to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from orchestrator.music.mpd_client import MPDClientPool
+from orchestrator.music import NativeMusicClientPool
 from orchestrator.music.manager import MusicManager
 
 logging.basicConfig(
@@ -20,11 +21,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+@pytest.mark.asyncio
 async def test_music_operations():
     """Test search and playlist operations for bottlenecks."""
     
-    # Connect to MPD
-    pool = MPDClientPool(
+    # Connect to music backend
+    pool = NativeMusicClientPool(
         host="127.0.0.1",
         port=6600,
         pool_size=6,  # Updated to new size

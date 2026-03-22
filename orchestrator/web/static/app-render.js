@@ -44,6 +44,9 @@ function renderMusicPage(main){
     if(!playlistFilter) return true;
     return n.toLowerCase().includes(playlistFilter);
   });
+  const playlistEmptyState = playlistFilter && (S.musicPlaylists||[]).length > 0
+    ? 'No playlists match your filter'
+    : 'No playlists found';
   const playlistRows=filteredPlaylists.map(name=>{
     const n=String(name||'').trim();
     if(!n) return '';
@@ -155,15 +158,14 @@ function renderMusicPage(main){
   main.innerHTML='<div class="max-w-6xl mx-auto px-2 py-4 space-y-3">'
     +'<div class="grid grid-cols-1 md:grid-cols-4 gap-3">'
       +'<div class="rounded-xl border border-gray-800 bg-gray-900/40 md:col-span-1 overflow-hidden">'
-        +'<div class="px-3 py-2 flex items-center justify-between gap-2 border-b border-gray-800">'
+        +'<div class="px-3 py-2 border-b border-gray-800">'
           +'<div class="text-sm font-semibold text-left">Playlists</div>'
-          +'<button data-action="music-refresh-playlists" class="px-2 py-1 rounded-lg text-xs bg-gray-700 hover:bg-gray-600 transition-colors">Refresh Playlists</button>'
         +'</div>'
         +'<div class="px-2 py-2 border-b border-gray-800">'
           +'<input id="musicPlaylistSearch" type="search" value="'+esc(S.musicPlaylistFilter||'')+'" placeholder="Search playlists" class="w-full rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
         +'</div>'
         +'<div class="max-h-72 overflow-y-auto p-0 text-left">'
-          +(playlistRows || '<p class="text-xs text-gray-500 px-3 py-3 text-left">No playlists found</p>')
+          +(playlistRows || '<p class="text-xs text-gray-500 px-3 py-3 text-left">'+esc(playlistEmptyState)+'</p>')
         +'</div>'
       +'</div>'
       +'<div class="md:col-span-3 space-y-3">'
@@ -337,6 +339,11 @@ function renderRecordingsPage(main){
   }).join('');
 
   const starting=!!S.recorderStartPending;
+  const stopping=!!S.recorderStopPending;
+  const recActive=!!S.recorderActive;
+  const recBtn = recActive
+    ? '<button data-action="recordings-stop-recording" class="px-3 py-1.5 rounded-lg text-sm bg-red-700 hover:bg-red-600 transition-colors" '+(stopping?'disabled style="opacity:.6;cursor:not-allowed"':'')+'>'+(stopping?'Stopping…':'Stop Recording')+'</button>'
+    : '<button data-action="recordings-start-recording" class="px-3 py-1.5 rounded-lg text-sm bg-green-700 hover:bg-green-600 transition-colors" '+(starting?'disabled style="opacity:.6;cursor:not-allowed"':'')+'>'+(starting?'Starting…':'Start Recording')+'</button>';
   main.innerHTML='<div class="max-w-5xl mx-auto px-2 py-4 space-y-3">'
     +'<div class="flex items-center justify-between gap-2 px-2 flex-wrap">'
       +'<h2 class="font-semibold text-lg">Recordings <span class="text-gray-400 font-normal text-sm ml-1">'+(S.recordings||[]).length+'</span></h2>'
@@ -344,7 +351,7 @@ function renderRecordingsPage(main){
         +(selectedCount>0
           ? '<button data-action="recordings-delete-selected" class="px-3 py-1.5 rounded-lg text-sm bg-red-800 hover:bg-red-700 transition-colors" '+(deleting?'disabled style="opacity:.6;cursor:not-allowed"':'')+'>'+(deleting?'Deleting…':'Delete Selected Recordings ('+selectedCount+')')+'</button>'
           : '')
-        +'<button data-action="recordings-start-recording" class="px-3 py-1.5 rounded-lg text-sm bg-green-700 hover:bg-green-600 transition-colors" '+(starting?'disabled style="opacity:.6;cursor:not-allowed"':'')+'>'+(starting?'Starting…':'Start Recording')+'</button>'
+        +recBtn
       +'</div>'
     +'</div>'
     +(err?'<div class="px-2 text-xs text-red-300">⚠ '+esc(err)+'</div>':'')

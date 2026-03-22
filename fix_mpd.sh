@@ -1,22 +1,21 @@
 #!/bin/bash
-# MPD Setup Script
+# Native music backend setup helper
 
 set -e
 
-echo "Setting up MPD directories..."
+echo "Setting up native music backend directories..."
 
-# Create all required directories
-mkdir -p ~/.config/mpd/playlists
-mkdir -p ~/.mpdstate/playlists
-
-# Create empty database file
-touch ~/.config/mpd/database
+# Create required local directories.
+mkdir -p ./music
+mkdir -p ./playlists
+mkdir -p ./.media
 
 echo "✓ Directories created"
-ls -la ~/.config/mpd/
+ls -la ./music ./playlists ./.media
 
-echo ""
-echo "Directories ready. Now starting MPD..."
-echo "Run: mpd ~/.config/mpd/mpd.conf"
-echo ""
-echo "Then verify with: mpc status"
+echo
+echo "Directories ready. To initialize the media index run:"
+echo "  ./.venv_orchestrator/bin/python validate_native_music_integration.py"
+echo
+echo "Then start orchestrator and run:"
+echo "  /music scan"

@@ -1,651 +1,529 @@
-"""
-MPD (Music Player Daemon) TCP client with connection pooling.
+from __future__ import annotations
 
-Provides low-level MPD protocol communication with:
-- Automatic reconnection on connection loss
-- Connection pooling for instant command execution
-- Proper command parsing and response handling
-"""
-
+import sqlite3
 import asyncio
-import itertools
 import logging
+import os
+import shlex
 import time
-from typing import Optional, Dict, List
 from contextlib import asynccontextmanager
-from orchestrator.observability.latency_trace import emit as emit_latency_trace
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from .library_index import LibraryIndex
+from .playlist_store import PlaylistStore
+from .native_player import NativePlayer
 
 logger = logging.getLogger(__name__)
 
 
-_TRACE_COMMAND_PREFIXES = ("status", "playlistinfo", "play", "random")
+@dataclass
+class QueueItem:
+    file: str
+    id: int
 
 
-def _command_preview(command: str, limit: int = 120) -> str:
-    text = str(command or "").strip()
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit-3]}..."
+class _NativeMusicBackend:
+    def __init__(self) -> None:
+        workspace = Path(os.getenv("OPENCLAW_WORKSPACE_DIR", str(Path.cwd()))).resolve()
+        configured_library = Path(os.getenv("MEDIA_LIBRARY_ROOT", "/music")).expanduser()
+        library_root = configured_library.resolve() if configured_library.is_absolute() else (workspace / configured_library).resolve()
+        if not library_root.exists():
+            try:
+                library_root.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                library_root = (workspace / "music").resolve()
+                library_root.mkdir(parents=True, exist_ok=True)
+        playlist_root = Path(os.getenv("PLAYLIST_ROOT", str(workspace / "playlists"))).expanduser().resolve()
+        db_path = Path(os.getenv("MEDIA_INDEX_DB_PATH", str(workspace / ".media" / "library.sqlite3"))).expanduser().resolve()
+
+        self.library = LibraryIndex(str(db_path), str(library_root))
+        self.library_root = library_root
+        self.playlists = PlaylistStore(str(playlist_root))
+        self.player = NativePlayer(str(library_root))
+
+        self.queue: list[QueueItem] = []
+        self.current_pos: int = -1
+        self.state: str = "stop"
+        self.volume: int = 100
+        self.random_enabled: bool = False
+        self.repeat_enabled: bool = False
+        self.elapsed_anchor_ts: float = 0.0
+        self.elapsed_anchor_value: float = 0.0
+        self._song_id_seq = 1000
+        self.playlist_version = 0
+        self.last_db_update = int(time.time())
+        self.browser_file_override: str = ""
+        self._startup_index_done = False
+        self._startup_index_lock = asyncio.Lock()
+        self._startup_index_task: asyncio.Task[None] | None = None
+        self._indexing_active = False
+
+    def _on_startup_index_done(self, task: asyncio.Task[None]) -> None:
+        try:
+            task.result()
+            logger.warning("✓ Music index startup scan completed in background")
+            print("✓ Music index startup scan completed in background", flush=True)
+        except Exception as exc:
+            logger.warning("✗ Music index startup scan failed: %s", exc)
+            print(f"✗ Music index startup scan failed: {exc}", flush=True)
+        finally:
+            if self._startup_index_task is task:
+                self._startup_index_task = None
+
+    def start_startup_index(self) -> None:
+        if self._startup_index_done:
+            logger.info("Music index startup scan skipped: already initialized")
+            print("   Music index: startup scan skipped (already initialized)", flush=True)
+            return
+        if self._startup_index_task and not self._startup_index_task.done():
+            logger.warning("Music index startup scan already running in background")
+            return
+        task = asyncio.create_task(self.ensure_startup_index())
+        self._startup_index_task = task
+        task.add_done_callback(self._on_startup_index_done)
+        logger.warning("↻ Music index startup scan scheduled in background")
+        print("↻ Music index: startup scan scheduled in background", flush=True)
+
+    async def ensure_startup_index(self) -> None:
+        if self._startup_index_done:
+            logger.info("Music index startup scan skipped: already initialized")
+            print("   Music index: startup scan skipped (already initialized)", flush=True)
+            return
+        async with self._startup_index_lock:
+            if self._startup_index_done:
+                logger.info("Music index startup scan skipped: already initialized")
+                print("   Music index: startup scan skipped (already initialized)", flush=True)
+                return
+
+            # Check for incomplete rebuild from previous crash/restart
+            try:
+                is_incomplete = self.library.detect_incomplete_rebuild()
+            except sqlite3.DatabaseError:
+                is_incomplete = False
+
+            if is_incomplete:
+                logger.warning("🔄 Music index: resuming incomplete rebuild from previous startup")
+                print("🔄 Music index: resuming from incomplete rebuild", flush=True)
+                try:
+                    self.library.cleanup_incomplete_rebuild()
+                except sqlite3.DatabaseError:
+                    logger.warning(
+                        "⚠️ Could not complete rebuild cleanup due to db corruption; recovery will happen during scan"
+                    )
+
+            started = time.monotonic()
+            logger.warning("🔍 Music index startup scan started in background")
+            print("🔍 Music index: startup scan started", flush=True)
+            result = await self.execute("update")
+            self._startup_index_done = True
+            elapsed = time.monotonic() - started
+            songs = result.get("songs", "0")
+            logger.warning(
+                "✓ Music index startup scan complete (background): songs=%s elapsed=%.1fs",
+                songs,
+                elapsed,
+            )
+            print(
+                f"✓ Music index: startup scan complete (songs={songs}, elapsed={elapsed:.1f}s)",
+                flush=True,
+            )
+
+    def set_output_route(self, route: str) -> None:
+        self.player.set_output_route(route)
+
+    def _next_id(self) -> int:
+        self._song_id_seq += 1
+        return self._song_id_seq
+
+    def _touch_playlist(self) -> None:
+        self.playlist_version += 1
+
+    def _current_item(self) -> QueueItem | None:
+        if 0 <= self.current_pos < len(self.queue):
+            return self.queue[self.current_pos]
+        return None
+
+    def _current_track(self) -> dict[str, str]:
+        item = self._current_item()
+        if not item:
+            return {}
+        track = self.library.get_track(item.file) or {"file": item.file}
+        if self.player.output_route == "browser" and self.browser_file_override:
+            track["file"] = self.browser_file_override
+        track["id"] = str(item.id)
+        track["pos"] = str(self.current_pos)
+        return track
+
+    def _set_state(self, state: str) -> None:
+        if state == "play":
+            self.elapsed_anchor_ts = time.monotonic()
+        else:
+            self.elapsed_anchor_value = self._elapsed_now()
+        self.state = state
+
+    def _elapsed_now(self) -> float:
+        if self.state != "play":
+            return float(self.elapsed_anchor_value)
+        return max(0.0, float(self.elapsed_anchor_value) + (time.monotonic() - self.elapsed_anchor_ts))
+
+    async def _play_pos(self, pos: int) -> None:
+        if not self.queue:
+            self.current_pos = -1
+            self.state = "stop"
+            return
+        pos = max(0, min(pos, len(self.queue) - 1))
+        self.current_pos = pos
+        self.elapsed_anchor_value = 0.0
+        ok = await self.player.play(self.queue[pos].file, seek_s=0)
+        self.browser_file_override = ""
+        if self.player.output_route == "browser" and self.player.browser_stream_path:
+            try:
+                rel = Path(self.player.browser_stream_path).resolve().relative_to(self.library_root)
+                self.browser_file_override = rel.as_posix()
+            except Exception:
+                self.browser_file_override = self.queue[pos].file
+        self._set_state("play" if ok else "stop")
+
+    async def execute(self, command: str, timeout: float | None = None) -> Dict[str, str]:
+        del timeout
+        cmd = str(command or "").strip()
+        if not cmd:
+            return {}
+        parts = shlex.split(cmd)
+        if not parts:
+            return {}
+
+        op = parts[0].lower()
+
+        if op == "status":
+            current = self._current_item()
+            track = self.library.get_track(current.file) if current else None
+            duration = float(track.get("duration", "0") or 0.0) if track else 0.0
+            return {
+                "state": self.state,
+                "song": str(self.current_pos if self.current_pos >= 0 else -1),
+                "songid": str(current.id if current else ""),
+                "playlistlength": str(len(self.queue)),
+                "playlist": str(self.playlist_version),
+                "elapsed": f"{self._elapsed_now():.3f}",
+                "duration": f"{duration:.3f}",
+                "volume": str(self.volume),
+                "random": "1" if self.random_enabled else "0",
+                "repeat": "1" if self.repeat_enabled else "0",
+            }
+
+        if op == "currentsong":
+            return self._current_track()
+
+        if op == "stats":
+            return self.library.stats()
+
+        if op == "play":
+            pos = self.current_pos if len(parts) < 2 else int(parts[1])
+            if pos < 0:
+                pos = 0
+            await self._play_pos(pos)
+            return {}
+
+        if op == "pause":
+            on = len(parts) > 1 and parts[1] == "1"
+            if on:
+                await self.player.pause()
+                self._set_state("pause")
+            else:
+                if self.state == "pause":
+                    await self.player.pause()
+                    self._set_state("play")
+                elif self.state == "stop":
+                    await self._play_pos(max(0, self.current_pos))
+            return {}
+
+        if op == "stop":
+            await self.player.stop()
+            self._set_state("stop")
+            return {}
+
+        if op == "next":
+            if self.queue:
+                nxt = (self.current_pos + 1) % len(self.queue)
+                await self._play_pos(nxt)
+            return {}
+
+        if op == "previous":
+            if self.queue:
+                prv = (self.current_pos - 1) % len(self.queue)
+                await self._play_pos(prv)
+            return {}
+
+        if op == "seekcur":
+            target = int(float(parts[1])) if len(parts) > 1 else 0
+            ok = await self.player.seek(target)
+            if ok:
+                self.elapsed_anchor_value = float(target)
+                self.elapsed_anchor_ts = time.monotonic()
+                if self.state != "pause":
+                    self.state = "play"
+            return {}
+
+        if op == "setvol":
+            level = int(parts[1]) if len(parts) > 1 else self.volume
+            self.volume = max(0, min(100, level))
+            return {}
+
+        if op == "clear":
+            self.queue = []
+            self.current_pos = -1
+            await self.player.stop()
+            self._set_state("stop")
+            self._touch_playlist()
+            return {}
+
+        if op == "add":
+            file_uri = parts[1]
+            self.queue.append(QueueItem(file=file_uri, id=self._next_id()))
+            self._touch_playlist()
+            return {}
+
+        if op == "addid":
+            file_uri = parts[1]
+            pos = int(parts[2]) if len(parts) > 2 else len(self.queue)
+            item = QueueItem(file=file_uri, id=self._next_id())
+            pos = max(0, min(pos, len(self.queue)))
+            self.queue.insert(pos, item)
+            if self.current_pos >= pos:
+                self.current_pos += 1
+            self._touch_playlist()
+            return {"Id": str(item.id)}
+
+        if op == "delete":
+            pos = int(parts[1])
+            if 0 <= pos < len(self.queue):
+                del self.queue[pos]
+                if self.current_pos == pos:
+                    self.current_pos = min(pos, len(self.queue) - 1)
+                elif self.current_pos > pos:
+                    self.current_pos -= 1
+                if not self.queue:
+                    await self.player.stop()
+                    self._set_state("stop")
+                self._touch_playlist()
+            return {}
+
+        if op == "deleteid":
+            sid = int(parts[1])
+            idx = next((i for i, it in enumerate(self.queue) if it.id == sid), -1)
+            if idx >= 0:
+                await self.execute(f"delete {idx}")
+            return {}
+
+        if op == "random":
+            self.random_enabled = len(parts) > 1 and parts[1] == "1"
+            return {}
+
+        if op == "repeat":
+            self.repeat_enabled = len(parts) > 1 and parts[1] == "1"
+            return {}
+
+        if op == "load":
+            name = parts[1]
+            entries = self.playlists.read_playlist(name)
+            self.queue = [QueueItem(file=e, id=self._next_id()) for e in entries]
+            self.current_pos = -1
+            self._touch_playlist()
+            return {}
+
+        if op == "save":
+            name = parts[1]
+            self.playlists.write_playlist(name, [it.file for it in self.queue])
+            return {}
+
+        if op == "rm":
+            name = parts[1]
+            self.playlists.delete_playlist(name)
+            return {}
+
+        if op == "playlistadd":
+            name = parts[1]
+            file_uri = parts[2]
+            self.playlists.append_to_playlist(name, file_uri)
+            return {}
+
+        if op == "update":
+            stats = self.library.stats()
+            song_count = int(stats.get("songs", "0") or 0)
+            self._indexing_active = True
+            try:
+                if song_count <= 0:
+                    logger.info("Music index update mode=full reason=empty-db")
+                    await asyncio.to_thread(self.library.rebuild)
+                else:
+                    logger.info(
+                        "Music index update mode=incremental reason=existing-db songs_before=%d",
+                        song_count,
+                    )
+                    scan_result = await asyncio.to_thread(self.library.scan_incremental)
+                    logger.info(
+                        "Music index incremental scan result indexed=%d changed=%d",
+                        int(scan_result.get("indexed", 0)),
+                        int(scan_result.get("changed", 0)),
+                    )
+            finally:
+                self._indexing_active = False
+            count = int(self.library.stats().get("songs", "0") or 0)
+            self.last_db_update = int(time.time())
+            return {"updating_db": "1", "songs": str(count)}
+
+        return {}
+
+    async def execute_list(self, command: str, timeout: float | None = None) -> List[Dict[str, str]]:
+        del timeout
+        cmd = str(command or "").strip()
+        if not cmd:
+            return []
+        parts = shlex.split(cmd)
+        if not parts:
+            return []
+        op = parts[0].lower()
+
+        if op == "outputs":
+            route = self.player.output_route
+            return [
+                {"outputid": "1", "outputname": "browser", "outputenabled": "1" if route == "browser" else "0"},
+                {"outputid": "2", "outputname": "local", "outputenabled": "1" if route != "browser" else "0"},
+            ]
+
+        if op == "playlistinfo":
+            start = 0
+            end = len(self.queue)
+            if len(parts) > 1 and ":" in parts[1]:
+                a, b = parts[1].split(":", 1)
+                start = max(0, int(a or 0))
+                end = min(len(self.queue), int(b or len(self.queue)))
+            elif len(parts) > 1:
+                idx = int(parts[1])
+                start = max(0, idx)
+                end = min(len(self.queue), idx + 1)
+            out: list[dict[str, str]] = []
+            for pos in range(start, end):
+                it = self.queue[pos]
+                # During index writes, avoid per-row DB reads so playlist UX stays responsive.
+                if self._indexing_active:
+                    track = {"file": it.file}
+                else:
+                    track = self.library.get_track(it.file) or {"file": it.file}
+                row = dict(track)
+                row["id"] = str(it.id)
+                row["pos"] = str(pos)
+                row.setdefault("file", it.file)
+                out.append(row)
+            return out
+
+        if op == "listplaylists":
+            return [{"playlist": name} for name in self.playlists.list_playlists()]
+
+        if op == "listall":
+            return self.library.list_all()
+
+        if op == "search":
+            if len(parts) < 3:
+                return []
+            field = parts[1].lower()
+            query = parts[2]
+            limit = None
+            offset = 0
+            if "window" in parts:
+                i = parts.index("window")
+                if i + 1 < len(parts) and ":" in parts[i + 1]:
+                    a, b = parts[i + 1].split(":", 1)
+                    offset = max(0, int(a or 0))
+                    end = max(offset, int(b or offset))
+                    limit = max(0, end - offset)
+            if field == "file" and not str(query).strip():
+                rows = self.library.list_all()
+                if limit is None:
+                    return rows[offset:]
+                return rows[offset : offset + limit]
+            return self.library.search(field, query, limit=limit, offset=offset)
+
+        return []
 
 
-def _should_trace_command(command: str) -> bool:
-    stripped = str(command or "").strip().lower()
-    return any(stripped == prefix or stripped.startswith(f"{prefix} ") for prefix in _TRACE_COMMAND_PREFIXES)
-
-
-def _log_command_timing(kind: str, command: str, conn_label: str, elapsed_ms: float, extra: str = "") -> None:
-    preview = _command_preview(command)
-    suffix = f" {extra}" if extra else ""
-    if elapsed_ms >= 1000:
-        logger.warning("⏱️ MPD %s %s on %s took %.1fms%s", kind, preview, conn_label, elapsed_ms, suffix)
-    else:
-        logger.info("⏱️ MPD %s %s on %s took %.1fms%s", kind, preview, conn_label, elapsed_ms, suffix)
-
-
-def _command_kind(command: str) -> str:
-    stripped = str(command or "").strip().lower()
-    if not stripped:
-        return "unknown"
-    if stripped.startswith("playlistinfo") or stripped.startswith("listplaylists"):
-        return "list"
-    if stripped.startswith("search"):
-        return "search"
-    if stripped.startswith("status"):
-        return "status"
-    if stripped.startswith("clear") or stripped.startswith("load") or stripped.startswith("play") or stripped.startswith("pause") or stripped.startswith("stop"):
-        return "control"
-    return "other"
+_BACKEND = _NativeMusicBackend()
 
 
 class MPDConnection:
-    """Single TCP connection to MPD server."""
-    _id_counter = itertools.count(1)
-    
+    _id = 0
+
     def __init__(self, host: str, port: int, timeout: float = 5.0):
-        self.host = host
-        self.port = port
+        del host, port
         self.timeout = timeout
-        self._reader: Optional[asyncio.StreamReader] = None
-        self._writer: Optional[asyncio.StreamWriter] = None
         self._connected = False
-        self._lock = asyncio.Lock()
-        self._last_activity_ts = 0.0
-        self._conn_id = next(self._id_counter)
+        MPDConnection._id += 1
+        self._label = f"native#{MPDConnection._id}"
 
     @property
     def label(self) -> str:
-        return f"mpd#{self._conn_id}"
-    
+        return self._label
+
     async def connect(self) -> bool:
-        """Establish connection to MPD server."""
-        started = time.monotonic()
-        try:
-            self._reader, self._writer = await asyncio.wait_for(
-                asyncio.open_connection(self.host, self.port),
-                timeout=self.timeout
-            )
-            
-            # Read MPD welcome message
-            welcome = await asyncio.wait_for(
-                self._reader.readline(),
-                timeout=self.timeout
-            )
-            
-            if not welcome.startswith(b"OK MPD"):
-                logger.error(f"Invalid MPD welcome: {welcome}")
-                await self.close()
-                return False
-            
-            self._connected = True
-            self._last_activity_ts = time.monotonic()
-            logger.info(
-                "Connected %s to MPD at %s:%s in %.1fms",
-                self.label,
-                self.host,
-                self.port,
-                (time.monotonic() - started) * 1000,
-            )
-            return True
-            
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout connecting to MPD at {self.host}:{self.port}")
-            return False
-        except Exception as e:
-            logger.error(f"Failed to connect to MPD: {e}")
-            return False
-    
+        self._connected = True
+        return True
+
     async def close(self):
-        """Close the connection."""
-        if self._writer:
-            try:
-                self._writer.close()
-                await self._writer.wait_closed()
-            except Exception as e:
-                logger.debug(f"Error closing connection: {e}")
-        
-        self._reader = None
-        self._writer = None
         self._connected = False
-    
+
     @property
     def is_connected(self) -> bool:
-        """Check if connection is active."""
-        return self._connected and self._writer is not None and not self._writer.is_closing()
-    
+        return self._connected
+
     async def send_command(self, command: str, timeout: float | None = None) -> Dict[str, str]:
-        """
-        Send a command to MPD and parse the response.
-        
-        Args:
-            command: MPD protocol command (e.g., "status", "play", "search artist Beatles")
-        
-        Returns:
-            Dictionary of key-value pairs from response
-        
-        Raises:
-            ConnectionError: If not connected or connection lost
-            ValueError: If MPD returns an error response
-        """
-        async with self._lock:
-            op_timeout = float(timeout) if timeout is not None else self.timeout
-            trace_command = _should_trace_command(command)
-            started = time.monotonic()
-            if not self.is_connected or self._reader is None or self._writer is None:
-                raise ConnectionError("Not connected to MPD")
-            
-            try:
-                if trace_command:
-                    logger.info(
-                        "→ MPD command %s on %s (timeout=%.1fs)",
-                        _command_preview(command),
-                        self.label,
-                        op_timeout,
-                    )
-                # Send command
-                self._writer.write(f"{command}\n".encode('utf-8'))
-                await asyncio.wait_for(
-                    self._writer.drain(),
-                    timeout=op_timeout
-                )
-                
-                # Read response
-                response = {}
-                while True:
-                    # Re-check connection state in case close() was called while reading
-                    if self._reader is None:
-                        raise ConnectionError("Connection lost to MPD during command")
-                    
-                    line = await asyncio.wait_for(
-                        self._reader.readline(),
-                        timeout=op_timeout
-                    )
-                    
-                    if not line:
-                        raise ConnectionError("Connection closed by MPD")
-                    
-                    line = line.decode('utf-8').strip()
-                    
-                    # Check for completion
-                    if line == "OK":
-                        break
-                    
-                    # Check for errors
-                    if line.startswith("ACK"):
-                        error_msg = line[4:].strip() if len(line) > 4 else "Unknown error"
-                        raise ValueError(f"MPD error: {error_msg}")
-                    
-                    # Parse key-value pair
-                    if ": " in line:
-                        key, value = line.split(": ", 1)
-                        # Handle multiple values for same key (e.g., multiple files)
-                        if key in response:
-                            # Convert to list if needed
-                            if not isinstance(response[key], list):
-                                response[key] = [response[key]]
-                            response[key].append(value)
-                        else:
-                            response[key] = value
+        return await _BACKEND.execute(command, timeout)
 
-                if trace_command:
-                    extra = f"keys={len(response)}"
-                    _log_command_timing("command", command, self.label, (time.monotonic() - started) * 1000, extra)
-                
-                return response
-                
-            except asyncio.TimeoutError:
-                logger.error("Timeout waiting for MPD response on %s for %s", self.label, _command_preview(command))
-                self._connected = False
-                raise ConnectionError("MPD command timeout")
-            except Exception as e:
-                logger.error("Error sending MPD command on %s for %s: %s", self.label, _command_preview(command), e)
-                self._connected = False
-                raise
-            finally:
-                if self._connected:
-                    self._last_activity_ts = time.monotonic()
-    
     async def send_command_list(self, send_cmd: str = "", timeout: float | None = None) -> List[Dict[str, str]]:
-        """
-        Send command and read response for list commands that return multiple items.
-        
-        Args:
-            send_cmd: MPD protocol command to send (if empty, just reads response)
-            timeout: Overall timeout for the entire command in seconds (applied to total elapsed time, not per-readline)
-        
-        Returns:
-            List of dictionaries, one per item
-        """
-        async with self._lock:
-            op_timeout = float(timeout) if timeout is not None else self.timeout
-            trace_command = _should_trace_command(send_cmd)
-            started = time.monotonic()
-            deadline = started + op_timeout  # Track overall deadline instead of per-readline
-            if not self.is_connected or self._reader is None or self._writer is None:
-                raise ConnectionError("Not connected to MPD")
-            
-            try:
-                # Send command if provided
-                if send_cmd:
-                    if trace_command:
-                        logger.info(
-                            "→ MPD list %s on %s (timeout=%.1fs)",
-                            _command_preview(send_cmd),
-                            self.label,
-                            op_timeout,
-                        )
-                    self._writer.write(f"{send_cmd}\n".encode('utf-8'))
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise asyncio.TimeoutError("Timeout before sending command")
-                    await asyncio.wait_for(
-                        self._writer.drain(),
-                        timeout=remaining
-                    )
-                
-                items = []
-                current_item = {}
-                
-                while True:
-                    # Re-check connection state in case close() was called while reading
-                    if self._reader is None:
-                        raise ConnectionError("Connection lost to MPD during list read")
-                    
-                    # Check if we've exceeded overall deadline
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise asyncio.TimeoutError(f"Timeout reading MPD list response (got {len(items)} items so far)")
-                    
-                    line = await asyncio.wait_for(
-                        self._reader.readline(),
-                        timeout=remaining
-                    )
-                    
-                    if not line:
-                        self._connected = False
-                        raise ConnectionError("Connection closed by MPD during list read")
-                    
-                    line = line.decode('utf-8').strip()
-                    
-                    if line == "OK":
-                        if current_item:
-                            items.append(current_item)
-                        break
-                    
-                    if line.startswith("ACK"):
-                        error_msg = line[4:].strip() if len(line) > 4 else "Unknown error"
-                        raise ValueError(f"MPD error: {error_msg}")
-                    
-                    if ": " in line:
-                        key, value = line.split(": ", 1)
-                        
-                        # New item starts when MPD emits another primary key for list-like commands.
-                        # Common boundaries: file (playlist/search), outputid (outputs),
-                        # playlist (listplaylists).
-                        if key in {"file", "outputid", "playlist"} and current_item:
-                            items.append(current_item)
-                            current_item = {}
-                        
-                        current_item[key] = value
-
-                if trace_command:
-                    extra = f"items={len(items)}"
-                    _log_command_timing("list", send_cmd, self.label, (time.monotonic() - started) * 1000, extra)
-                
-                return items
-                
-            except asyncio.TimeoutError:
-                logger.error("Timeout waiting for MPD list response on %s for %s", self.label, _command_preview(send_cmd))
-                self._connected = False
-                raise ConnectionError("MPD command timeout")
-            except ConnectionError:
-                # Connection errors are already handled
-                raise
-            except Exception as e:
-                logger.error("Error in MPD list response on %s for %s: %s", self.label, _command_preview(send_cmd), e)
-                self._connected = False
-                raise ConnectionError(f"MPD list response error: {e}")
-            finally:
-                if self._connected:
-                    self._last_activity_ts = time.monotonic()
+        return await _BACKEND.execute_list(send_cmd, timeout)
 
     async def send_command_batch(self, commands: List[str], timeout: float | None = None) -> None:
-        """Send multiple non-query commands via MPD command list mode."""
-        async with self._lock:
-            op_timeout = float(timeout) if timeout is not None else self.timeout
-            if not self.is_connected or self._reader is None or self._writer is None:
-                raise ConnectionError("Not connected to MPD")
-            if not commands:
-                return
-
-            try:
-                payload_lines = ["command_list_ok_begin", *commands, "command_list_end", ""]
-                self._writer.write("\n".join(payload_lines).encode("utf-8"))
-                await asyncio.wait_for(self._writer.drain(), timeout=op_timeout)
-
-                while True:
-                    if self._reader is None:
-                        raise ConnectionError("Connection lost to MPD during batch command")
-
-                    line = await asyncio.wait_for(self._reader.readline(), timeout=op_timeout)
-                    if not line:
-                        self._connected = False
-                        raise ConnectionError("Connection closed by MPD during batch command")
-
-                    line = line.decode("utf-8").strip()
-                    if line == "OK":
-                        break
-                    if line == "list_OK":
-                        continue
-                    if line.startswith("ACK"):
-                        error_msg = line[4:].strip() if len(line) > 4 else "Unknown error"
-                        raise ValueError(f"MPD error: {error_msg}")
-
-            except asyncio.TimeoutError:
-                logger.error("Timeout waiting for MPD batch response")
-                self._connected = False
-                raise ConnectionError("MPD batch command timeout")
-            except Exception as e:
-                logger.error(f"Error sending MPD batch command: {e}")
-                self._connected = False
-                raise
-            finally:
-                if self._connected:
-                    self._last_activity_ts = time.monotonic()
-
-    async def ensure_alive(self, idle_probe_after_s: float = 4.0) -> bool:
-        """Best-effort liveness probe for potentially stale idle sockets."""
-        if not self.is_connected:
-            return False
-        if (time.monotonic() - self._last_activity_ts) < idle_probe_after_s:
-            return True
-        try:
-            logger.info("↻ MPD liveness probe on %s after %.1fs idle", self.label, time.monotonic() - self._last_activity_ts)
-            await self.send_command("ping", timeout=min(1.5, max(0.5, self.timeout)))
-            return True
-        except Exception as exc:
-            logger.warning("↻ MPD liveness probe failed on %s: %s", self.label, exc)
-            self._connected = False
-            return False
+        for command in commands:
+            await _BACKEND.execute(command, timeout)
 
 
 class MPDClientPool:
-    """
-    Connection pool for MPD clients.
-    
-    Maintains a pool of connections to MPD for instant command execution.
-    Handles automatic reconnection and connection health monitoring.
-    """
-    
-    def __init__(self, host: str, port: int, pool_size: int = 3, timeout: float = 8.0):
-        self.host = host
-        self.port = port
-        self.pool_size = pool_size
+    def __init__(self, host: str = "localhost", port: int = 6600, pool_size: int = 3, timeout: float = 5.0):
+        del host, port, pool_size
         self.timeout = timeout
-        self._pool: List[MPDConnection] = []
-        self._available: asyncio.Queue = asyncio.Queue()
-        self._lock = asyncio.Lock()
-        self._initialized = False
-    
-    async def initialize(self):
-        """Initialize the connection pool."""
-        async with self._lock:
-            if self._initialized:
-                return
-            
-            logger.info(f"Initializing MPD connection pool (size={self.pool_size})")
-            
-            for i in range(self.pool_size):
-                conn = MPDConnection(self.host, self.port, self.timeout)
-                if await conn.connect():
-                    self._pool.append(conn)
-                    await self._available.put(conn)
-                else:
-                    logger.warning(f"Failed to initialize connection {i+1}/{self.pool_size}")
-            
-            if not self._pool:
-                raise ConnectionError(f"Failed to establish any connections to MPD at {self.host}:{self.port}")
-            
-            self._initialized = True
-            logger.info(f"MPD connection pool initialized with {len(self._pool)} connections")
-    
-    async def close(self):
-        """Close all connections in the pool."""
-        async with self._lock:
-            # Cancel any pending FTS rebuild tasks before closing connections
-            # This prevents errors when FTS rebuild tries to use closed connections
-            for conn in self._pool:
-                await conn.close()
-            self._pool.clear()
-            
-            # Clear the queue
-            while not self._available.empty():
-                try:
-                    self._available.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-            
-            self._initialized = False
-            logger.info("MPD connection pool closed")
-    
-    @asynccontextmanager
-    async def get_connection(self):
-        """
-        Get a connection from the pool (context manager).
-        
-        Usage:
-            async with pool.get_connection() as conn:
-                result = await conn.send_command("status")
-        """
-        if not self._initialized:
-            await self.initialize()
-        
-        # Get connection from pool
-        acquire_started = time.monotonic()
-        emit_latency_trace("mpd_pool.acquire_start", pool_size=self.pool_size)
-        conn: MPDConnection = await self._available.get()
-        emit_latency_trace(
-            "mpd_pool.acquire_done",
-            conn=conn.label,
-            pool_size=self.pool_size,
-            wait_ms=(time.monotonic() - acquire_started) * 1000.0,
-        )
+        self._conn = MPDConnection("", 0, timeout)
 
+    async def initialize(self) -> bool:
+        await self._conn.connect()
+        # Build/update index once per backend startup, even if multiple pools initialize.
         try:
-            # Check if connection is still valid, reconnect if needed
-            if not conn.is_connected:
-                logger.info("↻ Reconnecting stale %s", conn.label)
-                if not await conn.connect():
-                    logger.warning("Failed to reconnect to MPD; keeping connection in pool for future retry")
-                    raise ConnectionError("Failed to reconnect to MPD")
-            elif not await conn.ensure_alive(idle_probe_after_s=4.0):
-                logger.warning("↻ %s failed liveness probe; reconnecting", conn.label)
-                await conn.close()
-                if not await conn.connect():
-                    raise ConnectionError("Failed to reconnect to MPD")
+            _BACKEND.start_startup_index()
+        except Exception:
+            pass
+        return True
 
-            yield conn
-        finally:
-            # Always return connection to pool to avoid pool depletion on reconnect failures
-            await self._available.put(conn)
-    
+    async def close(self):
+        await self._conn.close()
+
     async def execute(self, command: str, timeout: float | None = None) -> Dict[str, str]:
-        """
-        Execute a single command using a pooled connection.
-        Retries once with a fresh connection if the pooled connection was stale
-        (MPD closes idle TCP connections without notifying the client).
-        
-        Args:
-            command: MPD protocol command
-        
-        Returns:
-            Dictionary of response key-value pairs
-        """
-        last_exc: Exception | None = None
-        started = time.monotonic()
-        cmd_kind = _command_kind(command)
-        emit_latency_trace("mpd_cmd.start", command=command, command_kind=cmd_kind, mode="single")
-        for attempt in (1, 2, 3):
-            async with self.get_connection() as conn:
-                try:
-                    result = await conn.send_command(command, timeout=timeout)
-                    emit_latency_trace(
-                        "mpd_cmd.done",
-                        command=command,
-                        command_kind=cmd_kind,
-                        mode="single",
-                        conn=conn.label,
-                        attempt=attempt,
-                        elapsed_ms=(time.monotonic() - started) * 1000.0,
-                    )
-                    return result
-                except ConnectionError as exc:
-                    last_exc = exc
-                    logger.warning(
-                        "↻ MPD command retry %d/3 on %s for %s after connection error: %s",
-                        attempt,
-                        conn.label,
-                        _command_preview(command),
-                        exc,
-                    )
-                    await conn.close()
-                    if attempt < 3:
-                        await asyncio.sleep(0.05 * attempt)
-                        continue
-        emit_latency_trace(
-            "mpd_cmd.error",
-            command=command,
-            command_kind=cmd_kind,
-            mode="single",
-            elapsed_ms=(time.monotonic() - started) * 1000.0,
-            error=str(last_exc or ""),
-        )
-        raise ConnectionError(f"MPD command failed after retries: {last_exc}")
-    
+        return await self._conn.send_command(command, timeout)
+
     async def execute_list(self, command: str, timeout: float | None = None) -> List[Dict[str, str]]:
-        """
-        Execute a list command and return multiple items.
-        Retries once with a fresh connection if the pooled connection was stale.
-        
-        Args:
-            command: MPD protocol command that returns multiple items
-        
-        Returns:
-            List of dictionaries, one per item
-        """
-        last_exc: Exception | None = None
-        started = time.monotonic()
-        cmd_kind = _command_kind(command)
-        emit_latency_trace("mpd_cmd.start", command=command, command_kind=cmd_kind, mode="list")
-        for attempt in (1, 2, 3):
-            async with self.get_connection() as conn:
-                try:
-                    result = await conn.send_command_list(send_cmd=command, timeout=timeout)
-                    emit_latency_trace(
-                        "mpd_cmd.done",
-                        command=command,
-                        command_kind=cmd_kind,
-                        mode="list",
-                        conn=conn.label,
-                        attempt=attempt,
-                        item_count=len(result),
-                        elapsed_ms=(time.monotonic() - started) * 1000.0,
-                    )
-                    return result
-                except ConnectionError as exc:
-                    # Don't retry on timeout — MPD is just slow, retrying wastes 3× the time
-                    if "timeout" in str(exc).lower():
-                        emit_latency_trace(
-                            "mpd_cmd.error",
-                            command=command,
-                            command_kind=cmd_kind,
-                            mode="list",
-                            conn=conn.label,
-                            attempt=attempt,
-                            elapsed_ms=(time.monotonic() - started) * 1000.0,
-                            error=str(exc),
-                        )
-                        raise
-                    last_exc = exc
-                    logger.warning(
-                        "↻ MPD list retry %d/3 on %s for %s after connection error: %s",
-                        attempt,
-                        conn.label,
-                        _command_preview(command),
-                        exc,
-                    )
-                    await conn.close()
-                    if attempt < 3:
-                        await asyncio.sleep(0.05 * attempt)
-                        continue
-        emit_latency_trace(
-            "mpd_cmd.error",
-            command=command,
-            command_kind=cmd_kind,
-            mode="list",
-            elapsed_ms=(time.monotonic() - started) * 1000.0,
-            error=str(last_exc or ""),
-        )
-        raise ConnectionError(f"MPD list command failed after retries: {last_exc}")
+        return await self._conn.send_command_list(command, timeout)
 
     async def execute_batch(self, commands: List[str], timeout: float | None = None) -> None:
-        """Execute multiple non-query commands using MPD command list mode."""
-        last_exc: Exception | None = None
-        started = time.monotonic()
-        emit_latency_trace("mpd_cmd.start", command="command_list", command_kind="batch", mode="batch", batch_size=len(commands))
-        for attempt in (1, 2, 3):
-            async with self.get_connection() as conn:
-                try:
-                    await conn.send_command_batch(commands, timeout=timeout)
-                    emit_latency_trace(
-                        "mpd_cmd.done",
-                        command="command_list",
-                        command_kind="batch",
-                        mode="batch",
-                        conn=conn.label,
-                        attempt=attempt,
-                        batch_size=len(commands),
-                        elapsed_ms=(time.monotonic() - started) * 1000.0,
-                    )
-                    return
-                except ConnectionError as exc:
-                    last_exc = exc
-                    logger.warning(
-                        "↻ MPD batch retry %d/3 on %s after connection error: %s",
-                        attempt,
-                        conn.label,
-                        exc,
-                    )
-                    await conn.close()
-                    if attempt < 3:
-                        await asyncio.sleep(0.05 * attempt)
-                        continue
-        emit_latency_trace(
-            "mpd_cmd.error",
-            command="command_list",
-            command_kind="batch",
-            mode="batch",
-            batch_size=len(commands),
-            elapsed_ms=(time.monotonic() - started) * 1000.0,
-            error=str(last_exc or ""),
-        )
-        raise ConnectionError(f"MPD batch command failed after retries: {last_exc}")
+        await self._conn.send_command_batch(commands, timeout)
+
+    @asynccontextmanager
+    async def acquire(self):
+        yield self._conn
+
+    def set_output_route(self, route: str) -> None:
+        _BACKEND.set_output_route(route)
+
+
+# Native-first names for the in-process compatibility backend.
+NativeMusicConnection = MPDConnection
+NativeMusicClientPool = MPDClientPool

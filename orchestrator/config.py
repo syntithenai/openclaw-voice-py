@@ -283,7 +283,7 @@ class VoiceConfig(BaseSettings):
     web_ui_hotword_active_ms: int = Field(2000)  # How long to keep hotword indicator active in UI after detection
     web_ui_chat_history_limit: int = Field(200)  # Max chat messages retained in web UI memory
     web_ui_chat_persist_path: str = Field("")  # Path to JSON file for durable chat thread storage; empty = ~/.openclaw/chat_state.json
-    web_ui_music_poll_ms: int = Field(1000)  # How often to poll MPD for music state (ms)
+    web_ui_music_poll_ms: int = Field(1000)  # How often to poll native music state (ms)
     web_ui_timer_poll_ms: int = Field(500)  # How often to push timer state to UI (ms)
     web_ui_mic_starts_disabled: bool = Field(True)  # Mic button starts in disabled (red) state
     web_ui_audio_authority: str = Field("native")  # native=OS mic only; browser=browser audio while connected (fallback local when disconnected); hybrid=same handoff semantics with explicit shared wake-state intent
@@ -294,8 +294,8 @@ class VoiceConfig(BaseSettings):
     web_ui_workspace_files_enabled: bool = Field(False)  # Serve files under /files/workspace
     web_ui_workspace_files_root: str = Field("")  # Root directory for /files/workspace; empty = OPENCLAW_WORKSPACE_DIR
     web_ui_workspace_files_allow_listing: bool = Field(False)  # Allow directory listing for /files/workspace
-    web_ui_media_files_enabled: bool = Field(False)  # Serve files under /files/media
-    web_ui_media_files_root: str = Field("")  # Root directory for /files/media
+    web_ui_media_files_enabled: bool = Field(True)  # Serve files under /files/media
+    web_ui_media_files_root: str = Field("music")  # Root directory for /files/media
     web_ui_media_files_allow_listing: bool = Field(False)  # Allow directory listing for /files/media
 
     # Tool System
@@ -306,14 +306,17 @@ class VoiceConfig(BaseSettings):
     tools_monitor_interval_ms: int = Field(100)  # How often to check for timer/alarm expiration
     tools_clear_on_startup: bool = Field(False)  # Legacy flag (ignored): persist active timers/alarms across process start
 
-    # Music Control (MPD)
-    music_enabled: bool = Field(False)  # Enable music control via MPD
-    mpd_host: str = Field("localhost")  # MPD server host
-    mpd_port: int = Field(6600)  # MPD server port
-    mpd_timeout: float = Field(8.0)  # Connection timeout in seconds
-    mpd_pool_size: int = Field(3)  # Keep pool small to reduce stale idle sockets and MPD disconnect churn
-    mpd_playlist_dir: str = Field("playlists")  # Relative to OPENCLAW_WORKSPACE_DIR
-    mpd_state_dir: str = Field(".mpd")  # Relative to OPENCLAW_WORKSPACE_DIR
+    # Music Control (native backend)
+    music_enabled: bool = Field(False)  # Enable orchestrator-native music control
+    media_player_backend: str = Field("native")  # native backend selector
+    media_library_root: str = Field("music")  # Root folder to index/play media from
+    media_index_db_path: str = Field(".media/library.sqlite3")  # SQLite media index path (relative to workspace if not absolute)
+    playlist_root: str = Field("playlists")  # Playlist storage root (M3U files)
+    media_transcode_only_when_needed: bool = Field(True)  # Convert formats only when direct playback is unsupported
+    media_transcode_browser_target: str = Field("aac")  # FFmpeg browser fallback target codec/container profile
+    media_transcode_local_target: str = Field("wav")  # FFmpeg local fallback target
+    music_command_timeout_s: float = Field(8.0)  # Timeout for music backend command operations
+    music_pool_size: int = Field(3)  # Keep pool small to reduce command contention
     music_fast_path_enabled: bool = Field(True)  # Enable fast-path parsing for music commands
     music_sleep_during_playback: bool = Field(True)  # Put orchestrator to sleep while music is playing
     music_auto_resume_timeout_s: int = Field(5)  # Seconds of silence before auto-resuming music after wake
@@ -323,15 +326,15 @@ class VoiceConfig(BaseSettings):
     music_tts_duck_ratio: float = Field(0.45)  # Keep this fraction of current music volume during TTS
     music_cut_in_duck_ratio: float = Field(0.50)  # Keep this fraction of current music volume during voice cut-in
     music_cut_in_duck_timeout_ms: int = Field(2000)  # Restore cut-in ducking after this timeout if not paused
-    music_pipewire_stream_normalize_enabled: bool = Field(True)  # Normalize PipeWire per-app stream volume for MPD on play/resume
-    music_pipewire_stream_target_percent: int = Field(100)  # Target PipeWire sink-input volume for MPD stream (percent)
+    music_pipewire_stream_normalize_enabled: bool = Field(True)  # Normalize PipeWire per-app stream volume on play/resume
+    music_pipewire_stream_target_percent: int = Field(100)  # Target PipeWire sink-input volume for music stream (percent)
 
     # Media Keys (Hardware button detection)
     media_keys_enabled: bool = Field(False)  # Enable hardware media key detection
     media_keys_device_filter: str = Field("")  # Optional device name filter (e.g., "Anker", "USB", "Conference")
     media_keys_exclusive_grab: bool = Field(False)  # Grab input device exclusively (usually leave false so OS volume/LED behavior works)
     media_keys_passthrough_keys: str = Field("volume_up,volume_down,mute")  # Comma-separated logical keys to re-inject to OS when exclusive grab is enabled
-    media_keys_control_music: bool = Field(False)  # Allow media keys to control MPD playback
+    media_keys_control_music: bool = Field(False)  # Allow media keys to control music playback
     media_keys_suppress_system_play: bool = Field(True)  # Pause desktop media players on wake/play-button events
     media_keys_play_scan_codes: str = Field("0xc00b6,0xc00cd")  # Comma-separated MSC_SCAN values that should be treated as play button
     media_keys_volume_up_scan_codes: str = Field("0xc00e9")  # Optional MSC_SCAN values to map to volume-up button
@@ -484,6 +487,15 @@ class VoiceConfig(BaseSettings):
             errors.append(
                 f"MEDIA_KEYS_COMMAND_DEBOUNCE_MS={self.media_keys_command_debounce_ms} must be >= 0"
             )
+
+        if self.media_player_backend.lower() not in {"native"}:
+            errors.append("MEDIA_PLAYER_BACKEND must be 'native'")
+
+        if not self.media_library_root:
+            errors.append("MEDIA_LIBRARY_ROOT must not be empty")
+
+        if not self.playlist_root:
+            errors.append("PLAYLIST_ROOT must not be empty")
 
         if not (0.05 <= self.music_tts_duck_ratio <= 1.0):
             errors.append(f"MUSIC_TTS_DUCK_RATIO={self.music_tts_duck_ratio} must be between 0.05 and 1.0")

@@ -15,8 +15,6 @@ x-orchestrator-common: &orchestrator-common
     - WHISPER_URL=http://whisper:10000
     - PIPER_URL=http://piper:10001
     - RECORDER_PYANNOTE_URL=http://pyannote:10002
-    - MPD_HOST=127.0.0.1
-    - MPD_PORT=6600
     # Model/cache paths inside container
     - SILERO_MODEL_CACHE_DIR=/app/docker/silero-models
     - OPENWAKEWORD_MODELS_DIR=/app/docker/wakeword-models
@@ -37,10 +35,8 @@ x-orchestrator-common: &orchestrator-common
     - ./.env.pi:/app/.env.pi:ro
     # Persist OpenClaw device identity for websocket auth signatures
     - ${HOME}/.openclaw:/root/.openclaw
-    # Music library for MPD skill
+    # Native music library mount
     - ${HOME}/music:/music:ro
-    # Shared MPD->orchestrator FIFO path
-    - ${MPD_FIFO_HOST_PATH:-/tmp/openclaw-mpd-fifo}:/tmp/mpd-fifo
 
 services:
   whisper:
@@ -75,9 +71,9 @@ services:
       - "1705:1705"
       - "1780:1780"
     command:
-      - "--stream.source=pipe:///tmp/mpd-fifo/music.pcm?name=mpd_fifo&mode=read&sampleformat=44100:16:2"
+      - "--stream.source=pipe:///tmp/music-fifo/music.pcm?name=music_fifo&mode=read&sampleformat=44100:16:2"
     volumes:
-      - ${MPD_FIFO_HOST_PATH:-/tmp/openclaw-mpd-fifo}:/tmp/mpd-fifo
+      - ${MUSIC_FIFO_HOST_PATH:-/tmp/openclaw-music-fifo}:/tmp/music-fifo
 
 
   piper:
@@ -157,8 +153,6 @@ services:
       - WHISPER_URL=http://127.0.0.1:10000
       - PIPER_URL=http://127.0.0.1:10001
       - OPENCLAW_GATEWAY_URL=http://127.0.0.1:18789
-      - MPD_HOST=127.0.0.1
-      - MPD_PORT=6600
       - SILERO_MODEL_CACHE_DIR=/app/docker/silero-models
       - OPENWAKEWORD_MODELS_DIR=/app/docker/wakeword-models
       - EMOTION_MODELS_DIR=/app/docker/emotion-models
@@ -178,10 +172,8 @@ services:
       - ${HOME}/.openclaw:/root/.openclaw
       - ${XDG_RUNTIME_DIR}/pulse/native:/tmp/pulse/native
       - ${HOME}/.config/pulse/cookie:/root/.config/pulse/cookie:ro
-      # Music library for MPD skill
+      # Native music library mount
       - ${HOME}/Music:/music:ro
-      # Shared MPD->orchestrator FIFO path
-      - ${MPD_FIFO_HOST_PATH:-/tmp/openclaw-mpd-fifo}:/tmp/mpd-fifo
     devices:
       - "/dev/input:/dev/input:ro"
       - "/dev/uinput:/dev/uinput"

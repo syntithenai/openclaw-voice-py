@@ -158,6 +158,7 @@ class EmbeddedVoiceWebService:
         self._on_recording_get: Callable[[str, str], Awaitable[dict[str, Any] | None]] | None = None
         self._on_recordings_delete_selected: Callable[[list[str], str], Awaitable[int]] | None = None
         self._on_recorder_start: Callable[[str], Awaitable[dict[str, Any]]] | None = None
+        self._on_recorder_stop: Callable[[str], Awaitable[dict[str, Any]]] | None = None
         self._on_resolve_recording_audio: Callable[[str], Path | None] | None = None
         self._on_timer_cancel: Callable[[str, str], Awaitable[None]] | None = None
         self._on_alarm_cancel: Callable[[str, str], Awaitable[None]] | None = None
@@ -701,6 +702,7 @@ class EmbeddedVoiceWebService:
         on_recording_get: Callable[[str, str], Awaitable[dict[str, Any] | None]] | None = None,
         on_recordings_delete_selected: Callable[[list[str], str], Awaitable[int]] | None = None,
         on_recorder_start: Callable[[str], Awaitable[dict[str, Any]]] | None = None,
+        on_recorder_stop: Callable[[str], Awaitable[dict[str, Any]]] | None = None,
         on_resolve_recording_audio: Callable[[str], Path | None] | None = None,
         on_timer_cancel: Callable[[str, str], Awaitable[None]] | None = None,
         on_alarm_cancel: Callable[[str, str], Awaitable[None]] | None = None,
@@ -748,6 +750,8 @@ class EmbeddedVoiceWebService:
             self._on_recordings_delete_selected = on_recordings_delete_selected
         if on_recorder_start is not None:
             self._on_recorder_start = on_recorder_start
+        if on_recorder_stop is not None:
+            self._on_recorder_stop = on_recorder_stop
         if on_resolve_recording_audio is not None:
             self._on_resolve_recording_audio = on_resolve_recording_audio
         if on_timer_cancel is not None:
@@ -812,13 +816,19 @@ class EmbeddedVoiceWebService:
                 "ws_port": self.ws_port,
                 "ui_port": self.ui_port,
             }))
-            # Fetch fresh music state if cache is empty (ensures page load shows current MPD state)
+            # Fetch fresh music state if cache is empty (ensures page load shows current playback state)
             if self._on_get_music_state and (not self._music_state or not self._music_queue):
                 try:
                     transport, queue = await self._on_get_music_state()
                     self._music_state.update(transport)
                     self._music_queue = list(queue)
                     self._music_rev += 1
+                except Exception:
+                    pass
+            if self._on_music_list_playlists is not None and not self._music_playlists_cache:
+                try:
+                    names = await self._on_music_list_playlists(client_id)
+                    self._music_playlists_cache = [str(n).strip() for n in (names or []) if str(n).strip()]
                 except Exception:
                     pass
             if self._on_recordings_list and not self._recordings:
@@ -971,7 +981,9 @@ class EmbeddedVoiceWebService:
                 return
             for attempt in (1, 2, 3):
                 try:
-                    transport, queue = await self._on_get_music_state()
+                    # Bound each snapshot attempt so a stuck music query cannot wedge
+                    # this task forever and block future music_state pushes.
+                    transport, queue = await asyncio.wait_for(self._on_get_music_state(), timeout=2.5)
                     # Send transport state immediately WITHOUT waiting for queue fetch
                     # (queue fetch can take 43+ seconds after loading a large playlist)
                     self.update_music_transport(**transport)
@@ -979,6 +991,11 @@ class EmbeddedVoiceWebService:
                     if queue:
                         self.update_music_queue(queue)
                     return
+                except asyncio.TimeoutError:
+                    if attempt == 3:
+                        logger.warning("music state push timed out after retries")
+                        return
+                    await asyncio.sleep(0.1 * attempt)
                 except Exception as exc:
                     if attempt == 3:
                         logger.warning("music state push failed after retries: %s", exc)
@@ -988,11 +1005,17 @@ class EmbeddedVoiceWebService:
         def _schedule_music_state_push(reason: str) -> None:
             current_task = self._music_state_push_task
             if current_task is not None and not current_task.done():
-                logger.debug(
-                    "Skipping duplicate music state push (%s); refresh already running",
-                    reason,
-                )
-                return
+                if reason == "music_load_playlist":
+                    logger.warning(
+                        "Cancelling stale music state push to prioritize playlist-load refresh"
+                    )
+                    current_task.cancel()
+                else:
+                    logger.debug(
+                        "Skipping duplicate music state push (%s); refresh already running",
+                        reason,
+                    )
+                    return
             if reason == "music_load_playlist":
                 emit_latency_trace("music_load.state_push_scheduled", action_id=action_id_str, reason=reason)
 
@@ -1087,6 +1110,18 @@ class EmbeddedVoiceWebService:
             except Exception as exc:
                 logger.warning("recorder_start handler error: %s", exc)
                 await _send_ws_json({"type": "recorder_start_error", "error": str(exc)})
+            return
+
+        if msg_type == "recorder_stop" and self._on_recorder_stop:
+            try:
+                result = await self._on_recorder_stop(client_id)
+                if result.get("success", True):
+                    await _send_ws_json({"type": "recorder_stop_ack", "response": str(result.get("response", ""))})
+                else:
+                    await _send_ws_json({"type": "recorder_stop_error", "error": str(result.get("response", "Failed to stop recording"))})
+            except Exception as exc:
+                logger.warning("recorder_stop handler error: %s", exc)
+                await _send_ws_json({"type": "recorder_stop_error", "error": str(exc)})
             return
 
         if msg_type == "music_toggle" and self._on_music_toggle:
@@ -1254,7 +1289,7 @@ class EmbeddedVoiceWebService:
                         await _send_music_action_ack("music_load_playlist", action_id)
 
                         # Push updated state/queue asynchronously to avoid blocking ACK timeout.
-                        # Large playlists can take longer to materialize on MPD; retries handled
+                        # Large playlists can take longer to materialize; retries handled
                         # inside _push_music_state_best_effort.
                         _schedule_music_state_push("music_load_playlist")
                         asyncio.create_task(_send_music_playlists_update())
@@ -1622,6 +1657,7 @@ class EmbeddedVoiceWebService:
             "ui_control_rev": self._ui_control_rev,
             "music": dict(self._music_state),
             "music_queue": list(self._music_queue),
+            "music_playlists": list(self._music_playlists_cache),
             "music_rev": self._music_rev,
             "recordings": list(self._recordings),
             "recordings_rev": self._recordings_rev,

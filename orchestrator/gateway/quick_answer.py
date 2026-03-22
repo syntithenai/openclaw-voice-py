@@ -860,7 +860,7 @@ class QuickAnswerClient:
         voice_load_complete_ts = (trace or {}).get("voice_load_complete_ts")
 
         # Push transport immediately for responsiveness.
-        # Queue fetch is expensive on some MPD instances and can saturate the shared
+        # Queue fetch is expensive on large libraries and can saturate the shared
         # list-query path; only force queue snapshot for playlist-load traces.
         try:
             transport = await manager.get_ui_music_state()
@@ -1081,7 +1081,7 @@ class QuickAnswerClient:
                         await self._emit_music_action_ack("music_load_playlist", voice_music_action_id)
                 # Fire-and-forget: ack already sent, client starts polling via
                 # requestMusicStateRetry; state sync runs in background so TTS
-                # is returned to the user without waiting for MPD queue fetch.
+                # is returned to the user without waiting for queue fetch.
                 sync_trace = None
                 if voice_music_action_id and not str(music_result).lower().startswith("error"):
                     sync_trace = {

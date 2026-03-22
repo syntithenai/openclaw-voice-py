@@ -78,7 +78,6 @@ from orchestrator.audio.sounds import (
     generate_exhale_sound,
 )
 from orchestrator.metrics import AECStatus, WakeWordResult
-from orchestrator.services.mpd_manager import MPDManager
 from orchestrator.runtime.config_validation import validate_runtime_config
 from orchestrator.platform.hardware import is_raspberry_pi
 from orchestrator.music.parser import MusicFastPathParser
@@ -93,6 +92,7 @@ class TTSQueueItem:
     request_id: int
     kind: str  # "reply" | "notification"
     created_ts: float
+    allow_when_ui_tts_muted: bool = False
 
 
 @dataclass(frozen=True)
@@ -779,27 +779,7 @@ async def run_orchestrator() -> None:
     logger.info("✓ Gateway ready in %dms", gateway_elapsed)
     print(f"✓ Gateway ready in {gateway_elapsed}ms", flush=True)
     
-    # MPD (Music Player Daemon)
-    print("→ Starting MPD...", flush=True)
-    playlist_dir = workspace_root / config.mpd_playlist_dir
-    playlist_dir.mkdir(parents=True, exist_ok=True)
-    mpd_manager = MPDManager(
-        mpd_port=6600,
-        mpd_host="127.0.0.1",
-        playlist_directory=str(playlist_dir),
-        state_directory=str(workspace_root / config.mpd_state_dir),
-    )
-    mpd_start = time.monotonic()
-    if mpd_manager.start():
-        if mpd_manager.wait_for_ready(timeout_sec=5):
-            mpd_elapsed = int((time.monotonic() - mpd_start) * 1000)
-            logger.info("✓ MPD ready in %dms", mpd_elapsed)
-            print(f"✓ MPD ready in {mpd_elapsed}ms", flush=True)
-        else:
-            logger.warning("MPD started but did not become ready within timeout")
-    else:
-        logger.warning("Failed to start MPD; music features may be unavailable")
-        mpd_manager = None
+    # Native media backend runs in-process and does not require external daemon startup.
     
     # Use the session prefix directly as a stable session name rather than appending a
     # timestamp.  A stable name means all voice interactions accumulate in one persistent
@@ -869,45 +849,41 @@ async def run_orchestrator() -> None:
         logger.info("✓ Tool System ready (persist_dir=%s)", timers_dir)
         print("✓ Tool System ready", flush=True)
     
-    # Music Control System (MPD)
+    # Music Control System (native backend)
     music_router = None
     music_manager = None
     if config.music_enabled:
-        print("→ Initializing Music Control System (MPD)...", flush=True)
+        print("→ Initializing Music Control System (native)...", flush=True)
         logger.info("→ Initializing Music Control System...")
         try:
-            from orchestrator.music import MPDClientPool, MusicManager, MusicRouter
-            
-            # Initialize MPD client pool
-            mpd_pool = MPDClientPool(
-                host=config.mpd_host,
-                port=config.mpd_port,
-                pool_size=config.mpd_pool_size,
-                timeout=config.mpd_timeout,
+            from orchestrator.music import NativeMusicClientPool, MusicManager, MusicRouter
+
+            # Initialize native music client pools.
+            music_pool = NativeMusicClientPool(
+                pool_size=config.music_pool_size,
+                timeout=config.music_command_timeout_s,
             )
             # Dedicated low-contention control pool for latency-sensitive commands
             # (e.g., clear/load/save/rm) so they do not queue behind heavy list calls.
-            mpd_control_pool = MPDClientPool(
-                host=config.mpd_host,
-                port=config.mpd_port,
+            music_control_pool = NativeMusicClientPool(
                 pool_size=1,
-                timeout=config.mpd_timeout,
+                timeout=config.music_command_timeout_s,
             )
-            mpd_initialized = False
-            mpd_attempts = 3
-            for attempt in range(1, mpd_attempts + 1):
+            music_initialized = False
+            music_attempts = 3
+            for attempt in range(1, music_attempts + 1):
                 try:
-                    await mpd_pool.initialize()
-                    await mpd_control_pool.initialize()
-                    mpd_initialized = True
+                    await music_pool.initialize()
+                    await music_control_pool.initialize()
+                    music_initialized = True
                     break
-                except Exception as mpd_init_err:
-                    if attempt < mpd_attempts:
+                except Exception as music_init_err:
+                    if attempt < music_attempts:
                         logger.warning(
-                            "MPD initialization attempt %d/%d failed (%s). Retrying in 1s...",
+                            "Music backend initialization attempt %d/%d failed (%s). Retrying in 1s...",
                             attempt,
-                            mpd_attempts,
-                            mpd_init_err,
+                            music_attempts,
+                            music_init_err,
                         )
                         await asyncio.sleep(1)
                     else:
@@ -915,50 +891,57 @@ async def run_orchestrator() -> None:
             
             # Initialize music manager
             music_manager = MusicManager(
-                mpd_pool,
-                control_pool=mpd_control_pool,
+                music_pool,
+                control_pool=music_control_pool,
                 genre_queue_limit=config.music_genre_queue_limit,
                 pipewire_stream_normalize_enabled=config.music_pipewire_stream_normalize_enabled,
                 pipewire_stream_target_percent=config.music_pipewire_stream_target_percent,
             )
+
+            # Route music audio based on current browser-audio control state.
+            # Note: web_service not yet initialized at this point, so default to local routing.
+            # It will be updated later if browser audio is enabled.
+            try:
+                browser_audio_enabled = web_service and web_service._ui_control_state.get("browser_audio_enabled", True)
+            except NameError:
+                browser_audio_enabled = False
+            
+            if browser_audio_enabled:
+                music_pool.set_output_route("browser")
+                music_control_pool.set_output_route("browser")
+            else:
+                music_pool.set_output_route("local")
+                music_control_pool.set_output_route("local")
             
             # Check if library is empty and auto-update if needed
             stats = await music_manager.get_stats()
             song_count = int(stats.get("songs", 0))
-            logger.info("MPD library has %d songs", song_count)
+            logger.info("Music library has %d songs", song_count)
 
             enabled_outputs = await music_manager.get_enabled_output_names()
             if enabled_outputs:
-                logger.info("MPD enabled outputs: %s", ", ".join(enabled_outputs))
+                logger.info("Enabled music outputs: %s", ", ".join(enabled_outputs))
                 if len(enabled_outputs) == 1 and enabled_outputs[0].strip().lower() == "null output":
                     logger.warning(
-                        "MPD is using only Null Output (silent). Check orchestrator container audio routing (Pulse/ALSA)."
+                        "Music backend is using only Null Output (silent). Check orchestrator container audio routing (Pulse/ALSA)."
                     )
                 elif len(enabled_outputs) > 1:
                     logger.warning(
-                        "MPD has multiple outputs enabled (%s). Ducking may sound inconsistent depending on active route; "
+                        "Music backend has multiple outputs enabled (%s). Ducking may sound inconsistent depending on active route; "
                         "prefer a single primary output with software mixer.",
                         ", ".join(enabled_outputs),
                     )
             else:
-                logger.warning("MPD reports no enabled outputs; playback will be silent")
+                logger.warning("Music backend reports no enabled outputs; playback will be silent")
             
             if song_count == 0:
-                logger.info("Library is empty - triggering automatic scan...")
-                print("  → Library is empty - scanning music directory...", flush=True)
-                update_result = await music_manager.update_library()
-                logger.info("Auto-scan initiated: %s", update_result)
-                
-                # Wait briefly and check again
-                await asyncio.sleep(2)
-                stats = await music_manager.get_stats()
-                new_song_count = int(stats.get("songs", 0))
-                if new_song_count > 0:
-                    logger.info("✓ Library scan complete: %d songs indexed", new_song_count)
-                    print(f"  ✓ Library scan complete: {new_song_count} songs", flush=True)
-                else:
-                    logger.warning("Library still empty after scan - check music directory")
-                    print("  ⚠ Library still empty - check music directory", flush=True)
+                logger.info(
+                    "Library is empty at startup; background index scan is running and songs will appear progressively"
+                )
+                print(
+                    "  → Library is empty - background indexing is running (results will appear progressively)",
+                    flush=True,
+                )
             
             # Initialize music router
             music_router = MusicRouter(music_manager)
@@ -969,9 +952,7 @@ async def run_orchestrator() -> None:
         except Exception as e:
             logger.error("Failed to initialize Music Control System: %s", e)
             logger.warning(
-                "Music control disabled for this run. If using Docker MPD from host orchestrator, ensure MPD is running and reachable at %s:%s",
-                config.mpd_host,
-                config.mpd_port,
+                "Music control disabled for this run due to backend initialization failure."
             )
             print(f"✗ Music Control System initialization failed: {e}", flush=True)
             music_router = None
@@ -2009,6 +1990,13 @@ async def run_orchestrator() -> None:
 
             async def _ui_browser_audio_set(enabled: bool, client_id: str) -> None:
                 web_service.update_ui_control_state(browser_audio_enabled=bool(enabled))
+                if music_manager and hasattr(music_manager, "pool") and hasattr(music_manager.pool, "set_output_route"):
+                    try:
+                        music_manager.pool.set_output_route("browser" if enabled else "local")
+                        if getattr(music_manager, "control_pool", None) is not None and hasattr(music_manager.control_pool, "set_output_route"):
+                            music_manager.control_pool.set_output_route("browser" if enabled else "local")
+                    except Exception as exc:
+                        logger.debug("Failed to update native music output route: %s", exc)
 
             async def _ui_continuous_mode_set(enabled: bool, client_id: str) -> None:
                 nonlocal wake_state, state, last_wake_detected_ts, last_activity_ts, wake_sleep_ts
@@ -2054,7 +2042,7 @@ async def run_orchestrator() -> None:
                 
                 # Queue and playlists are refreshed by the web_ui_publisher when it detects
                 # transport metadata (loaded_playlist, queue_length) changing. This avoids
-                # concurrent queue fetches that can saturate the MPD connection pool on
+                # concurrent queue fetches that can saturate the music connection pool on
                 # large playlists.
 
             async def _ui_get_music_state_snapshot() -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -2158,6 +2146,10 @@ async def run_orchestrator() -> None:
                         result = await music_manager.load_playlist(name)
                         if str(result).strip().lower().startswith("error:"):
                             raise RuntimeError(result)
+                        # Emit a lightweight transport hint immediately so UI/voice clients
+                        # observe the loaded playlist even if a full state snapshot is slow.
+                        if web_service:
+                            web_service.update_music_transport(loaded_playlist=name)
                         asyncio.create_task(_ui_refresh_music_state("music_load_playlist"))
                         # Signal the publisher to immediately refresh the queue,
                         # bypassing any existing backoff from previous failures.
@@ -2283,6 +2275,12 @@ async def run_orchestrator() -> None:
                     return {"success": False, "response": "Recording is not enabled on this device."}
                 return await recorder_tool.start_recording()
 
+            async def _ui_recorder_stop(client_id: str) -> dict[str, Any]:
+                if not recorder_tool:
+                    return {"success": False, "response": "Recording is not enabled on this device."}
+                result = await recorder_tool.stop_recording(reason="ui")
+                return {"success": True, "response": result.response}
+
             web_service.set_action_handlers(
                 on_mic_toggle=_ui_mic_toggle,
                 on_music_toggle=_ui_music_toggle,
@@ -2303,6 +2301,7 @@ async def run_orchestrator() -> None:
                 on_recording_get=_ui_recording_get,
                 on_recordings_delete_selected=_ui_recordings_delete_selected,
                 on_recorder_start=_ui_recorder_start,
+                on_recorder_stop=_ui_recorder_stop,
                 on_resolve_recording_audio=recordings_catalog.resolve_audio_path,
                 on_timer_cancel=_ui_timer_cancel,
                 on_alarm_cancel=_ui_alarm_cancel,
@@ -2317,12 +2316,7 @@ async def run_orchestrator() -> None:
             try:
                 if music_manager:
                     playlist_names = await music_manager.list_playlists()
-                    await web_service.broadcast(
-                        {
-                            "type": "music_playlists",
-                            "playlists": playlist_names or [],
-                        }
-                    )
+                    web_service.update_music_playlists(playlist_names or [])
                     transport, queue = await _ui_get_music_state_snapshot()
                     await web_service.push_music_state_now(queue=queue, **transport)
             except Exception as exc:
@@ -2346,27 +2340,15 @@ async def run_orchestrator() -> None:
                 music_queue_retry_after = 0.0
                 music_transport_dirty = True
                 music_queue_dirty = True
-                music_idle_connected = False
                 timer_tick = 0.0
                 music_queue_task: asyncio.Task | None = None
                 music_queue_pending_reason = ""
                 music_queue_pending_timeout_override: float | None = None
-                music_idle_task: asyncio.Task | None = None
-
-                def _mark_music_dirty(*subsystems: str) -> None:
-                    nonlocal music_transport_dirty, music_queue_dirty
-                    for subsystem in subsystems:
-                        name = str(subsystem or "").strip().lower()
-                        if name in {"player", "mixer", "options"}:
-                            music_transport_dirty = True
-                        if name == "playlist":
-                            music_transport_dirty = True
-                            music_queue_dirty = True
 
                 async def _refresh_music_queue(reason: str, timeout_override: float | None = None) -> None:
                     nonlocal last_music_queue_hash, music_queue_tick, music_queue_failures, music_queue_retry_after
                     try:
-                        base_timeout = min(2.5, max(1.0, float(config.mpd_timeout)))
+                        base_timeout = min(2.5, max(1.0, float(config.music_command_timeout_s)))
                         q_timeout = float(timeout_override) if timeout_override is not None else base_timeout
                         q = await music_manager.get_ui_playlist(timeout=q_timeout)
                         qh = str([
@@ -2428,54 +2410,6 @@ async def run_orchestrator() -> None:
                                 _schedule_music_queue_refresh(next_reason, timeout_override=next_timeout_override)
 
                     music_queue_task = asyncio.create_task(_runner())
-
-                async def _mpd_idle_notifier() -> None:
-                    nonlocal music_idle_connected
-                    while True:
-                        reader = None
-                        writer = None
-                        try:
-                            reader, writer = await asyncio.open_connection(config.mpd_host, config.mpd_port)
-                            welcome = await asyncio.wait_for(reader.readline(), timeout=max(1.0, config.mpd_timeout))
-                            if not welcome.startswith(b"OK MPD"):
-                                raise RuntimeError(f"Invalid MPD welcome: {welcome!r}")
-                            music_idle_connected = True
-                            logger.info("↻ MPD idle notifier connected")
-                            while True:
-                                writer.write(b"idle playlist player mixer options\n")
-                                await asyncio.wait_for(writer.drain(), timeout=max(1.0, config.mpd_timeout))
-                                changed: list[str] = []
-                                while True:
-                                    line = await reader.readline()
-                                    if not line:
-                                        raise ConnectionError("MPD idle notifier disconnected")
-                                    text = line.decode("utf-8", errors="replace").strip()
-                                    if text == "OK":
-                                        break
-                                    if text.startswith("ACK"):
-                                        raise RuntimeError(f"MPD idle notifier error: {text}")
-                                    if text.startswith("changed: "):
-                                        changed.append(text.split(": ", 1)[1].strip())
-                                if changed:
-                                    logger.info("↻ MPD idle changed: %s", ", ".join(changed))
-                                    _mark_music_dirty(*changed)
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception as exc:
-                            music_idle_connected = False
-                            logger.warning("MPD idle notifier error: %s", exc)
-                            await asyncio.sleep(1.0)
-                        finally:
-                            music_idle_connected = False
-                            if writer is not None:
-                                try:
-                                    writer.close()
-                                    await writer.wait_closed()
-                                except Exception:
-                                    pass
-
-                if music_manager:
-                    music_idle_task = asyncio.create_task(_mpd_idle_notifier())
 
                 try:
                     while True:
@@ -2544,7 +2478,7 @@ async def run_orchestrator() -> None:
                                     ms.get("loaded_playlist", ""),
                                     ms.get("playlist_version", ""),
                                 ))
-                                queue_poll_due = (not music_idle_connected) and ((now - music_queue_tick) >= music_queue_poll)
+                                queue_poll_due = (now - music_queue_tick) >= music_queue_poll
                                 # Fast path: a music_load_playlist action just completed.
                                 # Reset any backoff and kick an immediate queue refresh with
                                 # a more generous timeout for freshly-loaded large playlists.
@@ -2579,12 +2513,7 @@ async def run_orchestrator() -> None:
                                         exc,
                                     )
                 finally:
-                    if music_idle_task is not None:
-                        music_idle_task.cancel()
-                        try:
-                            await music_idle_task
-                        except asyncio.CancelledError:
-                            pass
+                    pass
 
             asyncio.create_task(_web_ui_publisher())
 
@@ -2739,7 +2668,12 @@ async def run_orchestrator() -> None:
 
         return text
 
-    async def submit_tts(text: str, request_id: int = 0, kind: str = "reply") -> None:
+    async def submit_tts(
+        text: str,
+        request_id: int = 0,
+        kind: str = "reply",
+        allow_when_ui_tts_muted: bool = False,
+    ) -> None:
         nonlocal last_tts_text, last_tts_ts
         nonlocal current_tts_text, current_tts_duration_s, tts_playback_start_ts
         nonlocal tts_playing, current_tts_request_id
@@ -2804,6 +2738,7 @@ async def run_orchestrator() -> None:
                 text=text,
                 request_id=effective_request_id,
                 kind=normalized_kind,
+                allow_when_ui_tts_muted=bool(allow_when_ui_tts_muted),
                 created_ts=now,
             )
         )
@@ -3622,8 +3557,8 @@ async def run_orchestrator() -> None:
                 logger.info("🚫 Dropped stale reply before playback [req#%d < current#%d]", request_id, current_request_id)
                 continue
 
-            if web_service and bool(web_service._ui_control_state.get("tts_muted", False)) and item.kind == "reply":
-                logger.info("🔇 Reply TTS muted by UI; skipping playback for req#%d", request_id)
+            if web_service and bool(web_service._ui_control_state.get("tts_muted", False)) and not item.allow_when_ui_tts_muted:
+                logger.info("🔇 TTS muted by UI; skipping %s playback for req#%d", item.kind, request_id)
                 continue
 
             while True:
@@ -4126,7 +4061,11 @@ async def run_orchestrator() -> None:
                 logger.error("Failed to play timer bell: %s", e)
             # Announce timer completion
             if name:
-                await submit_tts(f"Timer {name} is complete", kind="notification")
+                await submit_tts(
+                    f"Timer {name} is complete",
+                    kind="notification",
+                    allow_when_ui_tts_muted=True,
+                )
             else:
                 await submit_tts("Timer is complete", kind="notification")
         
@@ -4217,12 +4156,12 @@ async def run_orchestrator() -> None:
     music_sleep_suppressed_log_interval_s = 8.0
 
     async def apply_music_duck(*, reason: str, ratio: float) -> int | None:
-        """Lower MPD volume by ratio and return original volume for later restoration."""
+        """Lower music volume by ratio and return original volume for later restoration."""
         if not (config.music_enabled and music_manager):
             return None
         current = await music_manager.get_volume()
         if current is None or current < 0:
-            # MPD volume control is unavailable (e.g. hardware output with no mixer).
+            # Music volume control is unavailable (e.g. hardware output with no mixer).
             # Skip ducking entirely so we don't accidentally restore to 0 later.
             return None
         target = max(1, min(100, int(round(current * ratio))))
@@ -4239,7 +4178,7 @@ async def run_orchestrator() -> None:
         return current
 
     async def restore_music_duck(*, reason: str, restore_volume: int | None) -> None:
-        """Restore MPD volume after temporary ducking."""
+        """Restore music volume after temporary ducking."""
         if not (config.music_enabled and music_manager):
             return
         if restore_volume is None:
@@ -4458,7 +4397,7 @@ async def run_orchestrator() -> None:
                     if music_paused_for_wake and not is_playing:
                         playback_state = await music_manager.get_playback_state()
 
-                        # Only auto-resume when MPD is actually paused. If user explicitly
+                        # Only auto-resume when playback is actually paused. If user explicitly
                         # stopped playback, clear pause-for-wake state so it will not restart.
                         if playback_state != "pause":
                             logger.info(
@@ -5577,10 +5516,7 @@ async def run_orchestrator() -> None:
         if tool_monitor:
             logger.info("Stopping tool monitor...")
             await tool_monitor.stop()
-        # Cleanup MPD if running
-        if mpd_manager:
-            logger.info("Stopping MPD...")
-            mpd_manager.cleanup()
+        # Native backend runs in-process; no external music daemon cleanup required.
         capture.stop()
 
 

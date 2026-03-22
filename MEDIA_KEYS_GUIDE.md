@@ -9,7 +9,7 @@ The media key detection system uses the Linux `evdev` library to capture button 
 ### Supported Buttons
 
 - **Play/Pause** - Toggle wake/sleep
-- **Stop** - Optional MPD stop (when MPD media-key control is enabled)
+- **Stop** - Optional playback stop (when media-key music control is enabled)
 - **Next** - Same wake/sleep toggle behavior as play
 - **Previous** - Same wake/sleep toggle behavior as play
 - **Volume Up** - Increase system output volume
@@ -73,7 +73,7 @@ Add these settings to your `.env` file:
 # Media Key Detection
 MEDIA_KEYS_ENABLED=true
 MEDIA_KEYS_DEVICE_FILTER=Burr-Brown  # Optional: substring to filter device names
-MEDIA_KEYS_CONTROL_MUSIC=false       # Keep media keys from controlling MPD volume/playback
+MEDIA_KEYS_CONTROL_MUSIC=false       # Keep media keys from controlling backend volume/playback
 MEDIA_KEYS_EXCLUSIVE_GRAB=false      # Let OS keep handling volume keys/LED state
 MEDIA_KEYS_PASSTHROUGH_KEYS=volume_up,volume_down,mute
 ```
@@ -85,10 +85,11 @@ The `MEDIA_KEYS_DEVICE_FILTER` is optional but helpful if you have multiple devi
 Media keys require the music system to be enabled:
 
 ```bash
-# Music Control (MPD)
+# Music Control (native backend)
 MUSIC_ENABLED=true
-MPD_HOST=localhost
-MPD_PORT=6600
+MEDIA_PLAYER_BACKEND=native
+MEDIA_LIBRARY_ROOT=music
+PLAYLIST_ROOT=playlists
 ```
 
 ## Testing
@@ -117,7 +118,7 @@ python3 test_media_keys.py
    tail -f orchestrator_output.log | grep -i "media"
    ```
 
-3. Press buttons on your Anker speaker - they should control MPD playback
+3. Press buttons on your Anker speaker - they should control configured playback behavior
 
 ## Troubleshooting
 
@@ -181,7 +182,7 @@ python3 test_media_keys.py
 2. **Integration** (`orchestrator/main.py`)
    - Initializes detector when `MEDIA_KEYS_ENABLED=true`
     - Connects play/phone events to wake/sleep flow
-    - Routes volume events to OS volume behavior (not MPD volume)
+    - Routes volume events to OS volume behavior (not backend volume)
    - Manages lifecycle (start/stop)
 
 3. **Configuration** (`orchestrator/config.py`)

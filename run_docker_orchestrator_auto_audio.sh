@@ -44,13 +44,13 @@ case "$audio_profile" in
     ;;
 esac
 
-fifo_host_path="${MPD_FIFO_HOST_PATH:-}"
+fifo_host_path="${MUSIC_FIFO_HOST_PATH:-}"
 if [[ -z "$fifo_host_path" && -f "$SCRIPT_DIR/.env.docker" ]]; then
-  fifo_host_path="$(grep -E '^MPD_FIFO_HOST_PATH=' "$SCRIPT_DIR/.env.docker" | tail -n1 | cut -d= -f2- | tr -d '\"' | tr -d "'" || true)"
+  fifo_host_path="$(grep -E '^MUSIC_FIFO_HOST_PATH=' "$SCRIPT_DIR/.env.docker" | tail -n1 | cut -d= -f2- | tr -d '\"' | tr -d "'" || true)"
 fi
-fifo_host_path="${fifo_host_path:-/tmp/openclaw-mpd-fifo}"
+fifo_host_path="${fifo_host_path:-/tmp/openclaw-music-fifo}"
 fifo_pcm_path="${fifo_host_path%/}/music.pcm"
-export MPD_FIFO_HOST_PATH="$fifo_host_path"
+export MUSIC_FIFO_HOST_PATH="$fifo_host_path"
 
 snapcast_enabled="${SNAPCAST_ENABLED:-}"
 if [[ -z "$snapcast_enabled" && -f "$SCRIPT_DIR/.env.docker" ]]; then
@@ -74,7 +74,7 @@ else
   echo "PulseAudio socket not found; falling back to ALSA (/dev/snd)."
   echo "Audio profile: alsa"
 fi
-echo "Shared MPD FIFO host path: ${fifo_host_path}"
+echo "Shared music FIFO host path: ${fifo_host_path}"
 
 "${COMPOSE[@]}" stop orchestrator orchestrator-linux-alsa orchestrator-linux-pulse >/dev/null 2>&1 || true
 "${COMPOSE[@]}" rm -f orchestrator orchestrator-linux-alsa orchestrator-linux-pulse >/dev/null 2>&1 || true
