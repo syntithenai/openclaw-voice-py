@@ -91,12 +91,14 @@ function renderMusicPage(main){
                                 +(canSearch ? '' : '<p id="musicAddMinHint" class="text-xs text-gray-500 mt-1">Enter at least '+MUSIC_LIBRARY_SEARCH_MIN_LEN+' letters to search</p>')
       +'</div>'
       +(addRows
-                ? '<div class="px-2 flex items-center justify-end gap-1 text-xs text-gray-400">'
-                        +'<button data-action="music-add-select-all" class="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 transition-colors">Select All</button>'
-                        +'<button data-action="music-add-select-none" class="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 transition-colors">Select None</button>'
-                    +'</div>'
-                    +'<div class="overflow-x-auto rounded-xl border border-gray-800"><table class="w-full text-left table-fixed"><thead><tr class="text-xs text-gray-400 border-b border-gray-800"><th class="px-2 py-2 w-8">#</th><th class="px-2 py-2 w-1/2">Title</th><th class="px-2 py-2 w-1/4">Artist</th><th class="px-2 py-2 w-1/4">Album</th></tr></thead><tbody>'+addRows+'</tbody></table></div>'
-                                : '<p class="text-gray-500 text-center py-10 text-sm">'+(searchPending ? '<span class="inline-flex items-center gap-2"><span class="inline-block w-3 h-3 border-2 border-gray-400 border-t-transparent rounded-full animate-spin"></span>Searching…</span>' : (canSearch && S.musicAddHasSearched ? 'No matches found' : 'Search to find songs to add'))+'</p>')
+            const n=String(name||'').trim();
+            if(!n) return '';
+            return '<div class="flex w-full items-center justify-start gap-2 px-3 py-2 border-b border-gray-800 text-left">'
+              // Pencil (edit) button
+              +'<button data-action="music-open-edit-playlist" data-playlist-name="'+esc(n)+'" class="shrink-0 w-6 h-6 inline-flex items-center justify-center rounded text-sm bg-gray-700 hover:bg-yellow-600 transition-colors" title="Edit playlist title" aria-label="Edit playlist">✎</button>'
+              +'<button data-action="music-load-playlist" data-playlist-name="'+esc(n)+'" class="block flex-1 w-full text-left text-sm text-gray-200 hover:text-white truncate">'+esc(n)+'</button>'
+              +'<button data-action="music-open-delete-playlist" data-playlist-name="'+esc(n)+'" class="shrink-0 w-6 h-6 inline-flex items-center justify-center rounded text-sm bg-gray-700 hover:bg-red-700 transition-colors" title="Delete playlist" aria-label="Delete playlist">✕</button>'
+            +'</div>';
       +'</div>';
         main.onscroll=()=>{ updateScrollUpButton(); };
         updateScrollUpButton();

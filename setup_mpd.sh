@@ -1,5 +1,5 @@
 #!/bin/bash
-# Setup script for native music backend integration
+# Setup script for native music backend integration (renamed to setup_native_music.sh)
 
 set -e
 
@@ -27,7 +27,7 @@ echo "  ✓ Directories ready"
 # Step 3: Validate native backend
 echo ""
 echo "Step 3: Validate native backend..."
-if ./.venv_orchestrator/bin/python validate_native_music_integration.py; then
+if .//home/stever/.pyenv/versions/3.11.9/bin/python3.11 validate_native_music_integration.py; then
     echo "  ✓ Native backend validation passed"
 else
     echo "  ✗ Native backend validation failed"

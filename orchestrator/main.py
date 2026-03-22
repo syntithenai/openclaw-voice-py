@@ -2068,7 +2068,7 @@ async def run_orchestrator() -> None:
                 if music_manager:
                     try:
                         await music_manager.stop()
-                        asyncio.create_task(_ui_refresh_music_state("music_stop"))
+                        await _ui_refresh_music_state("music_stop")
                     except Exception as exc:
                         logger.warning("Web UI music_stop: %s", exc)
 

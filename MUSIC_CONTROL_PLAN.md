@@ -81,7 +81,7 @@ Optional route/runtime values:
 
 1. Run unit/integration tests for music manager/router/parser.
 2. Run native integration validator:
-   - `./.venv_orchestrator/bin/python validate_native_music_integration.py`
+   - `.//home/stever/.pyenv/versions/3.11.9/bin/python3.11 validate_native_music_integration.py`
 3. Verify UI state sync for queue/current track updates.
 4. Verify both playback routes:
    - local output route

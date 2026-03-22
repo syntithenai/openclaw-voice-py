@@ -242,6 +242,8 @@ class _NativeMusicBackend:
 
         if op == "stop":
             await self.player.stop()
+            self.player.browser_stream_path = ""
+            self.browser_file_override = ""
             self._set_state("stop")
             return {}
 
@@ -515,6 +517,9 @@ class MPDClientPool:
 
     async def execute_batch(self, commands: List[str], timeout: float | None = None) -> None:
         await self._conn.send_command_batch(commands, timeout)
+
+    def list_playlists_direct(self) -> List[str]:
+        return _BACKEND.playlists.list_playlists()
 
     @asynccontextmanager
     async def acquire(self):

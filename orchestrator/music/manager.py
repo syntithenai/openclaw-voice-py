@@ -1012,6 +1012,16 @@ class MusicManager:
         if self._playlist_names_cache and (now - self._playlist_names_cache_ts) <= self._playlist_names_cache_ttl_s:
             return list(self._playlist_names_cache)
 
+        direct_list = getattr(self.control_pool, "list_playlists_direct", None)
+        if callable(direct_list):
+            try:
+                playlists = [str(name).strip() for name in (direct_list() or []) if str(name).strip()]
+                self._playlist_names_cache = playlists
+                self._playlist_names_cache_ts = time.monotonic()
+                return list(self._playlist_names_cache)
+            except Exception as e:
+                logger.warning(f"Direct playlist listing failed, falling back to command path: {e}")
+
         for attempt in (1, 2):
             try:
                 emit_latency_trace("music_load.list_playlists_start", attempt=attempt)
@@ -1028,7 +1038,8 @@ class MusicManager:
                     await asyncio.sleep(0.05)
                     continue
                 logger.error(f"Failed to list playlists: {e}")
-                return []
+                cached = self._playlist_names_cache if self._playlist_names_cache else []
+                return list(cached)
         return []
 
     async def resolve_playlist_name(self, requested_name: str, refresh_if_miss: bool = True) -> str:

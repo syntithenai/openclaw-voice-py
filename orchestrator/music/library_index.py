@@ -210,6 +210,8 @@ class LibraryIndex:
 
         indexed = 0
         changed = 0
+        file_count = 0
+        debug_log_interval = 25
         current_mtime_ns = int(dir_stat.st_mtime_ns)
         previous_mtime_ns = self._get_known_dir_mtime(rel_dir)
         dir_changed = previous_mtime_ns != current_mtime_ns
@@ -219,19 +221,24 @@ class LibraryIndex:
             seen_files: set[str] = set()
             try:
                 for entry in os.scandir(abs_dir):
-                    if not entry.is_file(follow_symlinks=False):
-                        continue
+                    file_count += 1
                     abs_file = Path(entry.path)
+                    if not entry.is_file(follow_symlinks=False):
+                        logger.debug(f"[SCAN] Skipped non-file: {abs_file}")
+                        continue
                     if abs_file.suffix.lower() not in SUPPORTED_EXTENSIONS:
+                        logger.debug(f"[SCAN] Skipped unsupported extension: {abs_file}")
                         continue
                     rel_file = abs_file.relative_to(self.library_root).as_posix()
                     seen_files.add(rel_file)
                     existing_row = existing_rows.get(rel_file)
                     if not self._file_fingerprint_changed(abs_file, existing_row):
+                        logger.debug(f"[SCAN] Unchanged: {abs_file}")
                         indexed += 1
                         continue
                     row = self._track_row(abs_file)
                     if not row:
+                        logger.debug(f"[SCAN] Failed to read metadata: {abs_file}")
                         continue
                     if existing_row is not None:
                         row["added_ts"] = float(existing_row["added_ts"])
@@ -254,23 +261,30 @@ class LibraryIndex:
                         """,
                         row,
                     )
+                    logger.debug(f"[SCAN] Indexed: {abs_file}")
                     indexed += 1
                     changed += 1
+                    if indexed % debug_log_interval == 0:
+                        logger.info(f"[SCAN] Progress: indexed={indexed} changed={changed} dir={rel_dir}")
             except FileNotFoundError:
                 return (indexed, changed)
 
             stale_files = set(existing_rows.keys()) - seen_files
             for stale in stale_files:
                 self._conn.execute("DELETE FROM tracks WHERE path = ?", (stale,))
+                logger.debug(f"[SCAN] Removed stale: {stale}")
                 changed += 1
         else:
             for rel_file, existing_row in existing_rows.items():
+                file_count += 1
                 abs_file = self.library_root / rel_file
                 if not self._file_fingerprint_changed(abs_file, existing_row):
+                    logger.debug(f"[SCAN] Unchanged (no update needed): {abs_file}")
                     indexed += 1
                     continue
                 row = self._track_row(abs_file)
                 if not row:
+                    logger.debug(f"[SCAN] Failed to read metadata: {abs_file}")
                     continue
                 row["added_ts"] = float(existing_row["added_ts"])
                 self._conn.execute(
@@ -292,8 +306,11 @@ class LibraryIndex:
                     """,
                     row,
                 )
+                logger.debug(f"[SCAN] Updated: {abs_file}")
                 indexed += 1
                 changed += 1
+                if indexed % debug_log_interval == 0:
+                    logger.info(f"[SCAN] Progress: indexed={indexed} changed={changed} dir={rel_dir}")
 
         self._upsert_directory(rel_dir, current_mtime_ns)
 
@@ -539,6 +556,24 @@ class LibraryIndex:
                 changed += 1
 
             self._conn.commit()
+
+            # --- Sanity check: compare indexed vs. filesystem count ---
+            fs_count = 0
+            for root, _dirs, files in os.walk(self.library_root):
+                for name in files:
+                    if Path(name).suffix.lower() in SUPPORTED_EXTENSIONS:
+                        fs_count += 1
+            db_count = self._conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0]
+            if fs_count > 0:
+                diff = abs(db_count - fs_count)
+                percent = diff / fs_count
+                if percent > 0.02:
+                    logger.warning(f"[SANITY] Indexed track count ({db_count}) differs from filesystem count ({fs_count}) by more than 2% ({percent:.1%}). Triggering full rebuild.")
+                    self.rebuild()
+                    # Recount after rebuild
+                    db_count = self._conn.execute("SELECT COUNT(*) FROM tracks").fetchone()[0]
+                    logger.info(f"[SANITY] Post-rebuild indexed track count: {db_count}")
+
             return {"indexed": indexed, "changed": changed}
 
         return self._run_with_recovery("running incremental scan", _scan)

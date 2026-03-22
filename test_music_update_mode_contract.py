@@ -133,3 +133,33 @@ async def test_playlistinfo_stays_available_while_indexing(monkeypatch: pytest.M
     finally:
         backend.queue = original_queue
         backend._indexing_active = original_indexing_active
+
+
+@pytest.mark.asyncio
+async def test_stop_clears_browser_route_playback_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = mpd_client._BACKEND
+    original_state = backend.state
+    original_override = backend.browser_file_override
+    original_route = backend.player.output_route
+    original_browser_stream_path = backend.player.browser_stream_path
+
+    async def fake_stop() -> None:
+        return None
+
+    try:
+        backend.state = "play"
+        backend.browser_file_override = "Album/current.m4a"
+        backend.player.output_route = "browser"
+        backend.player.browser_stream_path = "/tmp/current.m4a"
+        monkeypatch.setattr(backend.player, "stop", fake_stop)
+
+        await backend.execute("stop")
+
+        assert backend.state == "stop"
+        assert backend.browser_file_override == ""
+        assert backend.player.browser_stream_path == ""
+    finally:
+        backend.state = original_state
+        backend.browser_file_override = original_override
+        backend.player.output_route = original_route
+        backend.player.browser_stream_path = original_browser_stream_path

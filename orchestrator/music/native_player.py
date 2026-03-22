@@ -36,6 +36,7 @@ class NativePlayer:
                 self._proc.kill()
         self._proc = None
         self._paused = False
+        self.browser_stream_path = ""
 
     async def play(self, rel_path: str, seek_s: int = 0) -> bool:
         src = (self.library_root / rel_path).resolve()

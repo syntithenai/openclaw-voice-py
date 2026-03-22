@@ -71,7 +71,7 @@
 2. Ensure library is indexed.
 3. Run orchestrator and test key workflow.
 4. Run validator:
-   - `./.venv_orchestrator/bin/python validate_native_music_integration.py`
+   - `.//home/stever/.pyenv/versions/3.11.9/bin/python3.11 validate_native_music_integration.py`
 
 ## Related Documents
 
