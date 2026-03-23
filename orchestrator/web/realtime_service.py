@@ -29,13 +29,8 @@ except ImportError:
 from orchestrator.observability.latency_trace import emit as emit_latency_trace
 from orchestrator.observability.latency_trace import scoped_action
 from orchestrator.web.http_server import start_http_servers
-from orchestrator.web.file_manager_service import WorkspaceFileManager
-from orchestrator.web.workspace_fs_watcher import WorkspaceFsWatcher
 
 logger = logging.getLogger("orchestrator.web.realtime")
-
-
-DEFAULT_FILE_MANAGER_ROOT = Path("/home/stever/projects/openclawstuff/.openclaw/workspace-voice")
 
 
 class EmbeddedVoiceWebService:
@@ -59,16 +54,6 @@ class EmbeddedVoiceWebService:
         workspace_files_enabled: bool = False,
         workspace_files_root: str = "",
         workspace_files_allow_listing: bool = False,
-        file_manager_enabled: bool = False,
-        file_manager_root: str = "",
-        file_manager_excluded_folders: str = "recordings,playlists,timers,.media,.openclaw",
-        file_manager_top_level_config_files: str = "SOUL.md,BOOTSTRAP.md,TOOLS.md,HEARTBEAT.md,IDENTITY.md,USER.md,AGENTS.md",
-        file_manager_max_editable_bytes: int = 2_000_000,
-        file_manager_watch_enabled: bool = True,
-        file_manager_watch_max_watches: int = 4096,
-        file_manager_watch_max_events_per_tick: int = 256,
-        file_manager_watch_max_paths_per_push: int = 128,
-        file_manager_watch_coalesce_ms: int = 75,
         media_files_enabled: bool = False,
         media_files_root: str = "",
         media_files_allow_listing: bool = False,
@@ -109,51 +94,10 @@ class EmbeddedVoiceWebService:
         self.workspace_files_root = str(workspace_root.resolve())
         self.workspace_files_allow_listing = bool(workspace_files_allow_listing)
 
-        self.file_manager_enabled = bool(file_manager_enabled)
-        self.file_manager: WorkspaceFileManager | None = None
-        self._file_manager_fs_rev: int = 0
-        self._file_manager_watcher: WorkspaceFsWatcher | None = None
-        if self.file_manager_enabled:
-            fm_root = (
-                Path(openclaw_workspace_root).expanduser()
-                if openclaw_workspace_root
-                else DEFAULT_FILE_MANAGER_ROOT
-            )
-            if file_manager_root:
-                requested_fm_root = Path(file_manager_root).expanduser().resolve()
-                if requested_fm_root != fm_root.resolve():
-                    logger.info(
-                        "Ignoring file manager root override %s; using workspace root %s",
-                        requested_fm_root,
-                        fm_root,
-                    )
-            self.file_manager = WorkspaceFileManager(
-                root=str(fm_root.resolve()),
-                excluded_folders=[x.strip() for x in str(file_manager_excluded_folders or "").split(",") if x.strip()],
-                excluded_top_level_config_files=[
-                    x.strip() for x in str(file_manager_top_level_config_files or "").split(",") if x.strip()
-                ],
-                max_editable_bytes=int(file_manager_max_editable_bytes or 2_000_000),
-            )
-            if file_manager_watch_enabled:
-                self._file_manager_watcher = WorkspaceFsWatcher(
-                    root=Path(self.file_manager.root),
-                    excluded_dirs=self.file_manager.excluded_folders,
-                    max_watches=int(file_manager_watch_max_watches),
-                    max_events_per_tick=int(file_manager_watch_max_events_per_tick),
-                    max_paths_per_push=int(file_manager_watch_max_paths_per_push),
-                    coalesce_ms=int(file_manager_watch_coalesce_ms),
-                    on_change=self._on_file_manager_fs_change,
-                )
-
         media_root = Path(media_files_root).expanduser() if media_files_root else Path("/music")
         self.media_files_enabled = bool(media_files_enabled)
         self.media_files_root = str(media_root.resolve())
         self.media_files_allow_listing = bool(media_files_allow_listing)
-        runtime_media_root = Path(tempfile.gettempdir()) / "openclaw-runtime-media"
-        self.runtime_media_files_enabled = bool(media_files_enabled)
-        self.runtime_media_files_root = str(runtime_media_root.resolve())
-        self.runtime_media_files_allow_listing = False
 
         self._http_server: HTTPServer | None = None
         self._http_thread: threading.Thread | None = None
@@ -296,8 +240,6 @@ class EmbeddedVoiceWebService:
     async def start(self) -> None:
         ssl_context = self._ensure_ssl_context()
         self._start_http_server()
-        if self._file_manager_watcher is not None:
-            await self._file_manager_watcher.start()
         self._ws_server = await websockets.serve(
             self._ws_handler,
             self.host,
@@ -326,9 +268,6 @@ class EmbeddedVoiceWebService:
             )
 
     async def stop(self) -> None:
-        if self._file_manager_watcher is not None:
-            await self._file_manager_watcher.stop()
-
         if self._status_task:
             self._status_task.cancel()
             try:
@@ -537,7 +476,7 @@ class EmbeddedVoiceWebService:
         if not self.auth_required():
             return False
         # Protect file serving endpoints
-        protected_prefixes = ["/files/workspace", "/files/media", "/recordings/audio/", "/api/file-manager"]
+        protected_prefixes = ["/files/workspace", "/files/media", "/recordings/audio/"]
         for prefix in protected_prefixes:
             if path == prefix or path.startswith(prefix + "/"):
                 return True
@@ -1152,18 +1091,6 @@ class EmbeddedVoiceWebService:
             "audio_b64": base64.b64encode(wav_bytes).decode(),
             "gain": float(gain),
         }))
-
-    async def _on_file_manager_fs_change(self, payload: dict[str, Any]) -> None:
-        self._file_manager_fs_rev += 1
-        await self.broadcast(
-            {
-                "type": "file_manager_fs_changed",
-                "rev": self._file_manager_fs_rev,
-                "paths": payload.get("paths", []),
-                "reason": payload.get("reason", "changed"),
-                "resyncRequired": bool(payload.get("resyncRequired", False)),
-            }
-        )
 
     # ------------------------------------------------------------------
     # Broadcast helper
@@ -2163,12 +2090,6 @@ class EmbeddedVoiceWebService:
         if float(expires_at or 0) < time.time():
             self._sessions.pop(session_id, None)
             return None
-        # Sliding expiration: authenticated activity keeps the session alive.
-        new_expiry = time.time() + self._auth_session_ttl_s
-        if "expires_ts" in entry:
-            entry["expires_ts"] = new_expiry
-        if "expires_at" in entry:
-            entry["expires_at"] = new_expiry
         return entry.get("user") or {}
 
     def auth_bootstrap_from_headers(self, headers: Any) -> dict:

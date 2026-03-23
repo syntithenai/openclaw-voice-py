@@ -85,12 +85,8 @@ function handleMsg(msg){
                 // Show toast notification on non-home pages
                 if(nextMsg) showMessageToast(String(nextMsg.text || ''), nextMsg.role);
                 if(S.page==='home'){
-                    if(nextMsg && nextMsg.role==='raw_gateway' && nextMsg.request_id!==undefined && nextMsg.request_id!==null){
-                        scheduleGatewayDebugBubbleUpdate(nextMsg.request_id, 'active');
-                    } else {
-                        renderThreadList('active');
-                        renderChatMessages('active');
-                    }
+                    renderThreadList('active');
+                    renderChatMessages('active');
                 }
             }
             break;
@@ -129,13 +125,8 @@ function handleMsg(msg){
             if(S.page==='home') updateChatComposerState();
             break;
         case 'navigate':
-            if(msg.page==='music' || msg.page==='home' || msg.page==='recordings' || msg.page==='files'){
+            if(msg.page==='music' || msg.page==='home' || msg.page==='recordings'){
                 navigate(msg.page);
-            }
-            break;
-        case 'file_manager_fs_changed':
-            if(typeof handleFileManagerFsChanged === 'function'){
-                handleFileManagerFsChanged(msg);
             }
             break;
         case 'recordings_state':
@@ -206,13 +197,6 @@ function handleMsg(msg){
                 S._musicStateRetryTimer = null;
             }
             applyMusic(msg.music||msg);
-            if(
-                S.page==='music'
-                && document.querySelector('.music-queue-table-container tbody tr')
-                && !document.querySelector('.music-queue-table-container tbody tr[data-queue-pos]')
-            ){
-                renderMusicPage(document.getElementById('main'));
-            }
             // Transport updates can arrive frequently (elapsed/position changes).
             // Avoid full page re-render on each tick, especially with large queues.
             applyMusicHeader();
@@ -467,8 +451,7 @@ function syncMusicFromQueue(){
     if(artist) S.music.artist = artist;
     if(album) S.music.album = album;
     if(current.file){
-        const currentFile = String(S.music.file||'').trim();
-        const hasBrowserOverride = currentFile.includes('.openclaw-transcoded/');
+        const hasBrowserOverride = String(S.music.file||'').includes('/.openclaw-transcoded/');
         if(!(S.browserAudioEnabled && hasBrowserOverride)) S.music.file = current.file;
     }
 }
@@ -476,57 +459,21 @@ function applyMusicQueueHighlight(){
     if(S.page!=='music') return;
     const pos = Number(S.music && S.music.position);
     if(!Number.isFinite(pos) || pos < 0) return;
-    const rows = document.querySelectorAll('.music-queue-table-container tbody tr');
+    const rows = document.querySelectorAll('.music-queue-table-container tbody tr[data-queue-pos]');
     if(!rows || !rows.length) return;
 
     rows.forEach((row) => {
-        // Back-compat: rows rendered before data-queue-pos may still be present.
-        let rowPos = Number(row.getAttribute('data-queue-pos'));
-        if(!Number.isFinite(rowPos)){
-            const playBtn = row.querySelector('[data-action="music-play-track"][data-position]');
-            if(playBtn) rowPos = Number(playBtn.getAttribute('data-position'));
-        }
-        if(!Number.isFinite(rowPos)){
-            const selectCb = row.querySelector('[data-action="music-queue-select"][data-position]');
-            if(selectCb) rowPos = Number(selectCb.getAttribute('data-position'));
-        }
+        const rowPos = Number(row.getAttribute('data-queue-pos'));
         const isActive = Number.isFinite(rowPos) && rowPos === pos;
-        row.classList.toggle('bg-gray-700', isActive);
-        row.classList.toggle('border-l-4', isActive);
-        row.classList.toggle('border-green-400', isActive);
+        row.classList.toggle('bg-gray-800', isActive);
         row.classList.toggle('font-semibold', isActive);
-        row.classList.toggle('text-green-300', isActive);
-
-        if(!isActive){
-            row.classList.remove('bg-gray-700', 'border-l-4', 'border-green-400', 'font-semibold', 'text-green-300');
-        }
+        row.classList.toggle('text-green-400', isActive);
     });
 }
 function applyMusic(m){
     const payload=(m&&typeof m==='object'&&m.music&&typeof m.music==='object')?m.music:m;
     if(!payload||typeof payload!=='object') return;
-    const nowMs = Date.now();
-    const pendingSeekUntil = Number(S._pendingSeekUntilMs || 0);
-    const pendingSeekTarget = Number(S._pendingSeekTargetSeconds);
     Object.assign(S.music,payload);
-    if(nowMs < pendingSeekUntil && Number.isFinite(pendingSeekTarget) && pendingSeekTarget >= 0){
-        const incomingElapsed = Number(payload.elapsed);
-        if(Number.isFinite(incomingElapsed)){
-            if(incomingElapsed + 0.75 < pendingSeekTarget){
-                S.music.elapsed = pendingSeekTarget;
-            } else if(Math.abs(incomingElapsed - pendingSeekTarget) <= 1.5){
-                S._pendingSeekUntilMs = 0;
-                S._pendingSeekTargetSeconds = null;
-            }
-        }
-    }
-    const warning = String(payload.warning || '').trim();
-    if(warning){
-        recordInlineError('music', '', warning);
-    } else if(String(S.musicActionError||'').startsWith('Playback failed for ')){
-        S.musicActionError='';
-        S.musicActionErrorTs=0;
-    }
     S.music._clientElapsedAnchorTs=Date.now();
     S.music.state=normalizeMusicState(S.music.state);
     reconcilePendingMusicLoads();
@@ -542,50 +489,15 @@ function _ensureBrowserMusicAudio(){
     const audio = new Audio();
     audio.preload = 'metadata';
     audio.crossOrigin = 'anonymous';
-    audio.addEventListener('loadedmetadata', ()=>{
-        const pendingSeek = Number(audio.dataset.pendingSeekSeconds || '');
-        if(!Number.isFinite(pendingSeek) || pendingSeek < 0) return;
-        try {
-            audio.currentTime = pendingSeek;
-            delete audio.dataset.pendingSeekSeconds;
-        } catch {}
-    });
     S._browserMusicAudio = audio;
     return audio;
 }
 
-function _syncBrowserMusicCurrentTime(audio, targetSeconds, force=false){
-    if(!audio) return;
-    const target = Math.max(0, Number(targetSeconds) || 0);
-    if(!Number.isFinite(target)) return;
-    const current = Math.max(0, Number(audio.currentTime) || 0);
-    const drift = Math.abs(current - target);
-    if(!force && drift < 0.75) return;
-    try {
-        if(audio.readyState > 0) {
-            audio.currentTime = target;
-            delete audio.dataset.pendingSeekSeconds;
-        } else {
-            audio.dataset.pendingSeekSeconds = String(target);
-        }
-    } catch {
-        audio.dataset.pendingSeekSeconds = String(target);
-    }
-}
-
-function _mediaUrlForFile(filePath, version=''){
+function _mediaUrlForFile(filePath){
     const raw = String(filePath||'').trim();
     if(!raw) return '';
-    let base = '';
-    if(raw.startsWith('__runtime_media__/')){
-        const rel = raw.slice('__runtime_media__/'.length);
-        base = '/files/runtime-media/' + rel.split('/').map(p=>encodeURIComponent(p)).join('/');
-    } else {
-        const parts = raw.split('/').map(p=>encodeURIComponent(p));
-        base = '/files/media/' + parts.join('/');
-    }
-    const v = String(version||'').trim();
-    return v ? (base + '?v=' + encodeURIComponent(v)) : base;
+    const parts = raw.split('/').map(p=>encodeURIComponent(p));
+    return '/files/media/' + parts.join('/');
 }
 
 function syncBrowserMusicPlayback(){
@@ -594,8 +506,6 @@ function syncBrowserMusicPlayback(){
         const music = S.music || {};
         const state = normalizeMusicState(music.state);
         const filePath = String(music.file||'').trim();
-        const songId = String(music.songid||'').trim();
-        const targetElapsed = Math.max(0, Number(music.elapsed) || 0);
         const audio = _ensureBrowserMusicAudio();
 
         if(!browserEnabled){
@@ -608,25 +518,20 @@ function syncBrowserMusicPlayback(){
             return;
         }
 
-        const src = _mediaUrlForFile(filePath, songId);
-        const srcChanged = !!src && audio.dataset.currentSrc !== src;
+        const src = _mediaUrlForFile(filePath);
         if(src && audio.dataset.currentSrc !== src){
             audio.src = src;
             audio.dataset.currentSrc = src;
         }
 
         if(state === 'play'){
-            if(srcChanged || audio.paused || audio.dataset.pendingSeekSeconds){
-                _syncBrowserMusicCurrentTime(audio, targetElapsed, true);
-            }
             const playPromise = audio.play();
             if(playPromise && typeof playPromise.catch === 'function') playPromise.catch(()=>{});
         } else if(state === 'pause'){
-            _syncBrowserMusicCurrentTime(audio, targetElapsed, true);
             if(!audio.paused) audio.pause();
         } else {
             if(!audio.paused) audio.pause();
-            _syncBrowserMusicCurrentTime(audio, targetElapsed, true);
+            try { audio.currentTime = 0; } catch {}
         }
     }catch {}
 }
@@ -881,7 +786,6 @@ loadUiPrefs();
 hydrateChatCache();
 renderAuthButton();
 initGoogleSignIn();
-setupAuthSessionRefresh();
 S.page=getPage(); renderPage(); updateNavActiveState(); applyMicState(); applyMicControlToggles(); updateWsDebugBanner(); updateMicInteractivity();
 if(wsAuthAllowed()) connectWs();
 refreshAuthSession({render:false, adjustWs:false}).catch(()=>{});

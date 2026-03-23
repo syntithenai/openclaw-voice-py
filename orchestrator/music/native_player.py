@@ -27,6 +27,8 @@ class NativePlayer:
         self._last_seek_s = 0
         self.browser_stream_path: str = ""
         self.last_error: str = ""
+        self._browser_cached_source_path: str = ""
+        self._browser_cached_stream_path: str = ""
 
     def set_output_route(self, route: str) -> None:
         self.output_route = "browser" if str(route).lower() == "browser" else "local"
@@ -41,7 +43,6 @@ class NativePlayer:
         self._proc = None
         self._paused = False
         self.browser_stream_path = ""
-        self._cleanup_runtime_browser_files()
 
     def _cleanup_runtime_browser_files(self) -> None:
         try:
@@ -71,6 +72,24 @@ class NativePlayer:
 
         # Browser route creates a transcoded asset that can be fetched by UI media mount.
         if self.output_route == "browser":
+            # Stream browser-compatible formats directly to avoid startup delay.
+            if not transcode:
+                self.browser_stream_path = str(src)
+                self._browser_cached_source_path = rel_path
+                self._browser_cached_stream_path = str(src)
+                self.last_error = ""
+                return True
+
+            # Reuse previous runtime transcode for the same source when available.
+            if (
+                self._browser_cached_source_path == rel_path
+                and self._browser_cached_stream_path
+                and Path(self._browser_cached_stream_path).exists()
+            ):
+                self.browser_stream_path = self._browser_cached_stream_path
+                self.last_error = ""
+                return True
+
             self._cleanup_runtime_browser_files()
             m4a_out = self.runtime_media_root / "current.m4a"
             mp3_out = self.runtime_media_root / "current.mp3"
@@ -81,6 +100,8 @@ class NativePlayer:
             ok = await self._ffmpeg.transcode_for_browser(str(src), str(m4a_out))
             if ok:
                 self.browser_stream_path = str(m4a_out)
+                self._browser_cached_source_path = rel_path
+                self._browser_cached_stream_path = str(m4a_out)
                 self.last_error = ""
                 return True
 
@@ -88,6 +109,8 @@ class NativePlayer:
             ok = await self._ffmpeg.transcode_for_browser_mp3(str(src), str(mp3_out))
             if ok:
                 self.browser_stream_path = str(mp3_out)
+                self._browser_cached_source_path = rel_path
+                self._browser_cached_stream_path = str(mp3_out)
                 self.last_error = ""
                 return True
 
@@ -95,6 +118,8 @@ class NativePlayer:
             ok = await self._ffmpeg.transcode_for_browser_wav(str(src), str(wav_out))
             if ok:
                 self.browser_stream_path = str(wav_out)
+                self._browser_cached_source_path = rel_path
+                self._browser_cached_stream_path = str(wav_out)
                 self.last_error = ""
                 return True
 

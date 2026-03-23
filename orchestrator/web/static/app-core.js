@@ -1,6 +1,5 @@
 const RUNTIME = window.__OPENCLAW_RUNTIME__ || {};
-const DEFAULT_WS_PORT = 18911;
-const WS_PORT = Number(RUNTIME.wsPort || 0) > 0 ? Number(RUNTIME.wsPort) : DEFAULT_WS_PORT;
+const WS_PORT = Number(RUNTIME.wsPort || 0);
 const MIC_STARTS_DISABLED = !!RUNTIME.micStartsDisabled;
 const AUDIO_AUTHORITY = String(RUNTIME.audioAuthority || 'native');
 const SERVER_INSTANCE_ID = String(RUNTIME.serverInstanceId || '');
@@ -54,8 +53,6 @@ const S = {
     optimisticTimers:{},
     _lastOptimisticIntentKey:'',
     _lastOptimisticIntentTs:0,
-    _pendingSeekTargetSeconds:null,
-    _pendingSeekUntilMs:0,
     lastStatusRev:0, lastMusicRev:0, lastTimersRev:0, lastUiControlRev:0,
     wsDebug:{ status:'init', lastCloseCode:null, lastCloseReason:'', lastError:'' },
     wsManualDisconnect:false, wsReconnectTimer:null,
@@ -67,8 +64,6 @@ const S = {
     authMode: AUTH_MODE_BOOTSTRAP,
     isAuthenticated: AUTHENTICATED_BOOTSTRAP,
     authUser: AUTH_USER_BOOTSTRAP,
-    authRefreshTimer:null,
-    authRefreshInFlight:false,
     googleSignInInitialized:false,
     googleSignInInitError:'',
 };
@@ -174,23 +169,6 @@ async function refreshAuthSession(opts={}){
 
     if(shouldRender && typeof renderPage==='function') renderPage();
     if(typeof updateMicInteractivity==='function') updateMicInteractivity();
-}
-
-function setupAuthSessionRefresh(){
-    if(S.authRefreshTimer) return;
-    // Background heartbeat keeps cookie/session TTL sliding while logged in.
-    S.authRefreshTimer = setInterval(async ()=>{
-        if(S.authRefreshInFlight) return;
-        if(String(S.authMode || 'disabled') === 'disabled') return;
-        if(!S.isAuthenticated) return;
-        S.authRefreshInFlight = true;
-        try{
-            await refreshAuthSession({ render:false, adjustWs:false });
-        }catch(_ ){
-        }finally{
-            S.authRefreshInFlight = false;
-        }
-    }, 5 * 60 * 1000);
 }
 
 async function handleGoogleSignInResponse(response){
@@ -749,20 +727,6 @@ function onTopMusicProgressClick(event){
         // Reset the client‑side anchor timestamp used by getEffectiveMusicElapsed()
         S.music._clientElapsedAnchorTs = Date.now();
     }
-    S._pendingSeekTargetSeconds = target;
-    S._pendingSeekUntilMs = Date.now() + 2500;
-    if(S.browserAudioEnabled && S._browserMusicAudio){
-        try {
-            if(S._browserMusicAudio.readyState > 0) {
-                S._browserMusicAudio.currentTime = target;
-                delete S._browserMusicAudio.dataset.pendingSeekSeconds;
-            } else {
-                S._browserMusicAudio.dataset.pendingSeekSeconds = String(target);
-            }
-        } catch {
-            S._browserMusicAudio.dataset.pendingSeekSeconds = String(target);
-        }
-    }
     sendMusicAction('music_seek', {seconds: target});
 }
 
@@ -872,7 +836,6 @@ function getScrollUpArea(){
     if(S.page==='home') return document.getElementById('chatArea');
     if(S.page==='music') return document.getElementById('main');
     if(S.page==='recordings') return document.getElementById('main');
-    if(S.page==='files') return document.getElementById('main');
     return null;
 }
 
@@ -909,7 +872,6 @@ function getPage(){
     const h=location.hash.replace('#','');
     if(h==='/music') return 'music';
     if(h==='/recordings') return 'recordings';
-    if(h==='/files') return 'files';
     return 'home';
 }
 function navigate(p){ location.hash='#/'+p; }

@@ -9,12 +9,6 @@ document.addEventListener('click', e => {
     const target = (e.target && typeof e.target.closest==='function') ? e.target : (e.target && e.target.parentElement ? e.target.parentElement : null);
     if(!target) return;
 
-    if (S.page === 'files' && typeof handleFileManagerClick === 'function') {
-        if (handleFileManagerClick(target, e)) {
-            return;
-        }
-    }
-
     const authLoginBtn = target.closest('[data-action="auth-login"]');
     if (authLoginBtn) {
         triggerGoogleLogin();
@@ -537,9 +531,6 @@ document.addEventListener('submit', e => {
 document.addEventListener('keydown', e => {
     const t = e.target;
     if(!t) return;
-    if (S.page === 'files' && typeof handleFileManagerKeydown === 'function') {
-        if (handleFileManagerKeydown(e)) return;
-    }
     if(t.id==='musicAddSearch'){
         if(e.key!=='Enter') return;
         e.preventDefault();
@@ -696,16 +687,10 @@ function handleTextInputChange(t){
 }
 
 document.addEventListener('input', e => {
-    if (S.page === 'files' && typeof handleFileManagerInput === 'function') {
-        if (handleFileManagerInput(e.target)) return;
-    }
     handleTextInputChange(e.target);
 });
 
 document.addEventListener('search', e => {
-    if (S.page === 'files' && typeof handleFileManagerInput === 'function') {
-        if (handleFileManagerInput(e.target)) return;
-    }
     handleTextInputChange(e.target);
 });
 
@@ -785,17 +770,6 @@ function applyMusicHeader(){
     btn.classList.toggle('cursor-not-allowed', pendingCount>0);
     btn.textContent=pendingCount>0?'…':(m.state==='play'?'⏹':'▶');
     btn.title=pendingCount>0?'Processing…':(m.state==='play'?'Stop':'Play');
-
-    // Keep the queue page transport button in sync without forcing a full music page re-render.
-    const queueBtn=document.querySelector('[data-action="music-toggle"]');
-    if(queueBtn){
-        const queueDisabled=pendingCount>0;
-        queueBtn.disabled=queueDisabled;
-        queueBtn.style.opacity=queueDisabled?'0.5':'';
-        queueBtn.style.cursor=queueDisabled?'not-allowed':'';
-        queueBtn.textContent=queueDisabled?'… Pending':(m.state==='play'?'⏹ Stop':'▶ Play');
-    }
-
     applyTopMusicProgress();
 }
 
@@ -876,13 +850,6 @@ function renderPage(){
         renderRecordingsPage(main);
         if(!Array.isArray(S.recordings) || S.recordings.length===0){
             sendAction({type:'recordings_list'});
-        }
-    } else if (S.page==='files') {
-        if (typeof renderFileManagerPage === 'function') {
-            renderFileManagerPage(main);
-        }
-        if (typeof ensureFileManagerReady === 'function') {
-            ensureFileManagerReady();
         }
     } else {
         renderHomePage(main);
@@ -1012,81 +979,6 @@ function renderChatMessages(selectedId){
     updateScrollDownButton();
     updateScrollUpButton();
 }
-
-const pendingGatewayDebugReqIds=new Set();
-let gatewayDebugRafId=0;
-
-function mergeRawGatewayFrames(rawMessages){
-    return (Array.isArray(rawMessages)?rawMessages:[]).map((msg, idx)=>{
-        const rawText=String((msg&&msg.text)||'');
-        if(!rawText.trim()) return {index:idx, rawText:''};
-        try{
-            return JSON.parse(rawText);
-        }catch(_){
-            return {index:idx, rawText};
-        }
-    });
-}
-
-function collectRawGatewayMessagesForRequest(selectedId, requestId){
-    const reqKey=String(requestId===undefined || requestId===null ? 'na' : requestId);
-    return getSelectedMessages(selectedId).filter((m)=>{
-        if(!m || m.role!=='raw_gateway') return false;
-        const msgReq=String((m&&m.request_id)!==undefined && (m&&m.request_id)!==null ? m.request_id : 'na');
-        return msgReq===reqKey;
-    });
-}
-
-function findDetailByKey(area, detailKey){
-    const nodes=area.querySelectorAll('details[data-detail-key]');
-    for(const el of nodes){
-        if(el.getAttribute('data-detail-key')===detailKey) return el;
-    }
-    return null;
-}
-
-function updateGatewayDebugBubbleInPlace(requestId, selectedId){
-    const area=document.getElementById('chatArea');
-    if(!area) return false;
-    const reqKey=String(requestId===undefined || requestId===null ? 'na' : requestId);
-    const detailKey='req:'+reqKey+':raw-group';
-    const detailEl=findDetailByKey(area, detailKey);
-    if(!detailEl) return false;
-
-    const rawMessages=collectRawGatewayMessagesForRequest(selectedId, requestId);
-    const mergedFrames=mergeRawGatewayFrames(rawMessages);
-    const mergedJson=JSON.stringify(mergedFrames, null, 2) || '[]';
-
-    const summary=detailEl.querySelector('summary');
-    if(summary) summary.textContent='Debug: raw gateway JSON ('+String(rawMessages.length)+')';
-
-    const pre=detailEl.querySelector('pre');
-    if(pre) pre.textContent=mergedJson;
-
-    return true;
-}
-
-function scheduleGatewayDebugBubbleUpdate(requestId, selectedId){
-    pendingGatewayDebugReqIds.add(String(requestId===undefined || requestId===null ? 'na' : requestId));
-    if(gatewayDebugRafId) return;
-    gatewayDebugRafId=requestAnimationFrame(()=>{
-        gatewayDebugRafId=0;
-        const ids=Array.from(pendingGatewayDebugReqIds);
-        pendingGatewayDebugReqIds.clear();
-        let missing=false;
-        ids.forEach((id)=>{
-            const ok=updateGatewayDebugBubbleInPlace(id, selectedId);
-            if(!ok) missing=true;
-        });
-        if(missing){
-            renderChatMessages(selectedId);
-        } else {
-            updateScrollDownButton();
-            updateScrollUpButton();
-        }
-    });
-}
-
 function scrollChat(){ const a=document.getElementById('chatArea'); if(a){ a.scrollTop=a.scrollHeight; updateScrollDownButton(); } }
 function collateChatMessages(msgs){
     const out=[];
@@ -1094,14 +986,6 @@ function collateChatMessages(msgs){
 
     const flushBucket=()=>{
         if(!activeBucket) return;
-        if(activeBucket.rawMsgs.length>0){
-            out.push({
-                role:'gateway_debug_group',
-                request_id:activeBucket.reqId,
-                raw_messages:activeBucket.rawMsgs,
-                hasFinal:activeBucket.finals.length>0,
-            });
-        }
         if(activeBucket.events.length>0){
             out.push({role:'context_group',request_id:activeBucket.reqId,events:activeBucket.events,steps:activeBucket.steps,interim:activeBucket.interim,hasFinal:activeBucket.finals.length>0});
         }
@@ -1123,7 +1007,7 @@ function collateChatMessages(msgs){
     const ensureActiveBucket=(reqId)=>{
         if(!activeBucket || activeBucket.reqId!==reqId){
             flushBucket();
-            activeBucket={reqId,rawMsgs:[],streams:[],steps:[],interim:[],events:[],finals:[]};
+            activeBucket={reqId,streams:[],steps:[],interim:[],events:[],finals:[]};
         }
         return activeBucket;
     };
@@ -1146,11 +1030,6 @@ function collateChatMessages(msgs){
             const bucket=ensureActiveBucket(reqId);
             bucket.interim.push(m);
             bucket.events.push({kind:'lifecycle',payload:m});
-            return;
-        }
-        if(role==='raw_gateway'){
-            const bucket=ensureActiveBucket(reqId);
-            bucket.rawMsgs.push(m);
             return;
         }
         if(role==='assistant'){
@@ -1324,23 +1203,6 @@ function mkBubble(m){
     const role = (m&&m.role)||'';
     d.className='chat-msg flex '+(role==='user'?'justify-end':'justify-start');
         d.setAttribute('data-role', role);
-
-    if(role==='gateway_debug_group'){
-        const wrap=document.createElement('div');
-        wrap.className='max-w-xs sm:max-w-sm lg:max-w-md space-y-1';
-        const reqKey=String((m&&m.request_id)!==undefined && (m&&m.request_id)!==null ? m.request_id : 'na');
-        const rawMessages=Array.isArray(m.raw_messages) ? m.raw_messages : [];
-        const mergedFrames=mergeRawGatewayFrames(rawMessages);
-        const mergedJson=JSON.stringify(mergedFrames, null, 2);
-        wrap.innerHTML='<details data-detail-key="'+esc('req:'+reqKey+':raw-group')+'" class="rounded-xl bg-gray-900/60 border border-fuchsia-700/60 text-xs overflow-hidden">'
-            +'<summary class="px-3 py-1.5 cursor-pointer text-fuchsia-200 hover:text-fuchsia-100 select-none">Debug: raw gateway JSON ('+esc(String(rawMessages.length))+')</summary>'
-            +'<div class="px-2 pb-2 pt-1">'
-                +'<pre class="whitespace-pre-wrap break-words text-[11px] text-gray-300">'+esc(mergedJson||'[]')+'</pre>'
-            +'</div>'
-          +'</details>';
-        d.appendChild(wrap);
-        return d;
-    }
 
     if(role==='assistant_stream_group'){
         const wrap=document.createElement('div');
