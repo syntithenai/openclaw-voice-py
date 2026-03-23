@@ -85,8 +85,12 @@ function handleMsg(msg){
                 // Show toast notification on non-home pages
                 if(nextMsg) showMessageToast(String(nextMsg.text || ''), nextMsg.role);
                 if(S.page==='home'){
-                    renderThreadList('active');
-                    renderChatMessages('active');
+                    if(nextMsg && nextMsg.role==='raw_gateway' && nextMsg.request_id!==undefined && nextMsg.request_id!==null){
+                        scheduleGatewayDebugBubbleUpdate(nextMsg.request_id, 'active');
+                    } else {
+                        renderThreadList('active');
+                        renderChatMessages('active');
+                    }
                 }
             }
             break;
@@ -501,7 +505,28 @@ function applyMusicQueueHighlight(){
 function applyMusic(m){
     const payload=(m&&typeof m==='object'&&m.music&&typeof m.music==='object')?m.music:m;
     if(!payload||typeof payload!=='object') return;
+    const nowMs = Date.now();
+    const pendingSeekUntil = Number(S._pendingSeekUntilMs || 0);
+    const pendingSeekTarget = Number(S._pendingSeekTargetSeconds);
     Object.assign(S.music,payload);
+    if(nowMs < pendingSeekUntil && Number.isFinite(pendingSeekTarget) && pendingSeekTarget >= 0){
+        const incomingElapsed = Number(payload.elapsed);
+        if(Number.isFinite(incomingElapsed)){
+            if(incomingElapsed + 0.75 < pendingSeekTarget){
+                S.music.elapsed = pendingSeekTarget;
+            } else if(Math.abs(incomingElapsed - pendingSeekTarget) <= 1.5){
+                S._pendingSeekUntilMs = 0;
+                S._pendingSeekTargetSeconds = null;
+            }
+        }
+    }
+    const warning = String(payload.warning || '').trim();
+    if(warning){
+        recordInlineError('music', '', warning);
+    } else if(String(S.musicActionError||'').startsWith('Playback failed for ')){
+        S.musicActionError='';
+        S.musicActionErrorTs=0;
+    }
     S.music._clientElapsedAnchorTs=Date.now();
     S.music.state=normalizeMusicState(S.music.state);
     reconcilePendingMusicLoads();
@@ -551,8 +576,14 @@ function _syncBrowserMusicCurrentTime(audio, targetSeconds, force=false){
 function _mediaUrlForFile(filePath, version=''){
     const raw = String(filePath||'').trim();
     if(!raw) return '';
-    const parts = raw.split('/').map(p=>encodeURIComponent(p));
-    const base = '/files/media/' + parts.join('/');
+    let base = '';
+    if(raw.startsWith('__runtime_media__/')){
+        const rel = raw.slice('__runtime_media__/'.length);
+        base = '/files/runtime-media/' + rel.split('/').map(p=>encodeURIComponent(p)).join('/');
+    } else {
+        const parts = raw.split('/').map(p=>encodeURIComponent(p));
+        base = '/files/media/' + parts.join('/');
+    }
     const v = String(version||'').trim();
     return v ? (base + '?v=' + encodeURIComponent(v)) : base;
 }

@@ -306,3 +306,228 @@ def test_status_local_fallback_advances_once_for_finished_proc(monkeypatch: pyte
         backend.player.output_route = original_route
         backend.player._proc = original_proc
         backend._last_finished_local_proc_id = original_finished_proc_id
+
+
+def test_failed_play_sets_warning_in_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = music_client._BACKEND
+    original_queue = list(backend.queue)
+    original_pos = backend.current_pos
+    original_state = backend.state
+    original_delay = backend._play_failure_skip_delay_s
+    original_warning = backend.last_warning
+    original_warning_ts = backend.last_warning_ts
+
+    async def fake_play(file_uri: str, seek_s: int = 0) -> bool:
+        del file_uri, seek_s
+        backend.player.last_error = "unsupported codec"
+        return False
+
+    try:
+        backend.queue = [music_client.QueueItem(file="Artist/Album/bad.flac", id=701)]
+        backend.current_pos = 0
+        backend.state = "stop"
+        backend._play_failure_skip_delay_s = 999.0
+
+        monkeypatch.setattr(backend.player, "play", fake_play)
+
+        asyncio.run(backend.execute("play 0"))
+        status = asyncio.run(backend.execute("status"))
+
+        assert status["state"] == "stop"
+        assert "Playback failed for bad.flac: unsupported codec" == status["warning"]
+    finally:
+        backend._cancel_play_failure_skip()
+        backend.queue = original_queue
+        backend.current_pos = original_pos
+        backend.state = original_state
+        backend._play_failure_skip_delay_s = original_delay
+        backend.last_warning = original_warning
+        backend.last_warning_ts = original_warning_ts
+
+
+def test_failed_play_skips_to_next_track_after_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = music_client._BACKEND
+    original_queue = list(backend.queue)
+    original_pos = backend.current_pos
+    original_state = backend.state
+    original_delay = backend._play_failure_skip_delay_s
+    original_warning = backend.last_warning
+    original_warning_ts = backend.last_warning_ts
+
+    played_files: list[str] = []
+    attempts = {"count": 0}
+
+    async def fake_play(file_uri: str, seek_s: int = 0) -> bool:
+        del seek_s
+        played_files.append(file_uri)
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            backend.player.last_error = "decode failure"
+            return False
+        await asyncio.sleep(0)
+        backend.player.last_error = ""
+        return True
+
+    async def _runner() -> None:
+        await backend.execute("play 0")
+        await asyncio.sleep(0.05)
+
+    try:
+        backend.queue = [
+            music_client.QueueItem(file="Artist/Album/bad.flac", id=801),
+            music_client.QueueItem(file="Artist/Album/good.mp3", id=802),
+        ]
+        backend.current_pos = -1
+        backend.state = "stop"
+        backend._play_failure_skip_delay_s = 0.01
+
+        monkeypatch.setattr(backend.player, "play", fake_play)
+
+        asyncio.run(_runner())
+
+        assert played_files == ["Artist/Album/bad.flac", "Artist/Album/good.mp3"]
+        assert backend.current_pos == 1
+        assert backend.state == "play"
+        assert backend.last_warning == ""
+    finally:
+        backend._cancel_play_failure_skip()
+        backend.queue = original_queue
+        backend.current_pos = original_pos
+        backend.state = original_state
+        backend._play_failure_skip_delay_s = original_delay
+        backend.last_warning = original_warning
+        backend.last_warning_ts = original_warning_ts
+
+
+def test_load_playlist_clears_runtime_media_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = music_client._BACKEND
+    original_queue = list(backend.queue)
+    original_pos = backend.current_pos
+    original_state = backend.state
+    original_stream_path = backend.player.browser_stream_path
+    original_override = backend.browser_file_override
+    original_warning = backend.last_warning
+    original_warning_ts = backend.last_warning_ts
+
+    stop_calls = {"count": 0}
+
+    async def fake_stop() -> None:
+        stop_calls["count"] += 1
+
+    try:
+        backend.queue = [music_client.QueueItem(file="Artist/Album/prev.mp3", id=901)]
+        backend.current_pos = 0
+        backend.state = "play"
+        backend.player.browser_stream_path = "/tmp/openclaw-runtime-media/current.m4a"
+        backend.browser_file_override = "__runtime_media__/current.m4a"
+        backend.last_warning = "Playback failed for prev.mp3"
+        backend.last_warning_ts = 123.0
+
+        monkeypatch.setattr(backend.player, "stop", fake_stop)
+        monkeypatch.setattr(backend.playlists, "read_playlist", lambda _name: ["Artist/Album/new.mp3"])
+
+        asyncio.run(backend.execute("load test"))
+
+        assert stop_calls["count"] == 1
+        assert backend.player.browser_stream_path == ""
+        assert backend.browser_file_override == ""
+        assert backend.last_warning == ""
+        assert backend.state == "stop"
+        assert [item.file for item in backend.queue] == ["Artist/Album/new.mp3"]
+    finally:
+        backend.queue = original_queue
+        backend.current_pos = original_pos
+        backend.state = original_state
+        backend.player.browser_stream_path = original_stream_path
+        backend.browser_file_override = original_override
+        backend.last_warning = original_warning
+        backend.last_warning_ts = original_warning_ts
+
+
+def test_clear_queue_clears_runtime_media_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = music_client._BACKEND
+    original_queue = list(backend.queue)
+    original_pos = backend.current_pos
+    original_state = backend.state
+    original_stream_path = backend.player.browser_stream_path
+    original_override = backend.browser_file_override
+
+    stop_calls = {"count": 0}
+
+    async def fake_stop() -> None:
+        stop_calls["count"] += 1
+
+    try:
+        backend.queue = [music_client.QueueItem(file="Artist/Album/prev.mp3", id=1001)]
+        backend.current_pos = 0
+        backend.state = "play"
+        backend.player.browser_stream_path = "/tmp/openclaw-runtime-media/current.m4a"
+        backend.browser_file_override = "__runtime_media__/current.m4a"
+
+        monkeypatch.setattr(backend.player, "stop", fake_stop)
+
+        asyncio.run(backend.execute("clear"))
+
+        assert stop_calls["count"] == 1
+        assert backend.queue == []
+        assert backend.current_pos == -1
+        assert backend.player.browser_stream_path == ""
+        assert backend.browser_file_override == ""
+        assert backend.state == "stop"
+    finally:
+        backend.queue = original_queue
+        backend.current_pos = original_pos
+        backend.state = original_state
+        backend.player.browser_stream_path = original_stream_path
+        backend.browser_file_override = original_override
+
+
+def test_sequential_failures_stop_after_exceeding_queue_length(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = music_client._BACKEND
+    original_queue = list(backend.queue)
+    original_pos = backend.current_pos
+    original_state = backend.state
+    original_delay = backend._play_failure_skip_delay_s
+    original_warning = backend.last_warning
+    original_warning_ts = backend.last_warning_ts
+    original_fail_count = backend._sequential_failed_plays
+
+    attempts = {"count": 0}
+
+    async def always_fail_play(file_uri: str, seek_s: int = 0) -> bool:
+        del file_uri, seek_s
+        attempts["count"] += 1
+        backend.player.last_error = "decode failure"
+        return False
+
+    async def _runner() -> None:
+        await backend.execute("play 0")
+        await asyncio.sleep(0.08)
+
+    try:
+        backend.queue = [
+            music_client.QueueItem(file="Artist/Album/a.flac", id=1101),
+            music_client.QueueItem(file="Artist/Album/b.flac", id=1102),
+        ]
+        backend.current_pos = -1
+        backend.state = "stop"
+        backend._play_failure_skip_delay_s = 0.01
+        backend._sequential_failed_plays = 0
+
+        monkeypatch.setattr(backend.player, "play", always_fail_play)
+
+        asyncio.run(_runner())
+
+        # Queue length is 2, so allow the third failure, then stop scheduling.
+        assert attempts["count"] == 3
+        assert backend.state == "stop"
+        assert backend._sequential_failed_plays == 3
+    finally:
+        backend._cancel_play_failure_skip()
+        backend.queue = original_queue
+        backend.current_pos = original_pos
+        backend.state = original_state
+        backend._play_failure_skip_delay_s = original_delay
+        backend.last_warning = original_warning
+        backend.last_warning_ts = original_warning_ts
+        backend._sequential_failed_plays = original_fail_count

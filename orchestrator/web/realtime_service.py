@@ -150,6 +150,10 @@ class EmbeddedVoiceWebService:
         self.media_files_enabled = bool(media_files_enabled)
         self.media_files_root = str(media_root.resolve())
         self.media_files_allow_listing = bool(media_files_allow_listing)
+        runtime_media_root = Path(tempfile.gettempdir()) / "openclaw-runtime-media"
+        self.runtime_media_files_enabled = bool(media_files_enabled)
+        self.runtime_media_files_root = str(runtime_media_root.resolve())
+        self.runtime_media_files_allow_listing = False
 
         self._http_server: HTTPServer | None = None
         self._http_thread: threading.Thread | None = None

@@ -785,6 +785,17 @@ function applyMusicHeader(){
     btn.classList.toggle('cursor-not-allowed', pendingCount>0);
     btn.textContent=pendingCount>0?'…':(m.state==='play'?'⏹':'▶');
     btn.title=pendingCount>0?'Processing…':(m.state==='play'?'Stop':'Play');
+
+    // Keep the queue page transport button in sync without forcing a full music page re-render.
+    const queueBtn=document.querySelector('[data-action="music-toggle"]');
+    if(queueBtn){
+        const queueDisabled=pendingCount>0;
+        queueBtn.disabled=queueDisabled;
+        queueBtn.style.opacity=queueDisabled?'0.5':'';
+        queueBtn.style.cursor=queueDisabled?'not-allowed':'';
+        queueBtn.textContent=queueDisabled?'… Pending':(m.state==='play'?'⏹ Stop':'▶ Play');
+    }
+
     applyTopMusicProgress();
 }
 
@@ -1001,6 +1012,81 @@ function renderChatMessages(selectedId){
     updateScrollDownButton();
     updateScrollUpButton();
 }
+
+const pendingGatewayDebugReqIds=new Set();
+let gatewayDebugRafId=0;
+
+function mergeRawGatewayFrames(rawMessages){
+    return (Array.isArray(rawMessages)?rawMessages:[]).map((msg, idx)=>{
+        const rawText=String((msg&&msg.text)||'');
+        if(!rawText.trim()) return {index:idx, rawText:''};
+        try{
+            return JSON.parse(rawText);
+        }catch(_){
+            return {index:idx, rawText};
+        }
+    });
+}
+
+function collectRawGatewayMessagesForRequest(selectedId, requestId){
+    const reqKey=String(requestId===undefined || requestId===null ? 'na' : requestId);
+    return getSelectedMessages(selectedId).filter((m)=>{
+        if(!m || m.role!=='raw_gateway') return false;
+        const msgReq=String((m&&m.request_id)!==undefined && (m&&m.request_id)!==null ? m.request_id : 'na');
+        return msgReq===reqKey;
+    });
+}
+
+function findDetailByKey(area, detailKey){
+    const nodes=area.querySelectorAll('details[data-detail-key]');
+    for(const el of nodes){
+        if(el.getAttribute('data-detail-key')===detailKey) return el;
+    }
+    return null;
+}
+
+function updateGatewayDebugBubbleInPlace(requestId, selectedId){
+    const area=document.getElementById('chatArea');
+    if(!area) return false;
+    const reqKey=String(requestId===undefined || requestId===null ? 'na' : requestId);
+    const detailKey='req:'+reqKey+':raw-group';
+    const detailEl=findDetailByKey(area, detailKey);
+    if(!detailEl) return false;
+
+    const rawMessages=collectRawGatewayMessagesForRequest(selectedId, requestId);
+    const mergedFrames=mergeRawGatewayFrames(rawMessages);
+    const mergedJson=JSON.stringify(mergedFrames, null, 2) || '[]';
+
+    const summary=detailEl.querySelector('summary');
+    if(summary) summary.textContent='Debug: raw gateway JSON ('+String(rawMessages.length)+')';
+
+    const pre=detailEl.querySelector('pre');
+    if(pre) pre.textContent=mergedJson;
+
+    return true;
+}
+
+function scheduleGatewayDebugBubbleUpdate(requestId, selectedId){
+    pendingGatewayDebugReqIds.add(String(requestId===undefined || requestId===null ? 'na' : requestId));
+    if(gatewayDebugRafId) return;
+    gatewayDebugRafId=requestAnimationFrame(()=>{
+        gatewayDebugRafId=0;
+        const ids=Array.from(pendingGatewayDebugReqIds);
+        pendingGatewayDebugReqIds.clear();
+        let missing=false;
+        ids.forEach((id)=>{
+            const ok=updateGatewayDebugBubbleInPlace(id, selectedId);
+            if(!ok) missing=true;
+        });
+        if(missing){
+            renderChatMessages(selectedId);
+        } else {
+            updateScrollDownButton();
+            updateScrollUpButton();
+        }
+    });
+}
+
 function scrollChat(){ const a=document.getElementById('chatArea'); if(a){ a.scrollTop=a.scrollHeight; updateScrollDownButton(); } }
 function collateChatMessages(msgs){
     const out=[];
@@ -1244,15 +1330,7 @@ function mkBubble(m){
         wrap.className='max-w-xs sm:max-w-sm lg:max-w-md space-y-1';
         const reqKey=String((m&&m.request_id)!==undefined && (m&&m.request_id)!==null ? m.request_id : 'na');
         const rawMessages=Array.isArray(m.raw_messages) ? m.raw_messages : [];
-        const mergedFrames=rawMessages.map((msg, idx)=>{
-            const rawText=String((msg&&msg.text)||'');
-            if(!rawText.trim()) return {index:idx, rawText:''};
-            try{
-                return JSON.parse(rawText);
-            }catch(_){
-                return {index:idx, rawText};
-            }
-        });
+        const mergedFrames=mergeRawGatewayFrames(rawMessages);
         const mergedJson=JSON.stringify(mergedFrames, null, 2);
         wrap.innerHTML='<details data-detail-key="'+esc('req:'+reqKey+':raw-group')+'" class="rounded-xl bg-gray-900/60 border border-fuchsia-700/60 text-xs overflow-hidden">'
             +'<summary class="px-3 py-1.5 cursor-pointer text-fuchsia-200 hover:text-fuchsia-100 select-none">Debug: raw gateway JSON ('+esc(String(rawMessages.length))+')</summary>'

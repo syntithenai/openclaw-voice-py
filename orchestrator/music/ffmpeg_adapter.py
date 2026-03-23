@@ -8,6 +8,17 @@ from .format_policy import InputFormat
 
 
 class FFmpegAdapter:
+    def __init__(self) -> None:
+        self.last_error: str = ""
+
+    def _capture_error(self, stderr: bytes) -> None:
+        text = (stderr or b"").decode("utf-8", errors="ignore").strip()
+        if not text:
+            self.last_error = "ffmpeg failed"
+            return
+        # Keep concise first line for UI-facing messages.
+        self.last_error = text.splitlines()[0].strip()
+
     def probe(self, source_path: str) -> InputFormat:
         try:
             proc = asyncio.run(
@@ -76,7 +87,12 @@ class FFmpegAdapter:
             stderr=asyncio.subprocess.PIPE,
         )
         _out, err = await proc.communicate()
-        return proc.returncode == 0
+        ok = proc.returncode == 0
+        if ok:
+            self.last_error = ""
+        else:
+            self._capture_error(err)
+        return ok
 
     async def transcode_for_browser(self, source_path: str, out_path: str) -> bool:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
@@ -95,5 +111,62 @@ class FFmpegAdapter:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        _out, _err = await proc.communicate()
-        return proc.returncode == 0
+        _out, err = await proc.communicate()
+        ok = proc.returncode == 0
+        if ok:
+            self.last_error = ""
+        else:
+            self._capture_error(err)
+        return ok
+
+    async def transcode_for_browser_mp3(self, source_path: str, out_path: str) -> bool:
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            source_path,
+            "-codec:a",
+            "libmp3lame",
+            "-b:a",
+            "192k",
+            out_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _out, err = await proc.communicate()
+        ok = proc.returncode == 0
+        if ok:
+            self.last_error = ""
+        else:
+            self._capture_error(err)
+        return ok
+
+    async def transcode_for_browser_wav(self, source_path: str, out_path: str) -> bool:
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            source_path,
+            "-ac",
+            "2",
+            "-ar",
+            "48000",
+            "-f",
+            "wav",
+            out_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _out, err = await proc.communicate()
+        ok = proc.returncode == 0
+        if ok:
+            self.last_error = ""
+        else:
+            self._capture_error(err)
+        return ok

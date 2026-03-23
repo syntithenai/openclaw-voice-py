@@ -15,6 +15,11 @@ from orchestrator.observability.latency_trace import emit as emit_latency_trace
 logger = logging.getLogger(__name__)
 
 
+def _is_internal_playlist_name(name: str) -> bool:
+    playlist_name = str(name or "").strip()
+    return playlist_name.startswith("__openclaw_")
+
+
 def _fuzzy_match_playlists(requested: str, available: List[str], threshold: float = 0.6) -> Optional[str]:
     """
     Fuzzy match a playlist name against available playlists.
@@ -512,6 +517,31 @@ class MusicManager:
     @staticmethod
     def _quote(value: str) -> str:
         return str(value).replace('\\', '\\\\').replace('"', '\\"')
+
+    async def _list_all_playlists(self) -> List[str]:
+        """List all playlists, including internal runtime snapshots."""
+        now = time.monotonic()
+        if self._playlist_names_cache and (now - self._playlist_names_cache_ts) <= self._playlist_names_cache_ttl_s:
+            return list(self._playlist_names_cache)
+
+        for attempt in (1, 2):
+            try:
+                emit_latency_trace("music_load.list_playlists_start", attempt=attempt)
+                result = await self._control_execute_list("listplaylists", timeout=8.0)
+                emit_latency_trace("music_load.list_playlists_done", attempt=attempt, count=len(result))
+                playlists = [item.get("playlist", "") for item in result if "playlist" in item]
+                self._playlist_names_cache = [p for p in playlists if str(p).strip()]
+                self._playlist_names_cache_ts = time.monotonic()
+                return list(self._playlist_names_cache)
+            except Exception as e:
+                emit_latency_trace("music_load.list_playlists_error", attempt=attempt, error=str(e))
+                if attempt == 1:
+                    logger.warning(f"list_playlists attempt 1 failed, retrying: {e}")
+                    await asyncio.sleep(0.05)
+                    continue
+                logger.error(f"Failed to list playlists: {e}")
+                return []
+        return []
 
     @staticmethod
     def _artist_bucket_key(track: Dict[str, str], fallback_index: int) -> str:
@@ -1292,29 +1322,9 @@ class MusicManager:
     # ========== Playlist Management ==========
     
     async def list_playlists(self) -> List[str]:
-        """List available playlists."""
-        now = time.monotonic()
-        if self._playlist_names_cache and (now - self._playlist_names_cache_ts) <= self._playlist_names_cache_ttl_s:
-            return list(self._playlist_names_cache)
-
-        for attempt in (1, 2):
-            try:
-                emit_latency_trace("music_load.list_playlists_start", attempt=attempt)
-                result = await self._control_execute_list("listplaylists", timeout=8.0)
-                emit_latency_trace("music_load.list_playlists_done", attempt=attempt, count=len(result))
-                playlists = [item.get("playlist", "") for item in result if "playlist" in item]
-                self._playlist_names_cache = [p for p in playlists if str(p).strip()]
-                self._playlist_names_cache_ts = time.monotonic()
-                return list(self._playlist_names_cache)
-            except Exception as e:
-                emit_latency_trace("music_load.list_playlists_error", attempt=attempt, error=str(e))
-                if attempt == 1:
-                    logger.warning(f"list_playlists attempt 1 failed, retrying: {e}")
-                    await asyncio.sleep(0.05)
-                    continue
-                logger.error(f"Failed to list playlists: {e}")
-                return []
-        return []
+        """List user-visible playlists, excluding internal runtime snapshots."""
+        playlists = await self._list_all_playlists()
+        return [playlist for playlist in playlists if not _is_internal_playlist_name(playlist)]
 
     async def resolve_playlist_name(self, requested_name: str, refresh_if_miss: bool = True) -> str:
         """Resolve a playlist name using fuzzy matching with intelligent fallback."""
@@ -1521,7 +1531,7 @@ class MusicManager:
             logger.error(f"Failed to rename playlist '{old_name}' -> '{new_name}': {e}")
             return f"Error: {e}"
     
-    async def delete_playlist(self, name: str) -> str:
+    async def delete_playlist(self, name: str, ignore_missing: bool = False) -> str:
         """Delete a saved playlist (case-insensitive matching)."""
         try:
             playlist_name = str(name or "").strip()
@@ -1530,7 +1540,7 @@ class MusicManager:
             
             # Find the actual playlist name (case-insensitive matching)
             # This ensures deletion works with "delete fred" even if playlist is "Fred.m3u"
-            available_playlists = await self.list_playlists()
+            available_playlists = await self._list_all_playlists()
             actual_playlist_name = None
             
             for available in available_playlists:
@@ -1539,6 +1549,13 @@ class MusicManager:
                     break
             
             if not actual_playlist_name:
+                if ignore_missing:
+                    logger.debug(
+                        "Playlist '%s' missing during best-effort delete; available=%s",
+                        playlist_name,
+                        available_playlists,
+                    )
+                    return f"Playlist '{playlist_name}' not found"
                 logger.warning(
                     f"Playlist '{playlist_name}' not found for deletion. Available: {available_playlists}"
                 )
@@ -1943,6 +1960,8 @@ class MusicManager:
                 "queue_length": int(status.get("playlistlength", 0) or 0),
                 "playlist_version": str(status.get("playlist", "") or ""),
                 "position": position,
+                "songid": str(status.get("songid", "") or ""),
+                "warning": str(status.get("warning", "") or ""),
                 "volume": int(vol_raw) if vol_raw is not None else None,
                 "title": track.get("title") or track.get("Title", ""),
                 "artist": track.get("artist") or track.get("Artist", ""),

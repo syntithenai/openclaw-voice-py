@@ -277,6 +277,9 @@ def decide_ghost_transcript(ctx: dict[str, Any]) -> GhostDecision:
 
     if not transcript:
         return GhostDecision(False, ("empty_transcript",), -9, "hard_reject_empty")
+    if transcript.startswith("/"):
+        # Explicit slash-prefixed entries are user commands and must route upstream.
+        return GhostDecision(True, ("allow_slash_command",), 10, "hard_allow_slash_command")
     if not has_alnum:
         return GhostDecision(False, ("punctuation_only",), -9, "hard_reject_punctuation")
 
@@ -1277,78 +1280,39 @@ async def run_orchestrator() -> None:
                     asyncio.create_task(_runner())
 
                 async def adjust_output_volume(direction: int):
-                    async def adjust_system_output_volume(step_direction: int, step_percent: int = 5) -> str:
-                        step = max(1, min(25, abs(int(step_percent))))
-                        suffix = "+" if step_direction > 0 else "-"
-                        delta = f"{step}%{suffix}"
+                    nonlocal tts_base_gain, tts_gain
 
-                        def _run_wpctl() -> bool:
-                            subprocess.run(
-                                ["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "0"],
-                                check=False,
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                            )
-                            result = subprocess.run(
-                                ["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", delta],
-                                check=False,
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                            )
-                            return result.returncode == 0
+                    previous_tts_base_gain = tts_base_gain
+                    tts_base_gain = max(0.2, min(3.0, tts_base_gain + (0.12 * direction)))
 
-                        def _run_pactl() -> bool:
-                            subprocess.run(
-                                ["pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"],
-                                check=False,
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                            )
-                            result = subprocess.run(
-                                ["pactl", "set-sink-volume", "@DEFAULT_SINK@", delta],
-                                check=False,
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                            )
-                            return result.returncode == 0
+                    # Preserve cut-in ducking if active, otherwise keep live playback in sync.
+                    if abs(tts_gain - previous_tts_base_gain) < 1e-6:
+                        tts_gain = tts_base_gain
+                    else:
+                        tts_gain = min(tts_gain, tts_base_gain)
 
-                        def _run_amixer() -> bool:
-                            controls = ["Master", "PCM", "Speaker"]
-                            for control in controls:
-                                result = subprocess.run(
-                                    ["amixer", "sset", control, delta, "unmute"],
-                                    check=False,
-                                    stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL,
-                                )
-                                if result.returncode == 0:
-                                    return True
-                            return False
+                    logger.info(
+                        "🔊 TTS base gain %s to %.2f",
+                        "increased" if direction > 0 else "decreased",
+                        tts_base_gain,
+                    )
 
-                        if shutil.which("wpctl"):
-                            if await asyncio.to_thread(_run_wpctl):
-                                return f"system volume adjusted via wpctl ({delta})"
-                        if shutil.which("pactl"):
-                            if await asyncio.to_thread(_run_pactl):
-                                return f"system volume adjusted via pactl ({delta})"
-                        if shutil.which("amixer"):
-                            if await asyncio.to_thread(_run_amixer):
-                                return f"system volume adjusted via amixer ({delta})"
-                        return "no supported system volume command available"
+                    if config.music_enabled and music_manager:
+                        try:
+                            if direction > 0:
+                                result = await music_manager.increase_volume(5)
+                            else:
+                                result = await music_manager.decrease_volume(5)
+                            logger.info("🎵 Music volume update: %s", result)
+                        except Exception as e:
+                            logger.debug("Failed to adjust music volume: %s", e)
 
-                    if not config.media_keys_exclusive_grab:
-                        logger.info(
-                            "🔊 Ignoring orchestrator volume-step for %s: exclusive grab disabled, leaving system volume to the OS",
-                            "up" if direction > 0 else "down",
-                        )
-                        return
-
-                    result = await adjust_system_output_volume(direction)
-                    logger.info("🔊 Hardware volume key handled by orchestrator: %s", result)
-
+                    # Play feedback click proportional to current volume level.
                     if volume_click_sound:
                         try:
-                            feedback_gain = float(min(3.0, max(0.0, config.volume_feedback_gain)))
+                            normalized_level = (tts_base_gain - 0.2) / max(0.01, 3.0 - 0.2)
+                            base_click_gain = float(max(0.0, config.volume_feedback_gain))
+                            feedback_gain = float(min(3.0, base_click_gain * (0.75 + 0.5 * normalized_level)))
                             play_feedback_async(volume_click_sound, feedback_gain, "volume feedback click")
                         except Exception as e:
                             logger.debug("Failed to play volume feedback click: %s", e)
@@ -1518,11 +1482,6 @@ async def run_orchestrator() -> None:
                         logger.info("🎛️ Play button consumed by alarm dismiss")
                         return
 
-                    if tts_playing:
-                        tts_stop_event.set()
-                        _tts_clear_all("play button")
-                        logger.info("⏹️ Play button stopping TTS")
-
                     asyncio.create_task(pause_system_media_if_needed("play button"))
                     if wake_state == WakeState.AWAKE:
                         await trigger_sleep("play button")
@@ -1554,7 +1513,7 @@ async def run_orchestrator() -> None:
                     asyncio.create_task(pause_system_media_if_needed("phone button"))
                     await trigger_wake("phone button")
                 
-                # Volume controls -> OS/system volume when orchestrator owns the device grab.
+                # Volume controls -> orchestrator-managed TTS + music volume.
                 elif event.key == "volume_up":
                     await adjust_output_volume(1)
 
@@ -1943,16 +1902,6 @@ async def run_orchestrator() -> None:
                 workspace_files_enabled=config.web_ui_workspace_files_enabled,
                 workspace_files_root=config.web_ui_workspace_files_root,
                 workspace_files_allow_listing=config.web_ui_workspace_files_allow_listing,
-                file_manager_enabled=config.web_ui_file_manager_enabled,
-                file_manager_root=config.web_ui_file_manager_root,
-                file_manager_excluded_folders=config.web_ui_file_manager_excluded_folders,
-                file_manager_top_level_config_files=config.web_ui_file_manager_top_level_config_files,
-                file_manager_max_editable_bytes=config.web_ui_file_manager_max_editable_bytes,
-                file_manager_watch_enabled=config.web_ui_file_manager_watch_enabled,
-                file_manager_watch_max_watches=config.web_ui_file_manager_watch_max_watches,
-                file_manager_watch_max_events_per_tick=config.web_ui_file_manager_watch_max_events_per_tick,
-                file_manager_watch_max_paths_per_push=config.web_ui_file_manager_watch_max_paths_per_push,
-                file_manager_watch_coalesce_ms=config.web_ui_file_manager_watch_coalesce_ms,
                 media_files_enabled=config.web_ui_media_files_enabled,
                 media_files_root=config.web_ui_media_files_root,
                 media_files_allow_listing=config.web_ui_media_files_allow_listing,
@@ -2016,11 +1965,6 @@ async def run_orchestrator() -> None:
                 if dismissed > 0:
                     tts_stop_event.set()
                     return
-
-                if tts_playing:
-                    tts_stop_event.set()
-                    _tts_clear_all("mic button")
-                    logger.info("⏹️ Mic button stopping TTS")
 
                 def _play_wake_feedback() -> None:
                     if not wake_click_sound:
@@ -2912,7 +2856,7 @@ async def run_orchestrator() -> None:
         except Exception as exc:
             logger.warning("Failed to append recorder completion chat message: %s", exc)
 
-    async def send_debounced_transcripts(immediate: bool = False) -> None:
+    async def send_debounced_transcripts(immediate: bool = False, force_gateway: bool = False) -> None:
         """Send accumulated transcripts after debounce period."""
         nonlocal pending_transcripts, processing_request, debounce_task
         nonlocal music_paused_for_wake, music_auto_resume_timer
@@ -3016,6 +2960,8 @@ async def run_orchestrator() -> None:
                 return
 
             parsed_music: tuple[str, dict[str, Any] | str] | None = None
+            is_slash_command = combined_transcript.startswith("/")
+            force_gateway = bool(force_gateway or is_slash_command)
 
             # Belt-and-suspenders: if user explicitly asked to stop/pause music,
             # clear wake-pause auto-resume state immediately so music cannot
@@ -3072,7 +3018,7 @@ async def run_orchestrator() -> None:
                     "⏩ QA bypass: within %dms of last gateway send; skipping quick answer",
                     bypass_window_ms,
                 )
-            if quick_answer_client and not in_bypass_window:
+            if quick_answer_client and not in_bypass_window and not force_gateway:
                 try:
                     qa_start = time.monotonic()
                     # Use tool-enabled method if tools are configured
@@ -3212,11 +3158,15 @@ async def run_orchestrator() -> None:
                 last_user_went_upstream = True
                 gw_start = time.monotonic()
                 try:
+                    gateway_metadata: dict[str, Any] = {"emotion": emotion_tag} if emotion_tag else {}
+                    if is_slash_command:
+                        gateway_metadata["is_command"] = True
+                        gateway_metadata["command_source"] = "slash_transcript"
                     response_text = await gateway.send_message(
                         final_text,
                         session_id=session_id,
                         agent_id=agent_id,
-                        metadata={"emotion": emotion_tag} if emotion_tag else {},
+                        metadata=gateway_metadata,
                     )
                     gw_elapsed = int((time.monotonic() - gw_start) * 1000)
                     logger.info("← GATEWAY: Response received in %dms", gw_elapsed)
@@ -3671,6 +3621,26 @@ async def run_orchestrator() -> None:
                 recorder_stop_hotword_armed_ts = None
                 return
 
+            # Slash-prefixed transcripts are explicit commands; route them upstream immediately.
+            if transcript.startswith("/"):
+                if cut_in_tts_hold_active:
+                    cut_in_tts_hold_active = False
+                    cut_in_tts_hold_started_ts = None
+                    cut_in_tts_hold_request_id = 0
+                    logger.info("🔓 Cut-in TTS hold released after slash command transcript")
+
+                if debounce_task and not debounce_task.done():
+                    debounce_task.cancel()
+                pending_transcripts.clear()
+                if not enqueue_pending_transcript(transcript, ""):
+                    return
+
+                debounce_task = asyncio.create_task(
+                    send_debounced_transcripts(immediate=True, force_gateway=True)
+                )
+                logger.info("⏩ Slash command detected: bypassing local handlers and debounce")
+                return
+
             start_recording_intent = bool(
                 re.search(r"\b(start|begin)\s+(the\s+)?record(ing)?\b", canonical_transcript)
                 or re.search(r"\brecorder\s+on\b", canonical_transcript)
@@ -4013,6 +3983,25 @@ async def run_orchestrator() -> None:
                         if flush_task and not flush_task.done():
                             flush_task.cancel()
 
+                    payload_obj: dict[str, Any] | None = None
+                    try:
+                        parsed = json.loads(message)
+                        if isinstance(parsed, dict):
+                            payload_obj = parsed
+                    except Exception:
+                        payload_obj = None
+
+                    if payload_obj is not None and web_service:
+                        if suppress_gateway_messages_for_new_session:
+                            continue
+                        step_msg, interim_msg, consumed = _extract_structured_event(payload_obj, current_request_id)
+                        if step_msg:
+                            web_service.append_chat_message(step_msg)
+                        if interim_msg:
+                            web_service.append_chat_message(interim_msg)
+                        if consumed:
+                            continue
+
                     text = strip_gateway_control_markers(extract_text_from_gateway_message(message))
                     if not text:
                         continue
@@ -4175,32 +4164,6 @@ async def run_orchestrator() -> None:
             await asyncio.sleep(reconnect_delay_s)
             reconnect_delay_s = min(reconnect_delay_max_s, reconnect_delay_s * 2.0)
 
-    async def gateway_raw_listener() -> None:
-        nonlocal current_request_id
-        reconnect_delay_s = 1.0
-        reconnect_delay_max_s = 8.0
-        while True:
-            try:
-                async for raw_frame in gateway.listen_raw():
-                    reconnect_delay_s = 1.0
-                    if not web_service or suppress_gateway_messages_for_new_session:
-                        continue
-                    web_service.append_chat_message(
-                        {
-                            "role": "raw_gateway",
-                            "text": raw_frame,
-                            "request_id": current_request_id,
-                            "source": "gateway_stream",
-                        }
-                    )
-            except (ConnectionRefusedError, OSError) as exc:
-                logger.warning("Gateway raw listener unavailable (%s); retrying in %.1fs", exc, reconnect_delay_s)
-            except Exception as exc:
-                logger.error("Gateway raw listener error: %s (retrying in %.1fs)", exc, reconnect_delay_s)
-
-            await asyncio.sleep(reconnect_delay_s)
-            reconnect_delay_s = min(reconnect_delay_max_s, reconnect_delay_s * 2.0)
-
     print("🎤 Audio capture starting. Press Ctrl+C to stop.", flush=True)
     logger.info("🎤 Audio capture starting. Press Ctrl+C to stop.")
     try:
@@ -4236,8 +4199,6 @@ async def run_orchestrator() -> None:
         asyncio.create_task(gateway_listener())
         if hasattr(gateway, "listen_steps"):
             asyncio.create_task(gateway_steps_listener())
-        if hasattr(gateway, "listen_raw"):
-            asyncio.create_task(gateway_raw_listener())
     
     # Start tool monitor for timers/alarms if enabled
     if timers_feature_enabled and tool_router and alert_gen:
@@ -4328,9 +4289,7 @@ async def run_orchestrator() -> None:
     last_tts_meter_ts = 0.0
     tts_meter_interval = 0.5
     tts_rms_baseline = 0.0
-    tts_rms_alpha = 0.12  # faster convergence to TTS echo level (was 0.05)
-    tts_cutin_floor = 0.0
-    tts_cutin_floor_initialized = False
+    tts_rms_alpha = 0.05
     cut_in_hits = 0
     silero_zero_hits = 0
     alarm_cut_in_hits = 0
@@ -4783,28 +4742,14 @@ async def run_orchestrator() -> None:
             except Exception:  # pragma: no cover
                 rms_cutin = 0.0
 
-            # Track baseline RMS during TTS playback to detect mic speech over speaker bleed.
-            # Only start tracking once actual audio playback begins (tts_playback_start_ts is set) —
-            # if we init during synthesis the baseline locks to ambient noise and the TTS echo
-            # immediately looks like a huge excess → false cut-in at the 150 ms arming point.
-            # Mirror the alarm cut-in approach: track max(raw, aec) so either path can feed the floor,
-            # and use faster alpha (0.12) so the floor converges to the TTS echo level within ~400 ms.
-            if tts_playing and tts_playback_start_ts is not None:
-                tts_cutin_signal = max(rms_raw, rms_cutin)
-                if not tts_cutin_floor_initialized:
-                    tts_cutin_floor = tts_cutin_signal
-                    tts_cutin_floor_initialized = True
-                else:
-                    tts_cutin_floor = (1.0 - tts_rms_alpha) * tts_cutin_floor + tts_rms_alpha * tts_cutin_signal
-                # tts_rms_baseline continues to track raw for the excess computation
+            # Track baseline RMS during TTS playback to detect mic speech over speaker bleed
+            if tts_playing:
                 if tts_rms_baseline == 0.0:
                     tts_rms_baseline = rms_raw
                 else:
                     tts_rms_baseline = (1.0 - tts_rms_alpha) * tts_rms_baseline + tts_rms_alpha * rms_raw
-            elif not tts_playing:
+            else:
                 tts_rms_baseline = 0.0
-                tts_cutin_floor = 0.0
-                tts_cutin_floor_initialized = False
                 cut_in_hits = 0
                 silero_zero_hits = 0
 
@@ -5447,44 +5392,32 @@ async def run_orchestrator() -> None:
             if tts_playing:
                 if now - last_tts_meter_ts >= tts_meter_interval:
                     logger.info(
-                        "🎚️ Cut-in RMS (raw=%.4f, aec=%.4f, floor=%.4f, baseline=%.4f, excess=%.4f, floor_excess=%.4f) | VAD raw=%s proc=%s | silero: %s (conf=%.2f) | threshold=%.4f",
+                        "🎚️ Cut-in RMS (raw=%.4f, aec=%.4f, baseline=%.4f, excess=%.4f) | VAD: %s | silero: %s (conf=%.2f) | threshold=%.4f",
                         rms_raw,
                         rms_cutin,
-                        tts_cutin_floor,
                         tts_rms_baseline,
                         max(0.0, rms_raw - tts_rms_baseline),
-                        max(0.0, max(rms_raw, rms_cutin) - tts_cutin_floor) if tts_cutin_floor_initialized else 0.0,
                         vad_result_cutin.speech_detected,
-                        vad_result.speech_detected,
                         silero_gate,
                         silero_conf if silero_conf is not None else -1.0,
                         config.vad_cut_in_rms,
                     )
                     logger.info(
-                        "🎚️ Cut-in gate (ready=%s, converged=%s, silero_gate=%s, floor_excess=%.4f, rms_cutin=%.4f, hits=%d/%d, min_ms=%d, converge_ms=%d)",
+                        "🎚️ Cut-in gate (ready=%s, silero_gate=%s, rms_excess=%.4f, rms_cutin=%.4f, hits=%d/%d, min_ms=%d)",
                         (tts_playback_start_ts is not None and int((now - tts_playback_start_ts) * 1000) >= config.vad_cut_in_min_ms),
-                        (tts_playback_start_ts is not None and int((now - tts_playback_start_ts) * 1000) >= max(750, config.vad_cut_in_min_ms + 600)),
                         silero_gate,
-                        max(0.0, max(rms_raw, rms_cutin) - tts_cutin_floor) if tts_cutin_floor_initialized else 0.0,
+                        max(0.0, rms_raw - tts_rms_baseline),
                         rms_cutin,
                         cut_in_hits,
                         config.vad_cut_in_frames,
                         config.vad_cut_in_min_ms,
-                        max(750, config.vad_cut_in_min_ms + 600),
                     )
                     last_tts_meter_ts = now
                 playback_ms = 0
                 if tts_playback_start_ts is not None:
                     playback_ms = int((now - tts_playback_start_ts) * 1000)
                 cut_in_ready = playback_ms >= config.vad_cut_in_min_ms
-                # Speech-like converge gate: wait until baseline has converged to the TTS echo
-                # level before applying the compound excess check.  Mirrors alarm's
-                # speech_like_min_ring_age_s (which uses ~1.2 s).  With alpha=0.12 the floor is
-                # ≥97 % converged after 750 ms, making false-positive excess drops below threshold.
-                tts_cutin_converge_ms = max(750, config.vad_cut_in_min_ms + 600)
-                tts_cutin_converged = playback_ms >= tts_cutin_converge_ms
                 rms_excess = max(0.0, rms_raw - tts_rms_baseline)
-                tts_cutin_signal_excess = max(0.0, max(rms_raw, rms_cutin) - tts_cutin_floor) if tts_cutin_floor_initialized else rms_excess
                 alarm_ringing_during_tts = bool(alarm_manager and alarm_manager.ringing_alarms)
                 if tts_playing and config.vad_cut_in_use_silero and silero_conf is not None:
                     if silero_conf <= 0.01 and vad_result_cutin.speech_detected and rms_excess >= config.vad_cut_in_rms:
@@ -5495,23 +5428,9 @@ async def run_orchestrator() -> None:
                         logger.warning("Silero gate stuck at low confidence; disabling Silero cut-in gate")
                         config.vad_cut_in_use_silero = False
                         silero_gate = True
-                # Dual VAD: raw OR processed, mirroring the alarm cut-in approach.
-                # AEC can suppress user voice in the processed frame; raw catches what AEC misses.
-                tts_vad_speech = bool(vad_result_cutin.speech_detected or vad_result.speech_detected)
-                tts_cutin_threshold = min(config.vad_cut_in_rms, max(config.vad_min_rms * 1.25, 0.0018))
-                tts_rms_or_excess = (
-                    (rms_raw >= tts_cutin_threshold)
-                    or (rms_cutin >= tts_cutin_threshold)
-                    or (tts_cutin_signal_excess >= max(0.0010, tts_cutin_threshold * 0.25))
-                )
                 cut_in_candidate = (not alarm_ringing_during_tts) and cut_in_ready and silero_gate and (
-                    # Compound speech-like path (mirrors alarm): dual VAD + rms-or-excess +
-                    # strict excess gate + baseline-converge guard.
-                    (tts_vad_speech and tts_rms_or_excess and tts_cutin_converged
-                     and (tts_cutin_signal_excess >= max(0.0030, tts_cutin_threshold * 0.55)))
-                    # Fast AEC path: AEC strips echo so rms_cutin reflects user voice directly;
-                    # no convergence wait needed.
-                    or rms_cutin >= tts_cutin_threshold
+                    (vad_result_cutin.speech_detected and rms_excess >= config.vad_cut_in_rms)
+                    or rms_cutin >= config.vad_cut_in_rms
                 )
                 if cut_in_candidate:
                     cut_in_hits += 1
@@ -5522,16 +5441,15 @@ async def run_orchestrator() -> None:
                 cut_in = cut_in_hits >= config.vad_cut_in_frames
                 if cut_in and now - last_tts_speech_log_ts >= tts_speech_log_interval:
                     logger.info(
-                        "✋ Cut-in triggered! (rms_raw=%.4f, rms_aec=%.4f, floor_excess=%.4f, vad_raw=%s, vad_proc=%s, silero=%s, silero_conf=%.2f, playback_ms=%d, converged=%s)",
+                        "✋ Cut-in triggered! (rms_raw=%.4f, rms_aec=%.4f, rms_excess=%.4f, vad=%s, silero=%s, silero_conf=%.2f, playback_ms=%d, cut_in_ready=%s)",
                         rms_raw,
                         rms_cutin,
-                        tts_cutin_signal_excess,
+                        rms_excess,
                         vad_result_cutin.speech_detected,
-                        vad_result.speech_detected,
                         silero_gate,
                         silero_conf if silero_conf is not None else -1.0,
                         playback_ms,
-                        tts_cutin_converged,
+                        cut_in_ready,
                     )
                     print("✋ Cut-in triggered → stopping TTS", flush=True)
                     last_tts_speech_log_ts = now
@@ -5578,12 +5496,11 @@ async def run_orchestrator() -> None:
                     if tts_gain != 0.5:
                         tts_gain = 0.5
                     logger.info(
-                        "⏹️ Setting tts_stop_event (rms_raw=%.4f, rms_aec=%.4f, floor_excess=%.4f, vad_raw=%s, vad_proc=%s, silero=%s, silero_conf=%.2f)",
+                        "⏹️ Setting tts_stop_event (rms_raw=%.4f, rms_aec=%.4f, rms_excess=%.4f, vad=%s, silero=%s, silero_conf=%.2f)",
                         rms_raw,
                         rms_cutin,
-                        tts_cutin_signal_excess,
+                        rms_excess,
                         vad_result_cutin.speech_detected,
-                        vad_result.speech_detected,
                         silero_gate,
                         silero_conf if silero_conf is not None else -1.0,
                     )

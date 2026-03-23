@@ -516,7 +516,10 @@ function expirePendingActions(){
         }
     });
 
-    if(S.musicActionErrorTs && (now-S.musicActionErrorTs)>INLINE_ERROR_TTL_MS){
+    const musicErrorTtlMs = String(S.musicActionError||'').startsWith('Playback failed for ')
+      ? PLAYBACK_ERROR_TTL_MS
+      : INLINE_ERROR_TTL_MS;
+    if(S.musicActionErrorTs && (now-S.musicActionErrorTs)>musicErrorTtlMs){
         S.musicActionError='';
         S.musicActionErrorTs=0;
         touchMusic=true;

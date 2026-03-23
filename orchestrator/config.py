@@ -388,6 +388,9 @@ class VoiceConfig(BaseSettings):
     wake_feedback_gain: float = Field(1.6)  # Playback gain multiplier for wake cue
     sleep_feedback_gain: float = Field(1.3)  # Playback gain multiplier for sleep cue
     volume_feedback_gain: float = Field(0.4)  # Playback gain for volume-step click sounds
+    fixed_effects_volume_enabled: bool = Field(False)  # Compensate wake/sleep/volume cues and alarm bells against system sink volume
+    fixed_effects_reference_system_volume_percent: int = Field(45)  # Sink volume percent where cue/alarm gains are calibrated
+    fixed_effects_max_gain: float = Field(3.0)  # Safety clamp for compensated cue/alarm gain
 
     @model_validator(mode='after')
     def validate_critical_config(self):
@@ -487,6 +490,12 @@ class VoiceConfig(BaseSettings):
             errors.append(f"AUDIO_OUTPUT_GAIN={self.audio_output_gain} is unusual (typical range: 0.1-5.0)")
         if self.tts_relative_gain < 0.1 or self.tts_relative_gain > 2.0:
             errors.append(f"TTS_RELATIVE_GAIN={self.tts_relative_gain} is unusual (typical range: 0.1-2.0)")
+        if not (1 <= self.fixed_effects_reference_system_volume_percent <= 150):
+            errors.append(
+                "FIXED_EFFECTS_REFERENCE_SYSTEM_VOLUME_PERCENT must be between 1 and 150"
+            )
+        if not (0.1 <= self.fixed_effects_max_gain <= 8.0):
+            errors.append("FIXED_EFFECTS_MAX_GAIN must be between 0.1 and 8.0")
 
         if self.auto_adjust_cutin_window_ms < 0:
             errors.append(

@@ -17,6 +17,8 @@ from .native_player import NativePlayer
 
 logger = logging.getLogger(__name__)
 
+RUNTIME_MEDIA_PREFIX = "__runtime_media__/"
+
 
 @dataclass
 class QueueItem:
@@ -126,6 +128,11 @@ class _NativeMusicBackend:
         # Single persistent background task that watches the current player proc
         # and advances the queue when it exits naturally.
         self._auto_advance_task: asyncio.Task[None] | None = None
+        self._play_failure_skip_task: asyncio.Task[None] | None = None
+        self._play_failure_skip_delay_s: float = 1.5
+        self._sequential_failed_plays: int = 0
+        self.last_warning: str = ""
+        self.last_warning_ts: float = 0.0
         # Guard to avoid double-advancing the same finished local process in
         # status fallback mode.
         self._last_finished_local_proc_id: int | None = None
@@ -210,6 +217,24 @@ class _NativeMusicBackend:
     def _touch_playlist(self) -> None:
         self.playlist_version += 1
 
+    def _set_warning(self, message: str) -> None:
+        self.last_warning = str(message or "").strip()
+        self.last_warning_ts = time.time() if self.last_warning else 0.0
+
+    def _clear_warning(self) -> None:
+        self.last_warning = ""
+        self.last_warning_ts = 0.0
+
+    def _cancel_play_failure_skip(self) -> None:
+        task = self._play_failure_skip_task
+        self._play_failure_skip_task = None
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        if task is not None and not task.done() and task is not current:
+            task.cancel()
+
     def _current_item(self) -> QueueItem | None:
         if 0 <= self.current_pos < len(self.queue):
             return self.queue[self.current_pos]
@@ -237,6 +262,48 @@ class _NativeMusicBackend:
         if self.state != "play":
             return float(self.elapsed_anchor_value)
         return max(0.0, float(self.elapsed_anchor_value) + (time.monotonic() - self.elapsed_anchor_ts))
+
+    async def _skip_failed_track_after_delay(self, failed_pos: int, failed_song_id: int) -> None:
+        try:
+            await asyncio.sleep(max(0.0, float(self._play_failure_skip_delay_s)))
+        except asyncio.CancelledError:
+            return
+
+        if self.state != "stop":
+            return
+        if self.current_pos != failed_pos:
+            return
+        current = self._current_item()
+        if current is None or int(current.id) != int(failed_song_id):
+            return
+        if len(self.queue) <= 1:
+            return
+
+        next_pos = (failed_pos + 1) % len(self.queue)
+        logger.warning(
+            "⏭ Skipping failed track after %.1fs: pos %d → %d (queue length %d)",
+            self._play_failure_skip_delay_s,
+            failed_pos,
+            next_pos,
+            len(self.queue),
+        )
+        await self._play_pos(next_pos)
+
+    def _schedule_play_failure_skip(self, failed_pos: int, failed_song_id: int) -> None:
+        self._cancel_play_failure_skip()
+        self._play_failure_skip_task = asyncio.create_task(
+            self._skip_failed_track_after_delay(failed_pos, failed_song_id)
+        )
+
+    async def _reset_playback_context(self) -> None:
+        """Stop playback and clear transient browser/runtime state."""
+        self._cancel_play_failure_skip()
+        await self.player.stop()
+        self.player.browser_stream_path = ""
+        self.browser_file_override = ""
+        self._sequential_failed_plays = 0
+        self._clear_warning()
+        self._set_state("stop")
 
     async def _maybe_advance_browser_route(self) -> None:
         """Advance browser-route playback when elapsed reaches track duration.
@@ -403,6 +470,7 @@ class _NativeMusicBackend:
         logger.debug("↻ Music auto-advance loop started")
 
     async def _play_pos(self, pos: int, seek_s: int = 0) -> None:
+        self._cancel_play_failure_skip()
         if not self.queue:
             self.current_pos = -1
             self.state = "stop"
@@ -411,14 +479,32 @@ class _NativeMusicBackend:
         self.current_pos = pos
         self.elapsed_anchor_value = float(seek_s)
         ok = await self.player.play(self.queue[pos].file, seek_s=seek_s)
+        if ok:
+            self._sequential_failed_plays = 0
+            self._clear_warning()
         self.browser_file_override = ""
         if self.player.output_route == "browser" and self.player.browser_stream_path:
             try:
                 rel = Path(self.player.browser_stream_path).resolve().relative_to(self.library_root)
                 self.browser_file_override = rel.as_posix()
             except Exception:
-                self.browser_file_override = self.queue[pos].file
+                self.browser_file_override = RUNTIME_MEDIA_PREFIX + Path(self.player.browser_stream_path).name
         self._set_state("play" if ok else "stop")
+        if not ok:
+            self._sequential_failed_plays += 1
+            file_name = Path(self.queue[pos].file).name or self.queue[pos].file
+            reason = str(getattr(self.player, "last_error", "") or "unknown playback error")
+            message = f"Playback failed for {file_name}: {reason}"
+            logger.warning(message)
+            self._set_warning(message)
+            if len(self.queue) > 0 and self._sequential_failed_plays > len(self.queue):
+                logger.warning(
+                    "⏹ Stopping auto-skip after %d consecutive failures (queue length %d)",
+                    self._sequential_failed_plays,
+                    len(self.queue),
+                )
+                return
+            self._schedule_play_failure_skip(pos, self.queue[pos].id)
 
     async def execute(self, command: str, timeout: float | None = None) -> Dict[str, str]:
         del timeout
@@ -448,6 +534,7 @@ class _NativeMusicBackend:
                 "volume": str(self.volume),
                 "random": "1" if self.random_enabled else "0",
                 "repeat": "1" if self.repeat_enabled else "0",
+                "warning": self.last_warning,
             }
 
         if op == "currentsong":
@@ -476,10 +563,7 @@ class _NativeMusicBackend:
             return {}
 
         if op == "stop":
-            await self.player.stop()
-            self.player.browser_stream_path = ""
-            self.browser_file_override = ""
-            self._set_state("stop")
+            await self._reset_playback_context()
             return {}
 
         if op == "next":
@@ -512,8 +596,7 @@ class _NativeMusicBackend:
         if op == "clear":
             self.queue = []
             self.current_pos = -1
-            await self.player.stop()
-            self._set_state("stop")
+            await self._reset_playback_context()
             self._touch_playlist()
             return {}
 
@@ -543,8 +626,7 @@ class _NativeMusicBackend:
                 elif self.current_pos > pos:
                     self.current_pos -= 1
                 if not self.queue:
-                    await self.player.stop()
-                    self._set_state("stop")
+                    await self._reset_playback_context()
                 self._touch_playlist()
             return {}
 
@@ -565,6 +647,7 @@ class _NativeMusicBackend:
 
         if op == "load":
             name = parts[1]
+            await self._reset_playback_context()
             entries = self.playlists.read_playlist(name)
             self.queue = [QueueItem(file=e, id=self._next_id()) for e in entries]
             self.current_pos = -1

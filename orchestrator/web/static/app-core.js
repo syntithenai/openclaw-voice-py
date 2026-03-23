@@ -54,6 +54,8 @@ const S = {
     optimisticTimers:{},
     _lastOptimisticIntentKey:'',
     _lastOptimisticIntentTs:0,
+    _pendingSeekTargetSeconds:null,
+    _pendingSeekUntilMs:0,
     lastStatusRev:0, lastMusicRev:0, lastTimersRev:0, lastUiControlRev:0,
     wsDebug:{ status:'init', lastCloseCode:null, lastCloseReason:'', lastError:'' },
     wsManualDisconnect:false, wsReconnectTimer:null,
@@ -747,6 +749,8 @@ function onTopMusicProgressClick(event){
         // Reset the client‑side anchor timestamp used by getEffectiveMusicElapsed()
         S.music._clientElapsedAnchorTs = Date.now();
     }
+    S._pendingSeekTargetSeconds = target;
+    S._pendingSeekUntilMs = Date.now() + 2500;
     if(S.browserAudioEnabled && S._browserMusicAudio){
         try {
             if(S._browserMusicAudio.readyState > 0) {
