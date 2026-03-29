@@ -368,6 +368,7 @@ function renderRecordingsPage(main){
     const id=String(item.id||'').trim();
     const checked=!!S.recordingsSelectionByIds[id];
     const excerpt=String(item.excerpt||'').trim() || 'No transcript excerpt yet';
+    const transcriptForCopy = String(item.excerpt || item.transcript || '').trim();
     return '<div class="rounded-xl border border-gray-800 bg-gray-900/40 p-3 flex items-start gap-3">'
       +'<div class="pt-1">'
         +'<input type="checkbox" data-action="recording-select" data-recording-id="'+esc(id)+'" '+(checked?'checked':'')+' />'
@@ -379,6 +380,7 @@ function renderRecordingsPage(main){
         +'</div>'
         +'<p class="mt-1 text-sm text-gray-300 line-clamp-2">'+esc(excerpt)+'</p>'
       +'</button>'
+      +'<button type="button" data-action="recording-copy-transcript" data-transcript="'+esc(transcriptForCopy)+'" class="px-2 py-1 rounded text-xs bg-gray-700 hover:bg-gray-600 transition-colors">Copy</button>'
     +'</div>';
   }).join('');
 
@@ -608,7 +610,8 @@ async function sendCaptureDiagnostics(err, phase='capture'){
     }
 }
 
-async function stopBrowserCapture(){
+async function stopBrowserCapture(options){
+  const opts = (options && typeof options === 'object') ? options : {};
     try{ if(S.processor) S.processor.disconnect(); }catch(_ ){}
     try{ if(S.audioCtx) await S.audioCtx.close(); }catch(_ ){}
     if(S.mediaStream){
@@ -618,6 +621,7 @@ async function stopBrowserCapture(){
     S.audioCtx=null;
     S.mediaStream=null;
     S.captureWorkletModuleReady=false;
+    if(opts.releaseLease !== false && typeof releaseBrowserAudioLease === 'function') releaseBrowserAudioLease();
 }
 
 async function disconnectWs(manual=true){

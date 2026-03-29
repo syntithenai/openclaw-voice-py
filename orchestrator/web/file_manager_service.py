@@ -398,6 +398,80 @@ class WorkspaceFileManager:
 
         return {"ok": True, "path": api_path}
 
+
+    def rename_entry(self, path: str | None, new_name: str) -> dict[str, Any]:
+        api_path = self._normalize_api_path(path)
+        if api_path == "/":
+            raise FileManagerError(400, "cannot rename workspace root")
+        if self._is_virtual(api_path):
+            raise FileManagerError(400, "cannot rename virtual entries")
+
+        name = str(new_name or "").strip()
+        if not name:
+            raise FileManagerError(400, "new name is required")
+        if "/" in name or "\\" in name:
+            raise FileManagerError(400, "name must not include path separators")
+        if name in {".", ".."}:
+            raise FileManagerError(400, "name is invalid")
+
+        real = self._resolve_real(api_path)
+        if not real.exists():
+            raise FileManagerError(404, "entry not found")
+
+        dest = (real.parent / name).resolve()
+        if dest == real:
+            return {"entry": self._entry(real)}
+        if dest.parent != real.parent:
+            raise FileManagerError(400, "rename cannot change directory")
+        if dest.exists():
+            raise FileManagerError(409, "an entry with that name already exists")
+
+        try:
+            real.rename(dest)
+        except Exception as exc:
+            raise FileManagerError(500, f"failed renaming: {exc}") from exc
+
+        return {"entry": self._entry(dest)}
+
+    def search_files(self, query: str, max_results: int = 200) -> dict[str, Any]:
+        q = str(query or "").strip().lower()
+        if not q:
+            return {"query": query, "results": []}
+
+        tokens = q.split()
+        if not tokens:
+            return {"query": query, "results": []}
+
+        results: list[dict[str, Any]] = []
+
+        def matches_all_tokens(name: str, path: str) -> bool:
+            search_text = (name + " " + path).lower()
+            return all(token in search_text for token in tokens)
+
+        def walk(folder: Path) -> None:
+            if len(results) >= max_results:
+                return
+            try:
+                children = sorted(folder.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+            except Exception:
+                return
+            for child in children:
+                if child.is_dir() and child.name in self.excluded_folders:
+                    continue
+                try:
+                    rel_path = "/" + str(child.relative_to(self.root)).replace("\\", "/")
+                except ValueError:
+                    rel_path = "/"
+                if matches_all_tokens(child.name, rel_path):
+                    results.append(self._entry(child))
+                    if len(results) >= max_results:
+                        return
+                if child.is_dir() and not child.is_symlink():
+                    walk(child)
+
+        walk(self.root)
+        return {"query": query, "results": results}
+
     def resolve_preview_path(self, path: str | None) -> Path:
         api_path = self._normalize_api_path(path)
         real = self._resolve_virtual_file(api_path) if self._is_virtual(api_path) else self._resolve_real(api_path)

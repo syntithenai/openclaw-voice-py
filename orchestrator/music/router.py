@@ -50,10 +50,8 @@ class MusicRouter:
             # Playlist management
             "load_playlist": self._handle_load_playlist,
             "save_playlist": self._handle_save_playlist,
-            "create_playlist": self._handle_create_playlist,
             "list_playlists": self._handle_list_playlists,
             "add_songs": self._handle_add_songs,
-            "add_songs_to_playlist": self._handle_add_songs_to_playlist,
             
             # Library management
             "update_library": self._handle_update_library,
@@ -243,10 +241,6 @@ class MusicRouter:
         """Handle load playlist command."""
         return await self.manager.load_playlist(name)
     
-    async def _handle_create_playlist(self, name: str) -> str:
-        """Handle create empty playlist command."""
-        return await self.manager.create_playlist(name)
-    
     async def _handle_save_playlist(self, name: str) -> str:
         """Handle save playlist command."""
         return await self.manager.save_playlist(name)
@@ -266,10 +260,6 @@ class MusicRouter:
         else:
             names = ", ".join(playlists[:5])
             return f"You have {len(playlists)} playlists including: {names}"
-    
-    async def _handle_add_songs_to_playlist(self, query: str, count: int = 5) -> str:
-        """Handle add songs to loaded playlist command."""
-        return await self.manager.add_songs_to_playlist(query, count)
     
     async def _handle_update_library(self) -> str:
         """Handle library update command."""
@@ -314,7 +304,6 @@ class MusicRouter:
             "music_play_playlist": lambda: self._handle_play_playlist(arguments.get("name", "")),
             "music_search": lambda: self._handle_search(arguments.get("query", "")),
             "music_load_playlist": lambda: self.manager.load_playlist(arguments.get("name", "")),
-            "music_create_playlist": lambda: self.manager.create_playlist(arguments.get("name", "")),
             "music_add_songs": lambda: self._handle_add_songs(
                 arguments.get("query", ""),
                 int(arguments.get("count", 5)),

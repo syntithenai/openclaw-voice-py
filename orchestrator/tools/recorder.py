@@ -16,6 +16,35 @@ from orchestrator.stt.whisper_client import WhisperTranscriptSegment
 logger = logging.getLogger("orchestrator.tools.recorder")
 
 
+def compute_hotword_stop_trim_seconds(
+    *,
+    armed_ts: float | None,
+    stop_ts: float | None,
+    extra_trim_ms: int = 900,
+    max_trim_ms: int = 8000,
+) -> float:
+    """Compute how much audio to trim from the tail after a hotword-armed recorder stop.
+
+    The trim window removes everything from the hotword arm moment to the end of the
+    recording, plus a small extra amount before the arm moment to catch the spoken hotword.
+    """
+    if armed_ts is None or stop_ts is None:
+        return 0.0
+    try:
+        armed = float(armed_ts)
+        stop = float(stop_ts)
+    except Exception:
+        return 0.0
+
+    if stop <= armed:
+        return max(0.0, float(extra_trim_ms) / 1000.0)
+
+    trim_seconds = (stop - armed) + (max(0, int(extra_trim_ms)) / 1000.0)
+    if max_trim_ms > 0:
+        trim_seconds = min(trim_seconds, max_trim_ms / 1000.0)
+    return max(0.0, trim_seconds)
+
+
 def _canonicalize(text: str) -> str:
     value = (text or "").strip().lower()
     if not value:

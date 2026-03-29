@@ -1,12 +1,14 @@
 """Quick answer LLM client for fast factual responses."""
 import asyncio
+import json
 import logging
 import re
 import httpx
 import random
 import time
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Optional
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Optional, Sequence
 
 
 logger = logging.getLogger("orchestrator.gateway.quick_answer")
@@ -77,53 +79,148 @@ def sanitize_quick_answer_text(text: object) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
-QUICK_ANSWER_BASE_SYSTEM_PROMPT = """You are a strict validation gatekeeper. Your sole objective is to provide immediate answers only when they are factual, indisputable, and concise.
+def _word_tokens(text: str) -> list[str]:
+    """Extract spoken-word-like tokens from text for stable length checks."""
+    return re.findall(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)?", text or "")
+
+
+def _truncate_to_target_words(text: str, target_words: int) -> str:
+    """Truncate a string to at most target_words using spoken-like tokenization."""
+    if target_words <= 0:
+        return ""
+    tokens = _word_tokens(text)
+    if not tokens:
+        return ""
+    return " ".join(tokens[:target_words]).strip()
+
+
+def resolve_recommended_model_id(recommendation: Any, config: Any) -> Optional[str]:
+    """
+    Resolve a recommended model ID from a quick-answer model recommendation dict.
+
+    Args:
+        recommendation: Dict with optional 'tier' key ('fast', 'basic', 'capable', 'smart', 'genius')
+        config: Config object with tier model ID fields
+
+    Returns:
+        Resolved model ID string, or None if no tier mapping exists or tier is invalid.
+
+    Resolution order:
+        1. Check if recommendation has a 'tier' key matching a known tier
+        2. Return the corresponding config field value if non-empty
+        3. If not found or empty, try next tier in fallback chain
+        4. Return None if no tier or no valid model ID found
+
+    Fallback chain: fast → basic → capable → smart → genius
+    """
+    if not isinstance(recommendation, dict):
+        return None
+
+    tier = recommendation.get("tier")
+    if not isinstance(tier, str):
+        return None
+
+    # Map tier names to config field names
+    tier_to_field = {
+        "fast": "quick_answer_model_tier_fast_id",
+        "basic": "quick_answer_model_tier_basic_id",
+        "capable": "quick_answer_model_tier_capable_id",
+        "smart": "quick_answer_model_tier_smart_id",
+        "genius": "quick_answer_model_tier_genius_id",
+    }
+
+    # Fallback order if the requested tier is empty
+    fallback_order = ["fast", "basic", "capable", "smart", "genius"]
+
+    # Start from the requested tier or the beginning of the chain
+    try:
+        start_idx = fallback_order.index(tier)
+    except ValueError:
+        return None  # Invalid tier name
+
+    # Walk the fallback chain
+    for fallback_tier in fallback_order[start_idx:]:
+        field_name = tier_to_field[fallback_tier]
+        model_id = getattr(config, field_name, None)
+        if isinstance(model_id, str) and model_id.strip():
+            return model_id.strip()
+
+    return None
+
+
+QUICK_ANSWER_BASE_SYSTEM_PROMPT = """You are a strict validation gatekeeper. Your sole objective is to handle tool-eligible requests with the provided tools and escalate everything else.
 
 Strict Response Protocol:
-- Verification Requirement: Before answering, mentally verify the fact against your training or tools. If the information is subject to change, opinion-based, or requires nuance, you must fail the check.
-- The "Uncertainty" Trigger: If there is even a 1% margin of doubt, or if the query involves complex reasoning, reply exactly with: USE_UPSTREAM_AGENT.
-- Constraint: Answers must be exactly one to two sentences. No conversational filler, no "I believe," no "As of my last update," and no sign-off phrases such as "is there anything else I can help with" or "let me know if you need more."
-- Binary Outcome: Your output is either a short, definitive fact or the escalation code. Any middle ground is a failure of your instructions.
-- If the user is asking about personal data, account-specific state, email, inbox contents, notifications, messages, calendar items, or anything that depends on prior conversation context or external state, you must reply exactly with: USE_UPSTREAM_AGENT.
-- If the user references earlier dialogue with phrases like "you never told me", "what about", "did I get", "any new ones", "check my", or "do I have", you must reply exactly with: USE_UPSTREAM_AGENT unless a timer/alarm/music tool directly answers it.
+- For tool-eligible requests (timers, alarms, music, recording, session management): invoke the relevant provided tool. Do not explain, confirm, or describe what you are doing - just call the tool.
+- For legitimate questions requiring a more capable model: respond with exactly this JSON (no other text): {{"type": "model_recommendation", "tier": "TIER", "reason": "brief explanation"}} where TIER is one of: fast, basic, capable, smart, genius.
+- For all other queries: respond with exactly: USE_UPSTREAM_AGENT
+
+NO FREE-FORM PROSE: Never respond with explanatory text, apologies, or conversational replies. Your only valid text responses are USE_UPSTREAM_AGENT or the model_recommendation JSON. For tool requests, call the tool.
+
+Content Rules:
+- Questions about the current date or time, plus simple calculations based only on the provided current date and time, are allowed. Respond with model_recommendation for these.
+- If the user is asking about personal data, account-specific state, email, inbox contents, notifications, messages, calendar items, or anything that depends on prior conversation context or external state, respond with: USE_UPSTREAM_AGENT.
+- If the user references earlier dialogue with phrases like "you never told me", "what about", "did I get", "any new ones", "check my", or "do I have", respond with: USE_UPSTREAM_AGENT unless a timer/alarm/music/session tool directly answers it.
+
+Current date and time: {current_datetime}
+
+{tool_usage_section}"""
+
+QUICK_ANSWER_BASE_SYSTEM_PROMPT_NO_MODELS = """You are a strict validation gatekeeper. Your sole objective is to handle tool-eligible requests with the provided tools and escalate everything else.
+
+Strict Response Protocol:
+- For tool-eligible requests (timers, alarms, music, recording, session management): invoke the relevant provided tool. Do not explain, confirm, or describe what you are doing - just call the tool.
+- For all other queries: respond with exactly: USE_UPSTREAM_AGENT
+
+NO FREE-FORM PROSE: Never respond with explanatory text, apologies, or conversational replies. Your only valid text responses are USE_UPSTREAM_AGENT. For tool requests, call the tool.
+
+Content Rules:
+- If the user is asking about personal data, account-specific state, email, inbox contents, notifications, messages, calendar items, or anything that depends on prior conversation context or external state, respond with: USE_UPSTREAM_AGENT.
+- If the user references earlier dialogue, respond with: USE_UPSTREAM_AGENT unless a timer/alarm/music/session tool directly answers it.
 
 Current date and time: {current_datetime}
 
 {tool_usage_section}"""
 
 
-def build_tool_usage_section(timers_enabled: bool, music_enabled: bool, recorder_enabled: bool, new_session_enabled: bool) -> str:
+def build_tool_usage_section(
+    timers_enabled: bool,
+    music_enabled: bool,
+    recorder_enabled: bool,
+    new_session_enabled: bool,
+    openclaw_models_available: bool = True,
+) -> str:
     """Build a prompt section that only mentions tool families that are actually available."""
     sections: list[str] = []
 
     if timers_enabled or music_enabled or recorder_enabled or new_session_enabled:
-        sections.append("Tool Usage:")
+        sections.append("Available tools (invoke the tool for matching requests):")
         if timers_enabled and music_enabled and recorder_enabled:
-            sections.append("- When user requests timer, alarm, music control, or recording operations, use the provided tools.")
-            sections.append("- Only use tools for timer/alarm/music/recording requests - do not escalate these to upstream agent.")
+            sections.append("- Timer/alarm requests → call timer or alarm tools")
+            sections.append("- Music control requests → call music tools")
+            sections.append("- Recording requests → call recorder tool")
         elif timers_enabled and music_enabled:
-            sections.append("- When user requests timer, alarm, or music control operations, use the provided tools.")
-            sections.append("- Only use tools for timer/alarm/music requests - do not escalate these to upstream agent.")
+            sections.append("- Timer/alarm requests → call timer or alarm tools")
+            sections.append("- Music control requests → call music tools")
         elif timers_enabled and recorder_enabled:
-            sections.append("- When user requests timer, alarm, or recording operations, use the provided tools.")
-            sections.append("- Only use tools for timer/alarm/recording requests - do not escalate these to upstream agent.")
+            sections.append("- Timer/alarm requests → call timer or alarm tools")
+            sections.append("- Recording requests → call recorder tool")
         elif music_enabled and recorder_enabled:
-            sections.append("- When user requests music control or recording operations, use the provided tools.")
-            sections.append("- Only use tools for music/recording requests - do not escalate these to upstream agent.")
+            sections.append("- Music control requests → call music tools")
+            sections.append("- Recording requests → call recorder tool")
         elif timers_enabled:
-            sections.append("- When user requests timer or alarm operations, use the provided tools.")
-            sections.append("- Only use tools for timer/alarm requests - do not escalate these to upstream agent.")
+            sections.append("- Timer/alarm requests → call timer or alarm tools")
         elif music_enabled:
-            sections.append("- When user requests music control operations, use the provided tools.")
-            sections.append("- Only use tools for music control requests - do not escalate these to upstream agent.")
+            sections.append("- Music control requests → call music tools")
         elif recorder_enabled:
-            sections.append("- When user requests recording operations, use the provided tools.")
-            sections.append("- Only use tools for recording requests - do not escalate these to upstream agent.")
+            sections.append("- Recording requests → call recorder tool")
         if new_session_enabled:
-            sections.append("- When user requests starting a new chat/session/conversation, use the provided session tool.")
-            sections.append("- Use the session tool for requests like 'start a new session' or 'new chat'.")
+            sections.append("- Session management requests (start new chat/session) → call session tool")
 
-    sections.append("- For all other uncertain queries, use USE_UPSTREAM_AGENT")
+    if openclaw_models_available:
+        sections.append("- All other queries → respond with model_recommendation JSON or USE_UPSTREAM_AGENT")
+    else:
+        sections.append("- All other queries → respond with USE_UPSTREAM_AGENT")
     return "\n".join(sections)
 
 
@@ -133,11 +230,34 @@ def build_system_prompt(
     music_enabled: bool,
     recorder_enabled: bool,
     new_session_enabled: bool,
+    openclaw_models_available: bool = True,
 ) -> str:
-    """Build the system prompt for the current tool capabilities."""
-    return QUICK_ANSWER_BASE_SYSTEM_PROMPT.format(
+    """
+    Build the system prompt for the current tool capabilities.
+    
+    Args:
+        current_datetime: Current date and time string
+        timers_enabled: Whether timer/alarm tools are available
+        music_enabled: Whether music control tools are available
+        recorder_enabled: Whether recording tools are available
+        new_session_enabled: Whether new-session tools are available
+        openclaw_models_available: Whether OpenClaw gateway has configured models.
+            When False, uses the no-models contract (no model_recommendation option).
+    """
+    base_prompt = (
+        QUICK_ANSWER_BASE_SYSTEM_PROMPT 
+        if openclaw_models_available 
+        else QUICK_ANSWER_BASE_SYSTEM_PROMPT_NO_MODELS
+    )
+    return base_prompt.format(
         current_datetime=current_datetime,
-        tool_usage_section=build_tool_usage_section(timers_enabled, music_enabled, recorder_enabled, new_session_enabled),
+        tool_usage_section=build_tool_usage_section(
+            timers_enabled,
+            music_enabled,
+            recorder_enabled,
+            new_session_enabled,
+            openclaw_models_available,
+        ),
     )
 
 
@@ -200,6 +320,15 @@ TIME_SENSITIVE_PATTERNS = [
     r"\b(who is the president|president of the (u\.?s\.?|united states))\b",
 ]
 
+DATE_TIME_QUICK_ANSWER_PATTERNS = [
+    r"\bwhat(?:'s|\s+is)?\s+(?:the\s+)?(?:current\s+)?time\b",
+    r"\bwhat(?:'s|\s+is)?\s+(?:the\s+)?(?:current\s+)?date\b",
+    r"\bwhat(?:'s|\s+is)?\s+today'?s\s+date\b",
+    r"\bwhat\s+day\s+is\s+it(?:\s+(?:today|now))?\b",
+    r"\bwhat\s+(?:day|date|time)\s+(?:is\s+it|will\s+it\s+be)\b.*\b(?:today|tomorrow|yesterday|now|in\s+\d+|after\s+\d+|from\s+now|from\s+today|next\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|this\s+(?:afternoon|evening|morning|week|month|year))\b",
+    r"\bhow\s+many\s+(?:seconds?|minutes?|hours?|days?|weeks?|months?)\b.*\b(?:until|from\s+now|from\s+today|before|after)\b",
+]
+
 # Action/task intents should go upstream so tools/agents can execute the request.
 ACTION_INTENT_PATTERNS = [
     r"\b(add|append|put|include)\b.*\b(shopping list|grocery list|todo list|to-do list|list)\b",
@@ -210,17 +339,23 @@ ACTION_INTENT_PATTERNS = [
     r"\b(open|go to|navigate to|visit)\b\s+([\w-]+\.)+[a-z]{2,}\b",
 ]
 
+# Long-form authoring/research requests should bypass quick answer and go upstream.
+DOCUMENT_AUTHORING_PATTERNS = [
+    r"\b(write|draft|create|generate|prepare|compile)\b.*\b(document|doc|report|plan|lesson\s*plan|outline)\b",
+    r"\b(save|export)\b.*\b(document|doc|file|markdown|md|pdf|text)\b",
+    r"\b(write|put|save)\b.*\bto\b.*\b(document|doc|file)\b",
+    r"\bresearch\b.*\b(write|document|report|plan|lesson\s*plan|outline)\b",
+    r"\b(write|compose|draft|tell)\b.*\b(story|stories|tale|poem|essay|article|speech|script)\b",
+    r"\b(write|compose|draft)\b.*\b\d+\s*[\-\s]?word\b",
+]
+
 RECORDER_INTENT_PATTERNS = [
-    r"\b(start|begin)\s+(the\s+)?record(ing)?\b",
-    r"\b(stop|end|finish)\s+(the\s+)?record(ing)?\b",
-    r"\b(recorder\s+status|recording\s+status)\b",
-    r"\b(recorder\s+on|recorder\s+off)\b",
+    r"\bstart\s+(the\s+)?record(ing)?\b",
+    r"\bstop\s+(the\s+)?record(ing)?\b",
 ]
 
 NEW_SESSION_INTENT_PATTERNS = [
-    r"\b(start|create|open|begin)\b.*\b(new|fresh)\b.*\b(session|chat|conversation)\b",
-    r"\b(new|fresh)\b.*\b(session|chat|conversation)\b",
-    r"\b(reset|clear)\b.*\b(session|chat|conversation)\b",
+    r"\bstart\s+(?:a\s+)?new\s+(?:session|chat)\b",
 ]
 
 TIMER_ALARM_INTENT_PATTERNS = [
@@ -256,8 +391,14 @@ def classify_upstream_decision(
     if any(re.search(pattern, query) for pattern in WEB_LOOKUP_PATTERNS):
         return True, "web_lookup"
 
+    if any(re.search(pattern, query) for pattern in DATE_TIME_QUICK_ANSWER_PATTERNS):
+        return False, "date_time_local"
+
     if any(re.search(pattern, query) for pattern in TIME_SENSITIVE_PATTERNS):
         return True, "time_sensitive"
+
+    if any(re.search(pattern, query) for pattern in DOCUMENT_AUTHORING_PATTERNS):
+        return True, "document_authoring"
 
     # If timers/alarms or music tooling is available, keep those intents local.
     if timers_enabled and any(re.search(pattern, query) for pattern in TIMER_ALARM_INTENT_PATTERNS):
@@ -267,7 +408,7 @@ def classify_upstream_decision(
         return False, "music_local"
 
     recorder_intent = any(re.search(pattern, query) for pattern in RECORDER_INTENT_PATTERNS)
-    if recorder_intent:
+    if recorder_enabled and recorder_intent:
         return False, "recorder_local"
 
     new_session_intent = any(re.search(pattern, query) for pattern in NEW_SESSION_INTENT_PATTERNS)
@@ -670,23 +811,6 @@ MUSIC_TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
-            "name": "music_create_playlist",
-            "description": "Create a new empty saved playlist",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Name for the new playlist"
-                    }
-                },
-                "required": ["name"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "music_update_library",
             "description": "Scan music directory and update the library database",
             "parameters": {
@@ -754,6 +878,122 @@ def build_tool_definitions(
     return tool_definitions
 
 
+def _load_json_with_comments(path: Path) -> Any:
+    """Load JSON with light JSONC-style support for line comments/trailing commas."""
+    text = path.read_text(encoding="utf-8")
+    # Remove comment-only lines (e.g. // comment)
+    text = re.sub(r"(?m)^\s*//.*$", "", text)
+    # Remove trailing commas before object/array close
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+    return json.loads(text)
+
+
+def _count_models_in_openclaw_config(config: Any) -> int:
+    """Best-effort count of configured models in models/openclaw config payloads."""
+    if isinstance(config, list):
+        return len(config)
+
+    if not isinstance(config, dict):
+        return 0
+
+    count = 0
+
+    direct_models = config.get("models")
+    if isinstance(direct_models, list):
+        count += len(direct_models)
+
+    # Handle openclaw.json shape: models.providers.<provider>.models[]
+    models_obj = config.get("models")
+    if isinstance(models_obj, dict):
+        nested_models = models_obj.get("models")
+        if isinstance(nested_models, list):
+            count += len(nested_models)
+        providers = models_obj.get("providers")
+        if isinstance(providers, dict):
+            for provider_cfg in providers.values():
+                if isinstance(provider_cfg, dict):
+                    provider_models = provider_cfg.get("models")
+                    if isinstance(provider_models, list):
+                        count += len(provider_models)
+
+    # Also support providers at root level
+    providers = config.get("providers")
+    if isinstance(providers, dict):
+        for provider_cfg in providers.values():
+            if isinstance(provider_cfg, dict):
+                provider_models = provider_cfg.get("models")
+                if isinstance(provider_models, list):
+                    count += len(provider_models)
+
+    return count
+
+
+def configured_models_available_from_files(config_paths: Optional[Sequence[str]] = None) -> bool:
+    """Return True if any provided models/openclaw config file defines at least one model."""
+    if config_paths is None:
+        config_paths = [
+            str(Path.cwd() / "models.json"),
+            str(Path.cwd() / "openclaw.json"),
+            str(Path.cwd() / ".openclaw" / "models.json"),
+            str(Path.cwd() / ".openclaw" / "openclaw.json"),
+            str(Path.cwd().parent / ".openclaw" / "models.json"),
+            str(Path.cwd().parent / ".openclaw" / "openclaw.json"),
+            str(Path.home() / ".openclaw" / "models.json"),
+            str(Path.home() / ".openclaw" / "openclaw.json"),
+        ]
+
+    existing_paths: list[Path] = []
+    for raw_path in config_paths:
+        path = Path(raw_path)
+        if path.exists() and path.is_file():
+            existing_paths.append(path)
+
+    if not existing_paths:
+        logger.info("No models.json/openclaw.json config files found; model recommendations disabled")
+        return False
+
+    for path in existing_paths:
+        try:
+            parsed = _load_json_with_comments(path)
+            model_count = _count_models_in_openclaw_config(parsed)
+            if model_count > 0:
+                logger.info("Configured models found in %s (count=%d)", path, model_count)
+                return True
+            logger.info("Config file %s has no configured models", path)
+        except Exception as exc:
+            logger.debug("Failed parsing model config file %s: %s", path, exc)
+
+    logger.info("No configured models found in models.json/openclaw.json files")
+    return False
+
+
+async def check_openclaw_models_available(
+    gateway_url: str,
+    token: str,
+    timeout_s: float = 10,
+    config_paths: Optional[Sequence[str]] = None,
+) -> bool:
+    """
+    Check if OpenClaw has configured models available in models.json/openclaw.json.
+
+    This is intentionally config-driven. If we cannot find configured models in
+    config files, quick-answer must not ask the LLM for model recommendations.
+    
+    Args:
+        gateway_url: Unused (kept for backward-compatible call sites)
+        token: Unused (kept for backward-compatible call sites)
+        timeout_s: Unused (kept for backward-compatible call sites)
+        config_paths: Optional ordered candidate file paths to check
+    
+    Returns:
+        True if at least one configured model is found, False otherwise
+    """
+    _ = gateway_url
+    _ = token
+    _ = timeout_s
+    return configured_models_available_from_files(config_paths)
+
+
 class QuickAnswerClient:
     """Client for getting quick factual answers from an LLM before escalating to the gateway."""
     
@@ -771,6 +1011,7 @@ class QuickAnswerClient:
         recorder_tool = None,
         web_service = None,
         new_session_handler: Callable[[], Awaitable[str | None]] | None = None,
+        openclaw_models_available: bool = True,
     ):
         """
         Initialize the quick answer client.
@@ -785,6 +1026,8 @@ class QuickAnswerClient:
             tool_router: ToolRouter instance for executing tool calls
             music_router: MusicRouter instance for executing music control calls
             web_service: Web service for sending state updates after music tools
+            openclaw_models_available: Whether OpenClaw gateway has configured models available
+                When False, model_recommendation will not be offered to the LLM
         """
         self.llm_url = llm_url
         self.model = model or "gpt-3.5-turbo"  # Default fallback
@@ -795,6 +1038,7 @@ class QuickAnswerClient:
         self.recorder_tool = recorder_tool
         self.web_service = web_service
         self.new_session_handler = new_session_handler
+        self.openclaw_models_available = bool(openclaw_models_available)
         self.timers_enabled = bool(timers_enabled and tool_router is not None)
         self.music_enabled = bool(music_enabled and music_router is not None)
         self.recorder_enabled = bool(recorder_enabled and recorder_tool is not None)
@@ -806,6 +1050,7 @@ class QuickAnswerClient:
             self.new_session_enabled,
         )
         self._last_tool_steps: list[dict[str, str]] = []
+        self._last_model_recommendation: dict[str, str] | None = None
         self._voice_music_action_seq: int = 0
 
     def _new_voice_music_action_id(self) -> str:
@@ -873,11 +1118,135 @@ class QuickAnswerClient:
         """Whether any tool family is enabled for quick-answer routing."""
         return bool(self.tool_definitions)
 
+    async def summarize_for_tts(
+        self,
+        full_response_text: str,
+        *,
+        target_words: int = 20,
+        timeout_ms: int | None = None,
+        user_question: str = "",
+    ) -> str:
+        """Return a concise spoken reply for TTS using the quick-answer endpoint.
+
+        When user_question is provided the model is asked to directly answer the
+        user without reproducing any generated content from the response.
+        Returns empty string when a reply could not be produced.
+        """
+        source_text = str(full_response_text or "").strip()
+        if not source_text:
+            return ""
+
+        target = max(1, int(target_words))
+        effective_timeout_s = (
+            max(0.2, float(timeout_ms) / 1000.0)
+            if timeout_ms is not None
+            else self.timeout_s
+        )
+
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        question = str(user_question or "").strip()
+        if question:
+            system_prompt = (
+                "You produce a concise spoken outcome/status reply for the user. "
+                f"Write exactly {target} words as one natural sentence. "
+                "Do not fulfill the user's creative/informational request in this reply. "
+                "Do not retell, quote, summarize, paraphrase, or excerpt generated assistant content. "
+                "State what was done for the user and any high-level result only. "
+                "Explicitly mention the request topic from the newest user turn. "
+                "No markdown, lists, or code."
+            )
+            user_prompt = (
+                "User question context (oldest to newest contiguous user turns):\n"
+                f"{question}\n\n"
+                "Assistant generated output (for status grounding only; do not retell it):\n"
+                f"{source_text}\n\n"
+                f"Write a {target}-word spoken status reply that tells the user what action was completed "
+                "and whether it succeeded."
+            )
+        else:
+            system_prompt = (
+                "You compress assistant responses for text-to-speech. "
+                f"Return exactly {target} words as a single plain sentence. "
+                "Preserve key intent and critical facts. "
+                "Do not add markdown, lists, or code."
+            )
+            user_prompt = (
+                "Create a spoken summary for this assistant response:\n\n"
+                f"{source_text}"
+            )
+
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.0,
+            "max_tokens": max(24, target * 5),
+        }
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    self.llm_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=effective_timeout_s,
+                )
+
+            if response.status_code != 200:
+                logger.warning(
+                    "TTS summary request returned status %d: %s",
+                    response.status_code,
+                    response.text[:200],
+                )
+                return ""
+
+            response_data = response.json()
+            choices = response_data.get("choices") if isinstance(response_data, dict) else None
+            if not choices:
+                logger.warning("TTS summary response missing choices")
+                return ""
+
+            message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+            content = str(message.get("content", "") or "").strip()
+            content = sanitize_quick_answer_text(content)
+            if not content:
+                logger.warning("TTS summary response was empty")
+                return ""
+
+            normalized = _truncate_to_target_words(content, target)
+            if not normalized:
+                logger.warning("TTS summary response was not speakable")
+                return ""
+
+            logger.info(
+                "← QUICK ANSWER: Generated TTS summary (%d/%d words)",
+                len(_word_tokens(normalized)),
+                target,
+            )
+            return normalized
+        except httpx.TimeoutException:
+            logger.warning("TTS summary request timed out after %.1fs", effective_timeout_s)
+            return ""
+        except Exception as exc:
+            logger.error("TTS summary request failed: %s", exc)
+            return ""
+
     def pop_last_tool_steps(self) -> list[dict[str, str]]:
         """Return and clear tool-call steps from the most recent quick-answer run."""
         steps = list(self._last_tool_steps)
         self._last_tool_steps.clear()
         return steps
+
+    def pop_last_model_recommendation(self) -> dict[str, str] | None:
+        """Return and clear the last model recommendation emitted by quick-answer."""
+        recommendation = dict(self._last_model_recommendation) if self._last_model_recommendation else None
+        self._last_model_recommendation = None
+        return recommendation
 
     async def _sync_web_music_state(self, trace: dict[str, Any] | None = None) -> None:
         if not (self.web_service and self.music_router and self.music_router.manager):
@@ -958,6 +1327,7 @@ class QuickAnswerClient:
             - If should_use_upstream is True, response_text will be empty and gateway should be used
             - If should_use_upstream is False, response_text contains the quick answer
         """
+        self._last_model_recommendation = None
         should_use_upstream, reason = classify_upstream_decision(user_query)
         if should_use_upstream:
             logger.info("← QUICK ANSWER: Heuristic escalation to upstream (%s)", reason)
@@ -965,7 +1335,11 @@ class QuickAnswerClient:
 
         try:
             current_datetime = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
-            system_prompt = build_system_prompt(current_datetime, False, False, False, False)
+            system_prompt = build_system_prompt(
+                current_datetime, 
+                False, False, False, False,
+                openclaw_models_available=self.openclaw_models_available
+            )
 
             history_msgs = build_history_messages(chat_history) if chat_history else []
             
@@ -1050,6 +1424,7 @@ class QuickAnswerClient:
             - If should_use_upstream is True, response_text will be empty and gateway should be used
             - If should_use_upstream is False, response_text contains the quick answer
         """
+        self._last_model_recommendation = None
         should_use_upstream, reason = classify_upstream_decision(
             user_query,
             timers_enabled=self.timers_enabled,
@@ -1081,14 +1456,11 @@ class QuickAnswerClient:
         if self.music_enabled and self.music_router:
             voice_music_action_id: str | None = None
             voice_playlist_name = ""
-            add_songs_trace_id: str | None = None
             fast_match = None
             try:
                 fast_match = self.music_router.parser.parse(user_query)
             except Exception:
                 fast_match = None
-            if fast_match and fast_match[0] in ("add_songs_to_playlist", "add_songs_to_queue"):
-                add_songs_trace_id = self._new_voice_music_action_id()
             if fast_match and fast_match[0] == "load_playlist":
                 voice_music_action_id = self._new_voice_music_action_id()
                 voice_playlist_name = str((fast_match[1] or {}).get("name", "") or "").strip()
@@ -1119,8 +1491,6 @@ class QuickAnswerClient:
                         "trace_id": voice_music_action_id,
                         "voice_load_complete_ts": voice_load_complete_ts,
                     }
-                elif add_songs_trace_id and not str(music_result).lower().startswith("error"):
-                    sync_trace = {"trace_id": add_songs_trace_id}
                 asyncio.create_task(self._sync_web_music_state(sync_trace))
                 logger.info("← QUICK ANSWER: Music fast-path execution: %s", _preview(music_result))
                 return False, sanitize_quick_answer_text(music_result)
@@ -1146,8 +1516,21 @@ class QuickAnswerClient:
                 self.music_enabled,
                 self.recorder_enabled,
                 self.new_session_enabled,
+                openclaw_models_available=self.openclaw_models_available,
             )
             music_like_query = bool(self.music_enabled and self.music_router and self.music_router.is_music_related(user_query))
+            # Force tool use when any tool family is available and the query reached this point
+            # having already passed classify_upstream_decision(). For music-like queries this was
+            # always "required"; extend to timers and recorder for the same reason: the routing
+            # decision already confirmed a local tool should handle it, so we must not let the
+            # LLM skip the tool and produce prose.
+            tool_eligible = bool(
+                music_like_query
+                or (self.timers_enabled and self.tool_router)
+                or (self.recorder_enabled and self.recorder_tool)
+                or (self.new_session_enabled and self.new_session_handler)
+            )
+            tool_choice_value = "required" if tool_eligible else "auto"
 
             history_msgs = build_history_messages(chat_history) if chat_history else []
 
@@ -1165,7 +1548,7 @@ class QuickAnswerClient:
                 "temperature": 0.0,
                 "max_tokens": 150,
                 "tools": self.tool_definitions,
-                "tool_choice": "required" if music_like_query else "auto",
+                "tool_choice": tool_choice_value,
             }
             
             logger.info("→ QUICK ANSWER (with tools): Querying LLM for: '%s'", user_query)
@@ -1202,6 +1585,13 @@ class QuickAnswerClient:
                 for tool_call in tool_calls:
                     func_name = tool_call.get("function", {}).get("name")
                     func_args = tool_call.get("function", {}).get("arguments", "{}")
+
+                    if isinstance(func_name, str):
+                        normalized_name = func_name.strip()
+                        if normalized_name.upper().startswith("USE_UPSTREAM_AGENT"):
+                            logger.info("← QUICK ANSWER: LLM requested upstream escalation via tool name")
+                            return True, ""
+                        func_name = normalized_name
                     
                     if func_name:
                         logger.info("← QUICK ANSWER: LLM requested tool call: %s", func_name)
@@ -1276,15 +1666,6 @@ class QuickAnswerClient:
                                     voice_action_name = "music_load_playlist"
                                     voice_music_action_id = self._new_voice_music_action_id()
                                     await self._emit_music_action_pending(voice_action_name, voice_music_action_id)
-                                elif func_name == "music_create_playlist":
-                                    voice_action_name = "music_create_playlist"
-                                    voice_music_action_id = self._new_voice_music_action_id()
-                                    playlist_name = str(args_dict.get("name", "") or "").strip()
-                                    await self._emit_music_action_pending(
-                                        voice_action_name,
-                                        voice_music_action_id,
-                                        name=playlist_name or None,
-                                    )
                                 elif func_name == "music_clear_queue":
                                     voice_action_name = "music_clear_queue"
                                     voice_music_action_id = self._new_voice_music_action_id()
@@ -1359,7 +1740,7 @@ class QuickAnswerClient:
                 return True, ""
             
             if not content:
-                logger.warning("Quick answer LLM returned empty content")
+                logger.warning("Quick answer LLM returned empty content with no tool calls")
                 return True, ""
             
             # Check if LLM wants to escalate to upstream
@@ -1367,8 +1748,51 @@ class QuickAnswerClient:
                 logger.info("← QUICK ANSWER: LLM escalated to upstream agent")
                 return True, ""
             
-            logger.info("← QUICK ANSWER: Got response (%d chars): %s", len(content), content[:100])
-            return False, sanitize_quick_answer_text(content)
+            # Strict two-outcome contract enforcement: response must be either
+            # (1) tool calls (already handled above)
+            # (2) model_recommendation JSON (only if OpenClaw models are available)
+            # (3) USE_UPSTREAM_AGENT
+            # Anything else (free-form prose) is a contract violation
+            
+            try:
+                # Try to parse as JSON for model_recommendation (if models are available)
+                import json
+                parsed = json.loads(content)
+                if isinstance(parsed, dict) and parsed.get("type") == "model_recommendation":
+                    # Check if models are actually available before accepting recommendation
+                    if not self.openclaw_models_available:
+                        logger.warning(
+                            "← QUICK ANSWER: LLM returned model_recommendation but no OpenClaw models available; escalating upstream"
+                        )
+                        return True, ""
+                    
+                    tier = parsed.get("tier")
+                    reason = parsed.get("reason", "quick-answer model recommendation")
+                    if isinstance(tier, str) and tier in ("fast", "basic", "capable", "smart", "genius"):
+                        logger.info(
+                            "← QUICK ANSWER: Model recommendation returned (tier=%s, reason=%s)",
+                            tier,
+                            reason,
+                        )
+                        self._last_model_recommendation = {
+                            "type": "model_recommendation",
+                            "tier": tier,
+                            "reason": str(reason),
+                        }
+                        return True, ""
+                    else:
+                        logger.warning("← QUICK ANSWER: Invalid tier in model_recommendation: %s", tier)
+                        return True, ""
+            except (json.JSONDecodeError, ValueError):
+                pass  # Not JSON, continue to prose check
+            
+            # If we get here, it's free-form prose - violates strict two-outcome contract
+            # Escalate to upstream rather than returning unstructured content to TTS
+            logger.warning(
+                "← QUICK ANSWER: LLM returned free-form prose (violates two-outcome contract); escalating upstream: %s",
+                content[:100],
+            )
+            return True, ""
             
         except httpx.TimeoutException:
             logger.warning("Quick answer LLM request timed out after %.1fs", self.timeout_s)

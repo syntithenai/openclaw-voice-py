@@ -191,12 +191,14 @@ class OpenClawGateway(BaseGateway):
         agent_id: str = "assistant",
         session_prefix: str = "voice",
         timeout_s: int = 30,
+        agent_response_timeout_s: int = 300,
     ) -> None:
         self.gateway_url = gateway_url.rstrip("/")
         self.token = token
         self.agent_id = agent_id
         self.session_prefix = session_prefix
         self.timeout_s = timeout_s
+        self.agent_response_timeout_s = agent_response_timeout_s
         self._current_session_key: Optional[str] = None
         self._ws: Optional[Any] = None
         self._pending_requests: dict[str, tuple[asyncio.Future, bool]] = {}
@@ -829,14 +831,40 @@ class OpenClawGateway(BaseGateway):
             "idempotencyKey": str(uuid4()),
         }
 
-        res = await self._send_request("agent", payload, timeout_s=self.timeout_s, expect_final=True)
+        # Agent responses can involve multiple tool calls/retries; keep a longer
+        # request wait than the base websocket/connect timeout.
+        res = await self._send_request(
+            "agent",
+            payload,
+            timeout_s=self.agent_response_timeout_s,
+            expect_final=True,
+        )
         if not bool(res.get("ok")):
             err = (res.get("error") or {}).get("message") if isinstance(res.get("error"), dict) else "agent request failed"
             raise RuntimeError(f"OpenClaw agent request failed: {err}")
 
         payload_obj = res.get("payload") if isinstance(res.get("payload"), dict) else {}
         immediate = payload_obj.get("text") or payload_obj.get("message")
-        return immediate if isinstance(immediate, str) else None
+        if isinstance(immediate, str) and immediate.strip():
+            return immediate
+        # Final payload had no text field — fall back to the accumulated streamed text so
+        # the caller can still append a final chat message and close the stream bubble.
+        if self._last_streamed_text:
+            visible, _ = self._split_reasoning_text(self._last_streamed_text)
+            stripped = visible.strip()
+            if stripped:
+                logger.debug("send_message: final payload missing text; using accumulated stream text (%d chars)", len(stripped))
+                return stripped
+        return None
+
+    async def patch_session(self, session_key: str, **patch_fields: Any) -> None:
+        """Patch a session's settings (e.g. reasoningLevel) via sessions.patch."""
+        await self._ensure_connected()
+        params: dict = {"key": session_key, **patch_fields}
+        res = await self._send_request("sessions.patch", params, timeout_s=self.timeout_s)
+        if not bool(res.get("ok")):
+            err = (res.get("error") or {}).get("message") if isinstance(res.get("error"), dict) else "sessions.patch failed"
+            raise RuntimeError(f"OpenClaw sessions.patch failed: {err}")
 
     async def inject_message(
         self,

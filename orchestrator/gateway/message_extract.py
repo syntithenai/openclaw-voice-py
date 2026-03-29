@@ -49,6 +49,8 @@ def strip_gateway_control_markers(text: str) -> str:
         return ""
     cleaned = re.sub(r"(?i)HEARTBEAT\s*[_ ]?OK(?:\s*NO\s*[_ ]?REPLY)?", " ", text)
     cleaned = re.sub(r"(?i)\bNO\s*[_ ]?REPLY\b", " ", cleaned)
-    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
-    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    # Preserve markdown structure by only normalizing horizontal whitespace.
+    # Using \s here would collapse newlines and break headings/lists/links formatting.
+    cleaned = re.sub(r"[ \t]+([,.;:!?])", r"\1", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     return cleaned

@@ -81,7 +81,7 @@ from orchestrator.metrics import AECStatus, WakeWordResult
 from orchestrator.runtime.config_validation import validate_runtime_config
 from orchestrator.platform.hardware import is_raspberry_pi
 from orchestrator.music.parser import MusicFastPathParser
-from orchestrator.tools.recorder import RecorderTool
+from orchestrator.tools.recorder import RecorderTool, compute_hotword_stop_trim_seconds
 from orchestrator.vad.model_loader import ensure_silero_model
 import numpy as np
 
@@ -201,6 +201,38 @@ def is_ack_token(canonical: str) -> bool:
 
 def is_greeting_token(canonical: str) -> bool:
     return canonical in GREETING_TOKENS
+
+
+def is_startup_welcome_pattern(text: str) -> bool:
+    """Detect common startup/cold-start welcome messages to suppress them.
+    
+    Matches patterns like:
+    - "Hey. I just came online. How can I help you today?"
+    - "Hello. I'm ready to assist."
+    - "I just came online."
+    - "How can I help you today?"
+    - etc.
+    """
+    canonical = canonicalize_transcript_for_match(text)
+    if not canonical:
+        return False
+    
+    # Startup greeting patterns
+    startup_patterns = (
+        re.compile(r"\b(just\s+)?came\s+online\b"),
+        re.compile(r"i\s+just\s+came\s+online\b"),
+        re.compile(r"\bhey\s*\.?\s+(i\s+just\s+came\s+online|how\s+can\s+i\s+help|what\s+can\s+i\s+do)"),
+        re.compile(r"\b(hello|hey|hi)\s*\.?\s+(i|how|what|welcome)"),
+        re.compile(r"^(hello|hey|hi)\s+(i|how|what|can)\b"),
+        re.compile(r"\b(how|what)\s+can\s+(i|we)\s+(help|do|assist)\s+(you|for|today)"),
+        re.compile(r"\b(ready|willing|happy|glad)\s+(to\s+)?(help|assist|listen)"),
+        re.compile(r"^\s*(hello|hey|hi)\s*\.?\s*$"),  # Just hello/hey/hi
+    )
+    
+    for pattern in startup_patterns:
+        if pattern.search(canonical):
+            return True
+    return False
 
 
 def has_supported_short_command(canonical: str, token_count: int) -> bool:
@@ -619,7 +651,15 @@ async def run_orchestrator() -> None:
     tts_last_played_request_id = 0  # Request ID of the last successfully completed TTS item
     last_gateway_send_ts: float | None = None  # Monotonic time of the last transcript sent to gateway
     last_thinking_phrase_ts: float | None = None  # Monotonic time of the last thinking phrase spoken
+    # Track if we're in the startup phase (no user messages sent yet)
+    startup_phase_active = bool(config.new_session_suppress_welcome_message)
+    # Legacy flag: suppress ALL gateway messages on new session (backward compat)
     suppress_gateway_messages_for_new_session = False
+    gateway_collation_open = False
+    gateway_collation_active_request_id = 0
+    gateway_collation_last_frame_ts: float | None = None
+    gateway_collation_close_task: asyncio.Task | None = None
+    dropped_out_of_window_gateway_frames = 0
     last_user_text = ""
     last_user_accepted_ts: float | None = None
     last_user_went_upstream = False
@@ -1520,7 +1560,37 @@ async def run_orchestrator() -> None:
         print("→ Initializing Quick Answer LLM...", flush=True)
         logger.info("→ Initializing Quick Answer LLM (%s)...", config.quick_answer_llm_url)
         try:
-            from orchestrator.gateway.quick_answer import QuickAnswerClient, get_random_thinking_phrase
+            from orchestrator.gateway.quick_answer import (
+                QuickAnswerClient,
+                check_openclaw_models_available,
+                classify_upstream_decision,
+                get_random_thinking_phrase,
+                resolve_recommended_model_id,
+            )
+
+            # Check if OpenClaw gateway has configured models available
+            openclaw_models_available = True
+            if isinstance(gateway, OpenClawGateway):
+                try:
+                    model_config_candidates = [
+                        str(Path.cwd() / "models.json"),
+                        str(Path.cwd() / "openclaw.json"),
+                        str(Path.cwd() / ".openclaw" / "models.json"),
+                        str(Path.cwd() / ".openclaw" / "openclaw.json"),
+                        str(Path.cwd().parent / ".openclaw" / "models.json"),
+                        str(Path.cwd().parent / ".openclaw" / "openclaw.json"),
+                        str(Path.home() / ".openclaw" / "models.json"),
+                        str(Path.home() / ".openclaw" / "openclaw.json"),
+                    ]
+                    openclaw_models_available = await check_openclaw_models_available(
+                        gateway.gateway_url,
+                        gateway.token,
+                        timeout_s=5.0,
+                        config_paths=model_config_candidates,
+                    )
+                except Exception as exc:
+                    logger.debug("Failed to check OpenClaw models availability: %s", exc)
+                    openclaw_models_available = False
 
             quick_answer_client = QuickAnswerClient(
                 llm_url=config.quick_answer_llm_url,
@@ -1533,9 +1603,14 @@ async def run_orchestrator() -> None:
                 tool_router=tool_router,
                 music_router=music_router,
                 recorder_tool=recorder_tool,
+                openclaw_models_available=openclaw_models_available,
             )
-            logger.info("✓ Quick Answer LLM ready")
-            print("✓ Quick Answer LLM ready", flush=True)
+            if openclaw_models_available:
+                logger.info("✓ Quick Answer LLM ready (with model tier resolution)")
+                print("✓ Quick Answer LLM ready (with model tier resolution)", flush=True)
+            else:
+                logger.info("✓ Quick Answer LLM ready (model tier resolution disabled - no models configured)")
+                print("✓ Quick Answer LLM ready (model tier resolution disabled)", flush=True)
         except ImportError as ie:
             logger.error("Quick Answer disabled: missing dependency (%s)", ie)
             logger.error("Install dependencies with: pip install -r requirements.txt")
@@ -1814,6 +1889,7 @@ async def run_orchestrator() -> None:
             debounce_task = None
             processing_request = False
             current_request_id += 1
+            _force_close_gateway_collation_window(f"{source} new session")
             if config.new_session_suppress_welcome_message:
                 suppress_gateway_messages_for_new_session = True
             _tts_clear_all(f"{source} new session")
@@ -1883,6 +1959,11 @@ async def run_orchestrator() -> None:
                 auth_session_cookie_name=config.web_ui_auth_session_cookie_name,
                 auth_session_ttl_hours=config.web_ui_auth_session_ttl_hours,
                 auth_cookie_secure=config.web_ui_auth_cookie_secure,
+                file_manager_enabled=config.web_ui_file_manager_enabled,
+                file_manager_root=config.web_ui_file_manager_root,
+                file_manager_excluded_folders=config.web_ui_file_manager_excluded_folders,
+                file_manager_top_level_config_files=config.web_ui_file_manager_top_level_config_files,
+                file_manager_max_editable_bytes=config.web_ui_file_manager_max_editable_bytes,
             )
             await web_service.start()
             web_service.update_recordings_state(recordings_catalog.list_recordings())
@@ -2295,6 +2376,31 @@ async def run_orchestrator() -> None:
 
             async def _ui_chat_text(text: str, client_id: str) -> None:
                 nonlocal pending_transcripts, debounce_task
+
+                # Intercept /reasoning directive before it reaches the transcript queue.
+                reasoning_match = re.match(
+                    r"^/reason(?:ing)?\s+(on|off|stream)\s*$", text.strip(), re.IGNORECASE
+                )
+                if reasoning_match:
+                    level = reasoning_match.group(1).lower()
+                    session_key = f"agent:{agent_id}:{session_id}"
+                    logger.info("💬 /reasoning directive from %s: level=%s session=%s", client_id, level, session_key)
+                    ack_text = f"Reasoning {level.upper()}"
+                    try:
+                        if hasattr(gateway, "patch_session"):
+                            patch_value = None if level == "off" else level
+                            await gateway.patch_session(session_key, reasoningLevel=patch_value)
+                            ack_text = f"Reasoning {level.upper()} ✓"
+                    except Exception as exc:
+                        logger.warning("Failed to patch session reasoning level: %s", exc)
+                        ack_text = f"Reasoning {level.upper()} (patch failed: {exc})"
+                    if web_service:
+                        try:
+                            web_service.append_chat_message({"role": "assistant", "text": ack_text})
+                        except Exception as exc:
+                            logger.warning("Failed to append reasoning ack message: %s", exc)
+                    return
+
                 normalized = normalize_transcript(text)
                 if not enqueue_pending_transcript(normalized, ""):
                     return
@@ -2601,12 +2707,12 @@ async def run_orchestrator() -> None:
 
     async def stop_ringing_alarms_immediately(source_label: str) -> int:
         """Stop all actively ringing alarms and interrupt current alarm bell playback."""
-        if not alarm_manager:
-            return 0
-
+        # Shared stop signal also interrupts in-flight timer bell playback.
         alarm_playback_stop_event.set()
+        stopped_count = 0
         try:
-            stopped_count = await alarm_manager.stop_alarm(None)
+            if alarm_manager:
+                stopped_count = await alarm_manager.stop_alarm(None)
             # Keep stop signal asserted briefly so in-flight playback writes observe it.
             await asyncio.sleep(0.12)
         finally:
@@ -2650,6 +2756,22 @@ async def run_orchestrator() -> None:
                 return item
             tts_queue_event.clear()
             await tts_queue_event.wait()
+
+    def _strip_markdown_for_tts_word_count(text: str) -> str:
+        """Normalize markdown-heavy responses for spoken-word counting."""
+        normalized = str(text or "")
+        normalized = re.sub(r"```[\s\S]*?```", " ", normalized)
+        normalized = re.sub(r"`[^`]*`", " ", normalized)
+        normalized = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r" \1 ", normalized)
+        normalized = re.sub(r"(?m)^\s{0,3}[>#*-]+\s*", "", normalized)
+        normalized = re.sub(r"[_*~]+", " ", normalized)
+        return normalized
+
+    def _count_spoken_words_for_tts(text: str) -> int:
+        """Count words while ignoring punctuation-heavy/code-only content."""
+        normalized = _strip_markdown_for_tts_word_count(text)
+        tokens = re.findall(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)?", normalized)
+        return len(tokens)
 
     def clean_text_for_tts(text: str) -> str:
         """Remove punctuation and icon symbols that should not be spoken by TTS.
@@ -2709,6 +2831,9 @@ async def run_orchestrator() -> None:
             for ch in text
             if unicodedata.category(ch) != "So" and ch not in {"\ufe0f", "\u200d"}
         )
+
+        # Expand negative numbers so TTS reads them correctly (e.g. -4 → minus 4).
+        text = re.sub(r'(?<!\w)-(\d)', r'minus \1', text)
 
         # Clean up multiple spaces
         text = re.sub(r'\s+', ' ', text).strip()
@@ -2794,6 +2919,70 @@ async def run_orchestrator() -> None:
             )
         )
 
+    def _active_gateway_collation_request_id() -> int:
+        if gateway_collation_open and gateway_collation_active_request_id > 0:
+            return gateway_collation_active_request_id
+        return 0
+
+    def _force_close_gateway_collation_window(reason: str) -> None:
+        nonlocal gateway_collation_open, gateway_collation_active_request_id
+        nonlocal gateway_collation_last_frame_ts, gateway_collation_close_task
+        if gateway_collation_close_task and not gateway_collation_close_task.done():
+            gateway_collation_close_task.cancel()
+        if gateway_collation_open or gateway_collation_active_request_id:
+            logger.info(
+                "🧩 Force-closed gateway collation window [req#%d] (%s)",
+                gateway_collation_active_request_id,
+                reason,
+            )
+        gateway_collation_open = False
+        gateway_collation_active_request_id = 0
+        gateway_collation_last_frame_ts = None
+
+    def _open_gateway_collation_window(request_id: int) -> None:
+        nonlocal gateway_collation_open, gateway_collation_active_request_id
+        nonlocal gateway_collation_last_frame_ts, gateway_collation_close_task
+        if request_id <= 0:
+            return
+        if gateway_collation_close_task and not gateway_collation_close_task.done():
+            gateway_collation_close_task.cancel()
+        gateway_collation_open = True
+        gateway_collation_active_request_id = int(request_id)
+        gateway_collation_last_frame_ts = time.monotonic()
+        logger.info("🧩 Opened gateway collation window [req#%d]", request_id)
+
+    def _touch_gateway_collation_window(request_id: int) -> bool:
+        nonlocal gateway_collation_last_frame_ts
+        if request_id <= 0:
+            return False
+        if not gateway_collation_open:
+            return False
+        if gateway_collation_active_request_id != int(request_id):
+            return False
+        gateway_collation_last_frame_ts = time.monotonic()
+        return True
+
+    def _schedule_gateway_collation_close(request_id: int, reason: str, delay_s: float = 1.5) -> None:
+        nonlocal gateway_collation_close_task
+        if request_id <= 0:
+            return
+        if gateway_collation_close_task and not gateway_collation_close_task.done():
+            gateway_collation_close_task.cancel()
+
+        async def _close_later() -> None:
+            nonlocal gateway_collation_open, gateway_collation_active_request_id, gateway_collation_last_frame_ts
+            try:
+                await asyncio.sleep(max(0.0, float(delay_s)))
+            except asyncio.CancelledError:
+                return
+            if gateway_collation_open and gateway_collation_active_request_id == int(request_id):
+                gateway_collation_open = False
+                gateway_collation_active_request_id = 0
+                gateway_collation_last_frame_ts = None
+                logger.info("🧩 Closed gateway collation window [req#%d] (%s)", request_id, reason)
+
+        gateway_collation_close_task = asyncio.create_task(_close_later())
+
     def _append_recorder_finished_chat(stop_result: Any) -> None:
         if not web_service:
             return
@@ -2823,6 +3012,120 @@ async def run_orchestrator() -> None:
         except Exception as exc:
             logger.warning("Failed to append recorder completion chat message: %s", exc)
 
+    def _safe_append_chat_message(message: dict[str, Any], context: str) -> None:
+        if not web_service:
+            return
+        try:
+            web_service.append_chat_message(message)
+        except Exception as exc:
+            logger.warning("Failed to append web chat message (%s): %s", context, exc)
+
+    def _safe_update_or_append_chat_message(message: dict[str, Any], context: str) -> None:
+        """Append or update user message if it's a prefix extension of the last one."""
+        if not web_service:
+            return
+        try:
+            web_service.update_or_append_chat_message(message)
+        except Exception as exc:
+            logger.warning("Failed to update or append web chat message (%s): %s", context, exc)
+
+    def _collect_summary_user_prompt(current_user_text: str) -> str:
+        """Collect the latest contiguous block of user turns for summary generation."""
+        current_norm = normalize_transcript(current_user_text)
+        prompts: list[str] = []
+
+        if web_service:
+            try:
+                history = list(getattr(web_service, "_chat_messages", []) or [])
+            except Exception:
+                history = []
+
+            for msg in reversed(history):
+                if not isinstance(msg, dict):
+                    continue
+                role = str(msg.get("role") or "").strip().lower()
+                seg_kind = str(msg.get("segment_kind") or "").strip().lower()
+
+                # Ignore non-conversational frames and in-flight stream deltas.
+                if role in {"raw_gateway", "step", "interim", "context_group", "gateway_debug_group"}:
+                    continue
+                if role == "assistant" and seg_kind == "stream":
+                    continue
+
+                if role == "assistant":
+                    break
+
+                if role == "user":
+                    txt = normalize_transcript(str(msg.get("text") or ""))
+                    if txt:
+                        prompts.append(txt)
+                    continue
+
+                if prompts:
+                    break
+
+        prompts.reverse()
+
+        if current_norm:
+            if not prompts or normalize_transcript(prompts[-1]) != current_norm:
+                prompts.append(current_norm)
+
+        deduped: list[str] = []
+        for txt in prompts:
+            if not deduped or normalize_transcript(deduped[-1]) != normalize_transcript(txt):
+                deduped.append(txt)
+
+        return "\n".join(deduped)
+
+    def _latest_stream_text_for_request(request_id: int) -> str:
+        """Return the latest in-progress streamed assistant text for a request."""
+        if not web_service:
+            return ""
+        try:
+            history = list(getattr(web_service, "_chat_messages", []) or [])
+        except Exception:
+            return ""
+
+        req_key = str(request_id)
+        for msg in reversed(history):
+            if not isinstance(msg, dict):
+                continue
+            if str(msg.get("role") or "").strip().lower() != "assistant":
+                continue
+            if str(msg.get("segment_kind") or "").strip().lower() != "stream":
+                continue
+            if str(msg.get("request_id") or "") != req_key:
+                continue
+            return str(msg.get("text") or "").strip()
+        return ""
+
+    def _summary_looks_like_response_excerpt(summary_text: str, full_response_text: str) -> bool:
+        """Detect summaries that mostly mirror generated output text."""
+        summary_norm = re.sub(r"\s+", " ", str(summary_text or "")).strip().lower()
+        full_norm = re.sub(r"\s+", " ", str(full_response_text or "")).strip().lower()
+        if not summary_norm or not full_norm:
+            return False
+        if summary_norm in full_norm:
+            return True
+        summary_tokens = summary_norm.split()
+        full_tokens = full_norm.split()
+        if len(summary_tokens) >= 6 and len(full_tokens) >= 6 and summary_tokens[:6] == full_tokens[:6]:
+            return True
+        return False
+
+    def _summary_topic_hint(user_prompt: str, max_words: int = 10) -> str:
+        """Extract a short topic hint from the latest user turn for fallback summaries."""
+        lines = [normalize_transcript(line) for line in str(user_prompt or "").splitlines()]
+        nonempty = [line for line in lines if line]
+        latest = nonempty[-1] if nonempty else ""
+        if not latest:
+            return ""
+        words = latest.split()
+        hint = " ".join(words[:max_words]).strip()
+        if len(words) > max_words:
+            hint = hint.rstrip(" ,;:") + "…"
+        return hint
+
     async def send_debounced_transcripts(immediate: bool = False) -> None:
         """Send accumulated transcripts after debounce period."""
         nonlocal pending_transcripts, processing_request, debounce_task
@@ -2838,23 +3141,6 @@ async def run_orchestrator() -> None:
         if processing_request:
             logger.info("⏱️ Debounce timer skipped - already processing a request")
             return
-
-        def _safe_append_chat_message(message: dict[str, Any], context: str) -> None:
-            if not web_service:
-                return
-            try:
-                web_service.append_chat_message(message)
-            except Exception as exc:
-                logger.warning("Failed to append web chat message (%s): %s", context, exc)
-        
-        def _safe_update_or_append_chat_message(message: dict[str, Any], context: str) -> None:
-            """Append or update user message if it's a prefix extension of the last one."""
-            if not web_service:
-                return
-            try:
-                web_service.update_or_append_chat_message(message)
-            except Exception as exc:
-                logger.warning("Failed to update or append web chat message (%s): %s", context, exc)
         
         if immediate:
             logger.info("⏱️ Immediate dispatch requested (web text input)")
@@ -2927,6 +3213,8 @@ async def run_orchestrator() -> None:
                 return
 
             parsed_music: tuple[str, dict[str, Any] | str] | None = None
+            canonical_combined = canonicalize_transcript_for_match(combined_transcript)
+            stop_transcript_intent = canonical_combined in {"stop transcript", "stop transcription"}
 
             # Belt-and-suspenders: if user explicitly asked to stop/pause music,
             # clear wake-pause auto-resume state immediately so music cannot
@@ -2941,13 +3229,25 @@ async def run_orchestrator() -> None:
                         logger.info("🎵 Explicit stop intent detected → clearing wake pause/auto-resume state")
                     music_paused_for_wake = False
                     music_auto_resume_timer = 0.0
+
+                    if stop_transcript_intent:
+                        dismissed_alert_alarms = await stop_ringing_alarms_immediately("voice stop transcript")
+                        # Interrupt any in-flight timer/alarm notification speech too.
+                        tts_stop_event.set()
+                        dropped_alert_tts = _tts_clear_all("voice stop transcript silenced alerts")
+                        if dismissed_alert_alarms > 0 or dropped_alert_tts > 0:
+                            logger.info(
+                                "🔕 Voice stop transcript silenced alerts (alarms_stopped=%d, tts_cleared=%d)",
+                                dismissed_alert_alarms,
+                                dropped_alert_tts,
+                            )
             
             # Increment request ID for new user message
-            nonlocal current_request_id
+            nonlocal current_request_id, startup_phase_active
             current_request_id += 1
+            _force_close_gateway_collation_window("new user message")
             logger.info("📍 New user message [req#%d]", current_request_id)
             print(f"\033[93m→ USER: {combined_transcript}\033[0m", flush=True)
-            suppress_gateway_messages_for_new_session = False
             is_music_query = bool(music_router and music_router.is_music_related(combined_transcript))
             _safe_update_or_append_chat_message(
                 {
@@ -2965,6 +3265,133 @@ async def run_orchestrator() -> None:
             
             # Try quick answer first if enabled
             should_send_to_gateway = True
+            quick_answer_model_recommendation: dict[str, str] | None = None
+
+            # Hard local fast-path for timers/alarms before any QA bypass logic.
+            # This guarantees deterministic timer handling stays local even if quick-answer
+            # is unavailable or currently in a bypass window.
+            if timers_feature_enabled and tool_router:
+                try:
+                    direct_timer_result = await tool_router.try_deterministic_parse(combined_transcript)
+                except Exception as exc:
+                    logger.debug("Direct timer/alarm fast-path parse failed: %s", exc)
+                    direct_timer_result = None
+
+                if direct_timer_result is not None:
+                    from orchestrator.gateway.quick_answer import sanitize_quick_answer_text
+
+                    local_response = sanitize_quick_answer_text(direct_timer_result)
+                    logger.info("✓ TIMER FAST-PATH: handled locally before QA/upstream")
+                    startup_phase_active = False
+
+                    if local_response:
+                        print(f"\033[94m← TIMER FAST-PATH: {local_response}\033[0m", flush=True)
+                        logger.info("→ TTS QUEUE [req#%d]: Enqueuing timer fast-path response: '%s'", current_request_id, local_response[:80])
+                        last_activity_ts = time.monotonic()
+                        await submit_tts(local_response, request_id=current_request_id)
+                        _safe_append_chat_message(
+                            {
+                                "role": "assistant",
+                                "text": local_response,
+                                "tts_text": local_response,
+                                "source": "timer_fast_path",
+                                "request_id": current_request_id,
+                                "segment_kind": "final",
+                            },
+                            "timer_fast_path_assistant",
+                        )
+                        last_assistant_text = local_response
+                        last_assistant_source = "timer_fast_path"
+                        last_assistant_ts = time.monotonic()
+                        last_assistant_was_question = assistant_turn_is_question(local_response)
+                        last_assistant_expects_short_reply = assistant_turn_expects_short_reply(local_response)
+
+                    should_send_to_gateway = False
+                    last_user_went_upstream = False
+
+                    # Preserve any transcripts that arrived while we were handling the fast-path.
+                    trailing_transcripts = pending_transcripts[initial_count:] if len(pending_transcripts) > initial_count else []
+                    filtered_trailing: list[tuple[str, str]] = []
+                    for trailing_text, trailing_emotion in trailing_transcripts:
+                        trailing_norm = normalize_transcript(trailing_text)
+                        if not trailing_norm:
+                            continue
+                        if _is_incremental_prefix_extension(combined_transcript, trailing_norm):
+                            continue
+                        if _is_incremental_prefix_extension(trailing_norm, combined_transcript):
+                            continue
+                        filtered_trailing.append((trailing_norm, trailing_emotion))
+
+                    pending_transcripts = filtered_trailing
+                    if pending_transcripts:
+                        if debounce_task and not debounce_task.done():
+                            debounce_task.cancel()
+                        debounce_task = asyncio.create_task(send_debounced_transcripts())
+
+            # Hard local fast-path for deterministic music commands before QA/upstream.
+            # This prevents clear local music intents (e.g. "play some jazz music")
+            # from leaking upstream when QA bypassing/escalation heuristics are active.
+            if should_send_to_gateway and config.music_enabled and music_router:
+                try:
+                    direct_music_result = await music_router.handle_request(combined_transcript, use_fast_path=True)
+                except Exception as exc:
+                    logger.debug("Direct music fast-path execution failed: %s", exc)
+                    direct_music_result = None
+
+                # Music fast-path returns None when no deterministic command matched.
+                if direct_music_result is not None:
+                    from orchestrator.gateway.quick_answer import sanitize_quick_answer_text
+
+                    local_response = sanitize_quick_answer_text(direct_music_result)
+                    logger.info("✓ MUSIC FAST-PATH: handled locally before QA/upstream")
+                    startup_phase_active = False
+
+                    if local_response:
+                        print(f"\033[94m← MUSIC FAST-PATH: {local_response}\033[0m", flush=True)
+                        logger.info("→ TTS QUEUE [req#%d]: Enqueuing music fast-path response: '%s'", current_request_id, local_response[:80])
+                        last_activity_ts = time.monotonic()
+                        await submit_tts(local_response, request_id=current_request_id)
+                        _safe_append_chat_message(
+                            {
+                                "role": "assistant",
+                                "text": local_response,
+                                "tts_text": local_response,
+                                "source": "music_fast_path",
+                                "request_id": current_request_id,
+                                "segment_kind": "final",
+                            },
+                            "music_fast_path_assistant",
+                        )
+                        last_assistant_text = local_response
+                        last_assistant_source = "music_fast_path"
+                        last_assistant_ts = time.monotonic()
+                        last_assistant_was_question = assistant_turn_is_question(local_response)
+                        last_assistant_expects_short_reply = assistant_turn_expects_short_reply(local_response)
+                    else:
+                        logger.info("→ MUSIC FAST-PATH [req#%d]: Silent success (no TTS response)", current_request_id)
+
+                    should_send_to_gateway = False
+                    last_user_went_upstream = False
+
+                    # Preserve any transcripts that arrived while we were handling the fast-path.
+                    trailing_transcripts = pending_transcripts[initial_count:] if len(pending_transcripts) > initial_count else []
+                    filtered_trailing: list[tuple[str, str]] = []
+                    for trailing_text, trailing_emotion in trailing_transcripts:
+                        trailing_norm = normalize_transcript(trailing_text)
+                        if not trailing_norm:
+                            continue
+                        if _is_incremental_prefix_extension(combined_transcript, trailing_norm):
+                            continue
+                        if _is_incremental_prefix_extension(trailing_norm, combined_transcript):
+                            continue
+                        filtered_trailing.append((trailing_norm, trailing_emotion))
+
+                    pending_transcripts = filtered_trailing
+                    if pending_transcripts:
+                        if debounce_task and not debounce_task.done():
+                            debounce_task.cancel()
+                        debounce_task = asyncio.create_task(send_debounced_transcripts())
+
             nonlocal last_gateway_send_ts, last_thinking_phrase_ts
             bypass_window_ms = config.quick_answer_bypass_window_ms
             in_bypass_window = (
@@ -2972,9 +3399,34 @@ async def run_orchestrator() -> None:
                 and last_gateway_send_ts is not None
                 and (time.monotonic() - last_gateway_send_ts) * 1000 < bypass_window_ms
             )
+            local_skill_query = False
+            if quick_answer_client:
+                try:
+                    should_force_upstream_local, local_reason = classify_upstream_decision(
+                        combined_transcript,
+                        timers_enabled=quick_answer_client.timers_enabled,
+                        music_enabled=quick_answer_client.music_enabled,
+                        recorder_enabled=quick_answer_client.recorder_enabled,
+                        new_session_enabled=quick_answer_client.new_session_enabled,
+                    )
+                    local_skill_query = (not should_force_upstream_local) and local_reason in {
+                        "timer_alarm_local",
+                        "music_local",
+                        "recorder_local",
+                        "new_session_local",
+                        "date_time_local",
+                    }
+                except Exception:
+                    local_skill_query = False
             if in_bypass_window and is_music_query:
                 logger.info(
                     "⏩ QA bypass override: music command detected; running quick-answer/tool path despite %dms bypass window",
+                    bypass_window_ms,
+                )
+                in_bypass_window = False
+            if in_bypass_window and local_skill_query:
+                logger.info(
+                    "⏩ QA bypass override: local-skill intent detected; running quick-answer/tool path despite %dms bypass window",
                     bypass_window_ms,
                 )
                 in_bypass_window = False
@@ -2992,10 +3444,13 @@ async def run_orchestrator() -> None:
                     else:
                         should_use_upstream, quick_response = await quick_answer_client.get_quick_answer(combined_transcript)
                     qa_elapsed = int((time.monotonic() - qa_start) * 1000)
+                    if should_use_upstream:
+                        quick_answer_model_recommendation = quick_answer_client.pop_last_model_recommendation()
                     if not should_use_upstream:
                         # Quick answer handled locally. Some command classes intentionally
                         # return empty text to keep interactions silent (e.g. play/stop).
                         logger.info("✓ QUICK ANSWER: Using LLM/tool response instead of gateway (latency: %dms)", qa_elapsed)
+                        startup_phase_active = False  # Assistant responded locally; clear startup phase
                         trailing_transcripts = pending_transcripts[initial_count:] if len(pending_transcripts) > initial_count else []
                         if quick_response:
                             print(f"\033[94m← QUICK ANSWER: {quick_response} [latency: {qa_elapsed}ms]\033[0m", flush=True)
@@ -3007,6 +3462,7 @@ async def run_orchestrator() -> None:
                                     {
                                         "role": "assistant",
                                         "text": quick_response,
+                                        "tts_text": quick_response,
                                         "source": "quick_answer",
                                         "request_id": current_request_id,
                                         "segment_kind": "final",
@@ -3113,15 +3569,129 @@ async def run_orchestrator() -> None:
             
             # Gateway submission (if quick answer didn't handle it)
             if should_send_to_gateway:
+                # Last-chance deterministic local handling for timer/alarm intents.
+                # This prevents tool-eligible timer/alarm commands from leaking upstream
+                # due to any earlier branch/bypass interactions.
+                if timers_feature_enabled and tool_router:
+                    try:
+                        final_timer_result = await tool_router.try_deterministic_parse(combined_transcript)
+                    except Exception as exc:
+                        logger.debug("Final timer/alarm safety parse failed: %s", exc)
+                        final_timer_result = None
+
+                    if final_timer_result is not None:
+                        from orchestrator.gateway.quick_answer import sanitize_quick_answer_text
+
+                        local_response = sanitize_quick_answer_text(final_timer_result)
+                        logger.info("✓ TIMER SAFETY-NET: handled locally before gateway dispatch")
+                        startup_phase_active = False
+                        if local_response:
+                            print(f"\033[94m← TIMER SAFETY-NET: {local_response}\033[0m", flush=True)
+                            logger.info(
+                                "→ TTS QUEUE [req#%d]: Enqueuing timer safety-net response: '%s'",
+                                current_request_id,
+                                local_response[:80],
+                            )
+                            last_activity_ts = time.monotonic()
+                            await submit_tts(local_response, request_id=current_request_id)
+                            _safe_append_chat_message(
+                                {
+                                    "role": "assistant",
+                                    "text": local_response,
+                                    "tts_text": local_response,
+                                    "source": "timer_safety_net",
+                                    "request_id": current_request_id,
+                                    "segment_kind": "final",
+                                },
+                                "timer_safety_net_assistant",
+                            )
+                            last_assistant_text = local_response
+                            last_assistant_source = "timer_safety_net"
+                            last_assistant_ts = time.monotonic()
+                            last_assistant_was_question = assistant_turn_is_question(local_response)
+                            last_assistant_expects_short_reply = assistant_turn_expects_short_reply(local_response)
+
+                        should_send_to_gateway = False
+                        last_user_went_upstream = False
+
+                if not should_send_to_gateway:
+                    return
+
+                # Final safety gate: never forward music-like requests upstream.
+                # This prevents external gateway-side music skills from executing
+                # when local parsing/tool handling misses a variant.
+                if config.music_enabled and music_router and music_router.is_music_related(combined_transcript):
+                    logger.info(
+                        "🚫 MUSIC UPSTREAM GUARD: suppressing upstream dispatch for music-like transcript: '%s'",
+                        combined_transcript[:120],
+                    )
+
+                    fallback_response = "I can only run local music controls. Try a direct command like play, stop, next, or previous."
+                    last_activity_ts = time.monotonic()
+                    await submit_tts(fallback_response, request_id=current_request_id)
+                    _safe_append_chat_message(
+                        {
+                            "role": "assistant",
+                            "text": fallback_response,
+                            "tts_text": fallback_response,
+                            "source": "music_upstream_guard",
+                            "request_id": current_request_id,
+                            "segment_kind": "final",
+                        },
+                        "music_upstream_guard_assistant",
+                    )
+                    last_assistant_text = fallback_response
+                    last_assistant_source = "music_upstream_guard"
+                    last_assistant_ts = time.monotonic()
+                    last_assistant_was_question = assistant_turn_is_question(fallback_response)
+                    last_assistant_expects_short_reply = assistant_turn_expects_short_reply(fallback_response)
+                    should_send_to_gateway = False
+                    last_user_went_upstream = False
+                    pending_transcripts.clear()
+                    return
+
                 # Clear all pending transcripts now (we're sending everything)
                 transcript_count = len(pending_transcripts)
                 pending_transcripts.clear()
+
+                # Keep startup/new-session gateway chatter suppressed until we actually
+                # dispatch a user request upstream. This prevents delayed welcome or
+                # out-of-order interim messages from interrupting request collation.
+                if suppress_gateway_messages_for_new_session:
+                    logger.info("🔓 Lifting gateway suppression at first upstream user dispatch [req#%d]", current_request_id)
+                    suppress_gateway_messages_for_new_session = False
+                startup_phase_active = False  # User message sent upstream; clear startup phase
                 
                 final_text = f"[{emotion_tag}] {combined_transcript}" if emotion_tag else combined_transcript
+
+                if (
+                    quick_answer_model_recommendation is not None
+                    and getattr(gateway, "provider", "") == "openclaw"
+                ):
+                    resolved_model_id = resolve_recommended_model_id(
+                        quick_answer_model_recommendation,
+                        config,
+                    )
+                    if resolved_model_id:
+                        final_text = f"/model {resolved_model_id} {final_text}"
+                        logger.info(
+                            "→ GATEWAY: Applied quick-answer model recommendation tier=%s as /model %s",
+                            quick_answer_model_recommendation.get("tier", ""),
+                            resolved_model_id,
+                        )
+                    else:
+                        logger.info(
+                            "→ GATEWAY: Quick-answer model recommendation present but no configured tier model resolved; sending transcript without /model prefix"
+                        )
+
                 logger.info("→ GATEWAY: Sending debounced transcript (%d parts) to %s [req#%d]", transcript_count, gateway.provider, current_request_id)
                 last_gateway_send_ts = time.monotonic()
                 last_user_went_upstream = True
                 gw_start = time.monotonic()
+                req_for_gateway = current_request_id
+                _open_gateway_collation_window(req_for_gateway)
+                response_text: str | None = None
+                response_error_text = ""
                 try:
                     response_text = await gateway.send_message(
                         final_text,
@@ -3131,39 +3701,144 @@ async def run_orchestrator() -> None:
                     )
                     gw_elapsed = int((time.monotonic() - gw_start) * 1000)
                     logger.info("← GATEWAY: Response received in %dms", gw_elapsed)
+                except Exception as exc:
+                    response_error_text = str(exc).strip() or "gateway request failed"
+                    logger.warning("Gateway send failed (%s); continuing", response_error_text)
+                streamed_fallback_text = ""
+                if not response_text:
+                    streamed_fallback_text = _latest_stream_text_for_request(req_for_gateway)
+                    if streamed_fallback_text:
+                        response_text = streamed_fallback_text
+                        logger.info(
+                            "↩️ Using streamed fallback text for finalization [req#%d] (%d chars)",
+                            req_for_gateway,
+                            len(streamed_fallback_text),
+                        )
+
+                if response_text or response_error_text:
                     if response_text:
                         print(f"\033[94m← ASSISTANT: {response_text}\033[0m", flush=True)
-                        logger.info("→ TTS QUEUE [req#%d]: Enqueuing response: '%s'", current_request_id, response_text[:80])
+
+                    summary = None
+                    summary_user_prompt = _collect_summary_user_prompt(combined_transcript)
+                    summary_topic = _summary_topic_hint(summary_user_prompt)
+                    target_summary_words = max(1, int(config.tts_long_response_summary_target_words))
+                    summary_trigger_words = max(1, int(config.tts_long_response_summary_word_trigger))
+                    summary_source_text = response_text or response_error_text
+                    normalized_response = re.sub(r"\s+", " ", response_text or "").strip()
+                    response_word_count = _count_spoken_words_for_tts(normalized_response) if normalized_response else 0
+                    summary_enabled = bool(config.tts_long_response_summary_enabled)
+                    should_summarize = bool(
+                        summary_enabled
+                        and (
+                            response_error_text
+                            or response_word_count >= summary_trigger_words
+                        )
+                    )
+
+                    if quick_answer_client is not None and should_summarize:
+                        try:
+                            summary = await quick_answer_client.summarize_for_tts(
+                                summary_source_text,
+                                target_words=target_summary_words,
+                                timeout_ms=int(config.tts_long_response_summary_timeout_ms),
+                                user_question=summary_user_prompt,
+                            )
+                        except Exception as exc:
+                            logger.warning("Gateway TTS summarization failed [req#%d]: %s", req_for_gateway, exc)
+
+                    fallback_summary = ""
+                    if response_error_text and normalized_response:
+                        if summary_topic:
+                            fallback_summary = f"I hit an error after partial output for your request about {summary_topic}, but I preserved and returned what was received."
+                        else:
+                            fallback_summary = "I hit an error after partial output, but I preserved and returned the received response."
+                    elif response_error_text:
+                        fallback_summary = f"I could not complete your request due to an error: {response_error_text}."
+                    elif should_summarize and summary_topic:
+                        fallback_summary = f"I completed your request about {summary_topic} and returned the result."
+                    elif should_summarize and normalized_response:
+                        summary_tokens = normalized_response.split()
+                        fallback_summary = " ".join(summary_tokens[:target_summary_words]).strip()
+                        if len(summary_tokens) > target_summary_words:
+                            fallback_summary = fallback_summary.rstrip(" ,;:") + "…"
+
+                    if summary and normalized_response and _summary_looks_like_response_excerpt(summary, normalized_response):
+                        logger.info("↩️ Replacing excerpt-like summary with user-focused fallback [req#%d]", req_for_gateway)
+                        summary = ""
+
+                    if should_summarize and not summary:
+                        summary = fallback_summary
+
+                    spoken_text = (response_text or "").strip()
+                    if summary:
+                        if response_text:
+                            raw_words = _count_spoken_words_for_tts(response_text)
+                            summary_words = _count_spoken_words_for_tts(summary)
+                            logger.info(
+                                "🗜️ Gateway response summary [req#%d]: raw=%d words -> summary=%d words",
+                                req_for_gateway,
+                                raw_words,
+                                summary_words,
+                            )
+                        if not config.gateway_tts_streaming_enabled or not spoken_text:
+                            spoken_text = summary
+                    elif not config.gateway_tts_streaming_enabled and response_text:
+                        logger.info(
+                            "↩️ Gateway TTS summary unavailable [req#%d]; speaking full response",
+                            req_for_gateway,
+                        )
+
+                    chat_text = summary or spoken_text or (response_error_text or "Request failed.")
+                    if response_error_text:
+                        chat_text = f"Error: {response_error_text}. {chat_text}".strip()
+
+                    if spoken_text:
+                        logger.info("→ TTS QUEUE [req#%d]: Enqueuing response: '%s'", req_for_gateway, spoken_text[:80])
                         # Update activity timestamp to keep system awake during TTS synthesis
                         last_activity_ts = time.monotonic()
-                        await submit_tts(response_text, request_id=current_request_id)
-                        if response_text:
-                            _safe_append_chat_message(
-                                {
-                                    "role": "assistant",
-                                    "text": response_text,
-                                    "source": "gateway",
-                                    "request_id": current_request_id,
-                                    "segment_kind": "final",
-                                },
-                                "gateway_assistant",
-                            )
-                        last_assistant_text = response_text
-                        last_assistant_source = "gateway"
-                        last_assistant_ts = time.monotonic()
-                        last_assistant_was_question = assistant_turn_is_question(response_text)
-                        last_assistant_expects_short_reply = assistant_turn_expects_short_reply(response_text)
-                        last_upstream_assistant_text = response_text
-                        last_upstream_assistant_ts = last_assistant_ts
-                        last_upstream_response_was_question = last_assistant_was_question
-                        last_upstream_response_requested_confirmation = last_assistant_expects_short_reply
+                        await submit_tts(spoken_text, request_id=req_for_gateway)
                     else:
-                        # Agent executed command without returning text (e.g., "play jazz")
-                        logger.info("← GATEWAY: No text response (agent executed action without speech response)")
-                        # Update activity timestamp but don't queue TTS
                         last_activity_ts = time.monotonic()
-                except Exception as exc:
-                    logger.warning("Gateway send failed (%s); continuing", exc)
+
+                    chat_message: dict[str, Any] = {
+                        "role": "assistant",
+                        "text": chat_text,
+                        "tts_text": spoken_text,
+                        "source": "gateway",
+                        "request_id": req_for_gateway,
+                        "segment_kind": "final",
+                    }
+                    if response_error_text:
+                        chat_message["error"] = response_error_text
+                    if normalized_response and chat_text.strip() != normalized_response:
+                        chat_message["full_text"] = response_text
+                    _safe_append_chat_message(
+                        chat_message,
+                        "gateway_assistant",
+                    )
+
+                    effective_assistant_text = response_text or chat_text
+                    last_assistant_text = effective_assistant_text
+                    last_assistant_source = "gateway"
+                    last_assistant_ts = time.monotonic()
+                    last_assistant_was_question = assistant_turn_is_question(effective_assistant_text)
+                    last_assistant_expects_short_reply = assistant_turn_expects_short_reply(effective_assistant_text)
+                    last_upstream_assistant_text = effective_assistant_text
+                    last_upstream_assistant_ts = last_assistant_ts
+                    last_upstream_response_was_question = last_assistant_was_question
+                    last_upstream_response_requested_confirmation = last_assistant_expects_short_reply
+                else:
+                    # Agent executed command without returning text (e.g., "play jazz")
+                    logger.info("← GATEWAY: No text response (agent executed action without speech response)")
+                    # Update activity timestamp but don't queue TTS
+                    last_activity_ts = time.monotonic()
+                _schedule_gateway_collation_close(
+                    req_for_gateway,
+                    reason="gateway_send_complete",
+                    # Keep this longer than gateway listener flush delay (5s).
+                    delay_s=6.5,
+                )
         finally:
             _push_schedule_state_now("request_complete")
             # Always clear processing flag
@@ -3208,9 +3883,9 @@ async def run_orchestrator() -> None:
         if not text:
             return ""
 
-        # Ignore descriptor-only transcripts such as "(knocking on door)" or
-        # "[door closes]" where no actual spoken words are present.
-        without_bracket_descriptors = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", text)
+        # Ignore descriptor-only transcripts such as "(knocking on door)",
+        # "[door closes]", or "*door slams*" where no actual spoken words are present.
+        without_bracket_descriptors = re.sub(r"[\(\[][^\)\]]*[\)\]]|\*[^*]+\*", " ", text)
         if not re.search(r"[a-zA-Z0-9]", without_bracket_descriptors):
             logger.info("⊘ Transcript filtered: bracketed sound descriptor only ('%s')", text[:120])
             return ""
@@ -3403,6 +4078,13 @@ async def run_orchestrator() -> None:
                 )
                 return
 
+            # Suppress standalone filler/acknowledgement transcriptions that are
+            # STT hallucinations or ambient sounds with no real spoken intent.
+            _FILLER_PHRASE_FILTER = {"thank you", "all right", "alright"}
+            if canonicalize_transcript_for_match(transcript) in _FILLER_PHRASE_FILTER:
+                logger.info("⊘ Transcript suppressed by phrase filter: '%s'", transcript[:80])
+                return
+
             now_ts = time.monotonic()
             canonical_transcript = canonicalize_transcript_for_match(transcript)
             if alarm_manager and alarm_manager.ringing_alarms:
@@ -3508,9 +4190,20 @@ async def run_orchestrator() -> None:
             if recorder_tool and recorder_capture_mode:
                 recorder_stop_armed = recorder_stop_hotword_armed_ts is not None
                 if recorder_stop_armed and recorder_tool.should_stop_from_transcript(transcript):
+                    dynamic_trim_seconds = compute_hotword_stop_trim_seconds(
+                        armed_ts=recorder_stop_hotword_armed_ts,
+                        stop_ts=now_ts,
+                        extra_trim_ms=int(config.recorder_stop_hotword_extra_trim_ms),
+                        max_trim_ms=int(config.recorder_stop_hotword_max_trim_ms),
+                    )
                     stop_result = await recorder_tool.stop_recording(
                         reason="voice stop phrase",
-                        trim_tail_seconds=1.6,
+                        trim_tail_seconds=dynamic_trim_seconds,
+                    )
+                    logger.info(
+                        "🎙️ Recorder stop trim applied from hotword arm: %.3fs (armed_age=%.3fs)",
+                        dynamic_trim_seconds,
+                        max(0.0, now_ts - float(recorder_stop_hotword_armed_ts or now_ts)),
                     )
                     recorder_stop_hotword_armed_ts = None
                     _append_recorder_finished_chat(stop_result)
@@ -3532,15 +4225,66 @@ async def run_orchestrator() -> None:
                 or re.search(r"\brecorder\s+on\b", canonical_transcript)
             )
             if start_recording_intent:
+                # Recorder start path runs before normal debounced chat routing, so mirror
+                # the user command immediately to chat here.
+                _safe_append_chat_message(
+                    {
+                        "role": "user",
+                        "text": transcript,
+                        "source": "voice",
+                        "request_id": current_request_id,
+                    },
+                    "voice_user_recorder_start",
+                )
                 if recorder_tool:
+                    # Confirm in chat + TTS before recording activation so the confirmation
+                    # is visible/spoken first when TTS is enabled.
+                    kickoff_text = "Recording started."
+                    _safe_append_chat_message(
+                        {
+                            "role": "assistant",
+                            "text": kickoff_text,
+                            "tts_text": kickoff_text,
+                            "source": "recorder_local",
+                            "request_id": current_request_id,
+                            "segment_kind": "final",
+                        },
+                        "recorder_start_assistant",
+                    )
+                    await submit_tts(kickoff_text, request_id=current_request_id, kind="notification")
+
                     start_result = await recorder_tool.start_recording()
-                    spoken = str(start_result.get("response", "")).strip()
-                    if spoken:
-                        await submit_tts(spoken, request_id=current_request_id, kind="notification")
+                    if not bool(start_result.get("success", False)):
+                        err_text = str(start_result.get("response", "Recording could not be started.")).strip()
+                        if err_text:
+                            _safe_append_chat_message(
+                                {
+                                    "role": "assistant",
+                                    "text": err_text,
+                                    "tts_text": err_text,
+                                    "source": "recorder_local",
+                                    "request_id": current_request_id,
+                                    "segment_kind": "final",
+                                },
+                                "recorder_start_error_assistant",
+                            )
+                            await submit_tts(err_text, request_id=current_request_id, kind="notification")
                     logger.info("🎙️ Recorder start phrase handled locally before gateway routing")
                 else:
+                    disabled_text = "Recording is not enabled on this device."
+                    _safe_append_chat_message(
+                        {
+                            "role": "assistant",
+                            "text": disabled_text,
+                            "tts_text": disabled_text,
+                            "source": "recorder_local",
+                            "request_id": current_request_id,
+                            "segment_kind": "final",
+                        },
+                        "recorder_start_disabled_assistant",
+                    )
                     await submit_tts(
-                        "Recording is not enabled on this device.",
+                        disabled_text,
                         request_id=current_request_id,
                         kind="notification",
                     )
@@ -3713,14 +4457,50 @@ async def run_orchestrator() -> None:
                 current_tts_duration_s = 0.0
 
     async def gateway_listener() -> None:
-        nonlocal current_request_id
+        nonlocal dropped_out_of_window_gateway_frames
         buffer = ""
         flush_task: asyncio.Task | None = None
-        first_chunk_word_threshold = max(0, config.gateway_tts_fast_start_words)
+        flush_delay_s = 5.0
+        tts_streaming_enabled = bool(config.gateway_tts_streaming_enabled)
+        first_chunk_word_threshold = max(0, config.gateway_tts_fast_start_words) if tts_streaming_enabled else 0
         active_buffer_request_id = 0
+        active_ui_stream_request_id = 0
+        ui_stream_text = ""
+        ui_stream_message_id = ""
         kickoff_sent_request_id = 0
         reconnect_delay_s = 1.0
         reconnect_delay_max_s = 8.0
+
+        logger.info(
+            "🔊 Gateway TTS mode: %s",
+            "streaming sentence chunks" if tts_streaming_enabled else "single final response with summarization",
+        )
+
+        def _push_ui_stream_chunk(request_id: int, chunk_text: str) -> None:
+            nonlocal active_ui_stream_request_id, ui_stream_text, ui_stream_message_id
+            if not web_service or request_id <= 0:
+                return
+            if not chunk_text:
+                return
+
+            if request_id != active_ui_stream_request_id:
+                active_ui_stream_request_id = request_id
+                ui_stream_text = ""
+                ui_stream_message_id = f"assistant-stream-{request_id}"
+
+            ui_stream_text += chunk_text
+            stream_msg = {
+                "id": ui_stream_message_id,
+                "role": "assistant",
+                "text": ui_stream_text,
+                "source": "gateway_stream",
+                "request_id": request_id,
+                "segment_kind": "stream",
+            }
+            if hasattr(web_service, "upsert_chat_message"):
+                web_service.upsert_chat_message(stream_msg)
+            else:
+                web_service.append_chat_message(stream_msg)
 
         def _payload_short_text(value: Any, limit: int = 280) -> str:
             if value is None:
@@ -3817,19 +4597,36 @@ async def run_orchestrator() -> None:
             }
             return tokens[-1] not in trailing_connectors
 
-        def split_first_n_words(text: str, n: int) -> tuple[str, str]:
-            """Split text into first n tokens and remainder, preserving punctuation in tokens."""
+        def split_first_n_words(text: str, n: int) -> tuple[str, str, bool]:
+            """Split text into first n tokens and remainder.
+
+            Returns (prefix, remainder, boundary_safe). boundary_safe is False when
+            the split lands at end-of-buffer on an alphanumeric character, which can
+            indicate a streamed partial word.
+            """
             if n <= 0:
-                return "", text
+                return "", text, False
             tokens = list(re.finditer(r"\S+", text))
             if len(tokens) < n:
-                return "", text
+                return "", text, False
             cutoff = tokens[n - 1].end()
-            return text[:cutoff].strip(), text[cutoff:].strip()
+            prefix = text[:cutoff].strip()
+            remainder_raw = text[cutoff:]
+            remainder = remainder_raw.strip()
+            if remainder:
+                return prefix, remainder, True
+            trailing = text[cutoff - 1] if cutoff > 0 else ""
+            boundary_safe = bool(trailing) and not trailing.isalnum()
+            return prefix, remainder, boundary_safe
 
-        async def flush_buffer() -> None:
+        async def flush_buffer(request_id: int) -> None:
             nonlocal buffer
             if not buffer.strip():
+                buffer = ""
+                return
+
+            if not _touch_gateway_collation_window(request_id):
+                logger.info("🧩 Dropped buffered gateway text outside active window [req#%d]", request_id)
                 buffer = ""
                 return
 
@@ -3838,6 +4635,14 @@ async def run_orchestrator() -> None:
                 buffer = ""
                 return
             
+            # During startup phase, only suppress welcome greetings, not all output
+            if startup_phase_active and buffer:
+                text_to_check = strip_gateway_control_markers(buffer).strip()
+                if is_startup_welcome_pattern(text_to_check):
+                    logger.info("🔇 Suppressed startup welcome pattern from buffer: '%s'...", text_to_check[:60])
+                    buffer = ""
+                    return
+            
             # Filter out NO_REPLY markers
             text_to_send = strip_gateway_control_markers(buffer).strip()
             if "NO_REPLY" in text_to_send or "NO_RE" in text_to_send or text_to_send in ["NO", "_RE", "NO _RE"]:
@@ -3845,15 +4650,8 @@ async def run_orchestrator() -> None:
                 buffer = ""
                 return
                 
-            await submit_tts(text_to_send, request_id=current_request_id)
-            if web_service:
-                web_service.append_chat_message({
-                    "role": "assistant",
-                    "text": text_to_send,
-                    "source": "gateway_stream",
-                    "request_id": current_request_id,
-                    "segment_kind": "stream",
-                })
+            if tts_streaming_enabled:
+                await submit_tts(text_to_send, request_id=request_id)
             buffer = ""
 
         while True:
@@ -3862,10 +4660,22 @@ async def run_orchestrator() -> None:
                     # If we receive any frame, connection is healthy again.
                     reconnect_delay_s = 1.0
 
-                    if current_request_id != active_buffer_request_id:
+                    request_id = _active_gateway_collation_request_id()
+                    if request_id <= 0:
+                        dropped_out_of_window_gateway_frames += 1
+                        if dropped_out_of_window_gateway_frames <= 3 or dropped_out_of_window_gateway_frames % 50 == 0:
+                            logger.info(
+                                "🧩 Dropping gateway frame outside active collation window (%d dropped)",
+                                dropped_out_of_window_gateway_frames,
+                            )
+                        continue
+
+                    _touch_gateway_collation_window(request_id)
+
+                    if request_id != active_buffer_request_id:
                         # New user request boundary: reset sentence buffer state.
                         buffer = ""
-                        active_buffer_request_id = current_request_id
+                        active_buffer_request_id = request_id
                         if flush_task and not flush_task.done():
                             flush_task.cancel()
 
@@ -3880,7 +4690,23 @@ async def run_orchestrator() -> None:
                     if payload_obj is not None and web_service:
                         if suppress_gateway_messages_for_new_session:
                             continue
-                        step_msg, interim_msg, consumed = _extract_structured_event(payload_obj, current_request_id)
+                        if startup_phase_active and isinstance(payload_obj, dict):
+                            # Check if payload contains assistant text that looks like a startup greeting
+                            payload_text = payload_obj.get("text") or payload_obj.get("content") or ""
+                            if payload_text and is_startup_welcome_pattern(payload_text):
+                                logger.info("🔇 Suppressed startup welcome pattern from gateway JSON [req#%d]: '%s'...", request_id, str(payload_text)[:60])
+                                continue
+                        # Fallback debug feed for providers that do not expose listen_raw().
+                        if not hasattr(gateway, "listen_raw"):
+                            web_service.append_chat_message(
+                                {
+                                    "role": "raw_gateway",
+                                    "text": json.dumps(payload_obj, ensure_ascii=False),
+                                    "request_id": request_id,
+                                    "source": "gateway_stream",
+                                }
+                            )
+                        step_msg, interim_msg, consumed = _extract_structured_event(payload_obj, request_id)
                         if step_msg:
                             web_service.append_chat_message(step_msg)
                         if interim_msg:
@@ -3895,6 +4721,17 @@ async def run_orchestrator() -> None:
                     if suppress_gateway_messages_for_new_session:
                         logger.info("🔇 Suppressed gateway text after new-session reset: '%s'", text[:80])
                         continue
+                    
+                    # During startup phase, suppress only welcome patterns
+                    if startup_phase_active and is_startup_welcome_pattern(text):
+                        logger.info("🔇 Suppressed startup welcome pattern: '%s'...", text[:80])
+                        continue
+
+                    # Debug: check if text starts with triple backticks
+                    if text.strip().startswith('```'):
+                        logger.debug("⚠️ Text starts with triple backticks: %s", text[:60])
+
+                    _push_ui_stream_chunk(request_id, text)
 
                     logger.info("🔤 Received: '%s'", text)
 
@@ -3936,27 +4773,19 @@ async def run_orchestrator() -> None:
                     logger.info("📝 Buffer: '%s'", buffer[:100])
 
                     # Fast-start policy: emit first chunk once threshold words are available for this request.
-                    if first_chunk_word_threshold > 0 and kickoff_sent_request_id != current_request_id:
-                        kickoff_text, remainder = split_first_n_words(buffer, first_chunk_word_threshold)
-                        if kickoff_text and should_emit_fast_start_chunk(kickoff_text):
+                    if tts_streaming_enabled and first_chunk_word_threshold > 0 and kickoff_sent_request_id != request_id:
+                        kickoff_text, remainder, boundary_safe = split_first_n_words(buffer, first_chunk_word_threshold)
+                        if kickoff_text and boundary_safe and should_emit_fast_start_chunk(kickoff_text):
                             buffer = remainder
-                            kickoff_sent_request_id = current_request_id
-                            logger.info("🚀 Fast-start chunk [req#%d]: '%s'", current_request_id, kickoff_text)
-                            await submit_tts(kickoff_text, request_id=current_request_id)
-                            if web_service:
-                                web_service.append_chat_message({
-                                    "role": "assistant",
-                                    "text": kickoff_text,
-                                    "source": "gateway_stream",
-                                    "request_id": current_request_id,
-                                    "segment_kind": "stream",
-                                })
+                            kickoff_sent_request_id = request_id
+                            logger.info("🚀 Fast-start chunk [req#%d]: '%s'", request_id, kickoff_text)
+                            await submit_tts(kickoff_text, request_id=request_id)
                             if flush_task and not flush_task.done():
                                 flush_task.cancel()
                             continue
 
                     match = re.search(r"(.+?[.!?])\s*$", buffer)
-                    if match:
+                    if tts_streaming_enabled and match:
                         raw_sentence = match.group(1)
                         sentence = strip_gateway_control_markers(raw_sentence).strip()
                         buffer = buffer[len(raw_sentence):].strip()
@@ -3969,23 +4798,17 @@ async def run_orchestrator() -> None:
                             continue
                         
                         logger.info("✅ Complete sentence: '%s'", sentence)
-                        await submit_tts(sentence, request_id=current_request_id)
-                        if web_service:
-                            web_service.append_chat_message({
-                                "role": "assistant",
-                                "text": sentence,
-                                "source": "gateway_stream",
-                                "request_id": current_request_id,
-                                "segment_kind": "stream",
-                            })
+                        await submit_tts(sentence, request_id=request_id)
                         if flush_task and not flush_task.done():
                             flush_task.cancel()
                         continue
 
                     if flush_task and not flush_task.done():
                         flush_task.cancel()
-                    flush_task = asyncio.create_task(asyncio.sleep(5))
-                    flush_task.add_done_callback(lambda task: asyncio.create_task(flush_buffer()) if not task.cancelled() else None)
+                    flush_task = asyncio.create_task(asyncio.sleep(flush_delay_s))
+                    flush_task.add_done_callback(
+                        lambda task, req_id=request_id: asyncio.create_task(flush_buffer(req_id)) if not task.cancelled() else None
+                    )
 
                 # Stream ended cleanly (e.g., websocket dropped) — reconnect.
                 logger.warning("Gateway listen stream ended; reconnecting in %.1fs", reconnect_delay_s)
@@ -3999,8 +4822,57 @@ async def run_orchestrator() -> None:
             await asyncio.sleep(reconnect_delay_s)
             reconnect_delay_s = min(reconnect_delay_max_s, reconnect_delay_s * 2.0)
 
+    async def gateway_raw_listener() -> None:
+        reconnect_delay_s = 1.0
+        reconnect_delay_max_s = 8.0
+
+        def _should_emit_raw_debug_frame(raw_message: str) -> bool:
+            """Only surface agent event frames in the raw debug bubble."""
+            txt = str(raw_message or "").strip()
+            if not txt:
+                return False
+            try:
+                payload = json.loads(txt)
+            except Exception:
+                return False
+            if not isinstance(payload, dict):
+                return False
+            if str(payload.get("type") or "").strip().lower() != "event":
+                return False
+            return str(payload.get("event") or "").strip().lower() == "agent"
+
+        while True:
+            try:
+                async for raw_message in gateway.listen_raw():
+                    reconnect_delay_s = 1.0
+                    if not web_service:
+                        continue
+                    request_id = _active_gateway_collation_request_id()
+                    if request_id <= 0:
+                        continue
+                    _touch_gateway_collation_window(request_id)
+                    if suppress_gateway_messages_for_new_session:
+                        continue
+                    if not _should_emit_raw_debug_frame(raw_message):
+                        continue
+
+                    web_service.append_chat_message(
+                        {
+                            "role": "raw_gateway",
+                            "text": str(raw_message),
+                            "request_id": request_id,
+                            "source": "gateway_stream",
+                        }
+                    )
+            except (ConnectionRefusedError, OSError) as exc:
+                logger.warning("Gateway raw listener unavailable (%s); retrying in %.1fs", exc, reconnect_delay_s)
+            except Exception as exc:
+                logger.error("Gateway raw listener error: %s (retrying in %.1fs)", exc, reconnect_delay_s)
+
+            await asyncio.sleep(reconnect_delay_s)
+            reconnect_delay_s = min(reconnect_delay_max_s, reconnect_delay_s * 2.0)
+
     async def gateway_steps_listener() -> None:
-        nonlocal current_request_id
         reconnect_delay_s = 1.0
         reconnect_delay_max_s = 8.0
         while True:
@@ -4009,8 +4881,23 @@ async def run_orchestrator() -> None:
                     reconnect_delay_s = 1.0
                     if not isinstance(step, dict) or not web_service:
                         continue
+                    request_id = _active_gateway_collation_request_id()
+                    if request_id <= 0:
+                        continue
+                    _touch_gateway_collation_window(request_id)
                     if suppress_gateway_messages_for_new_session:
                         continue
+
+                    # Step events are always available when the Thinking tool timeline is visible.
+                    # Emit a raw debug frame from each step so Debug JSON appears consistently.
+                    web_service.append_chat_message(
+                        {
+                            "role": "raw_gateway",
+                            "text": json.dumps(step, ensure_ascii=False),
+                            "request_id": request_id,
+                            "source": "gateway_steps",
+                        }
+                    )
 
                     name = str(step.get("name") or "event").strip() or "event"
                     phase = str(step.get("phase") or "update").strip() or "update"
@@ -4024,7 +4911,7 @@ async def run_orchestrator() -> None:
                                 "role": "interim",
                                 "text": name,
                                 "phase": phase,
-                                "request_id": current_request_id,
+                                "request_id": request_id,
                                 "details": details_text,
                                 "source": "gateway_stream",
                             }
@@ -4036,7 +4923,7 @@ async def run_orchestrator() -> None:
                                 "text": name,
                                 "name": name,
                                 "phase": phase,
-                                "request_id": current_request_id,
+                                "request_id": request_id,
                                 "tool_call_id": tool_call_id,
                                 "details": details_text,
                                 "source": "gateway_stream",
@@ -4083,6 +4970,8 @@ async def run_orchestrator() -> None:
     # Start gateway listener if supported
     if getattr(gateway, "supports_listen", False):
         asyncio.create_task(gateway_listener())
+        if hasattr(gateway, "listen_raw"):
+            asyncio.create_task(gateway_raw_listener())
         if hasattr(gateway, "listen_steps"):
             asyncio.create_task(gateway_steps_listener())
     
@@ -4105,7 +4994,7 @@ async def run_orchestrator() -> None:
                     pass
                 else:
                     for ring_index in range(3):
-                        await asyncio.to_thread(playback.play_pcm, bell_pcm_16k, 1.0, threading.Event())
+                        await asyncio.to_thread(playback.play_pcm, bell_pcm_16k, 1.0, alarm_playback_stop_event)
                         if ring_index < 2:
                             await asyncio.sleep(0.2)
             except Exception as e:
@@ -5567,7 +6456,31 @@ async def run_orchestrator() -> None:
         if tool_monitor:
             logger.info("Stopping tool monitor...")
             await tool_monitor.stop()
-        # Native backend runs in-process; no external music daemon cleanup required.
+
+        # Explicitly stop music playback on orchestrator shutdown so any active
+        # native player process does not continue after this process exits.
+        shutdown_music_manager = locals().get("music_manager")
+        if shutdown_music_manager:
+            try:
+                logger.info("Stopping music playback for orchestrator shutdown...")
+                await asyncio.wait_for(shutdown_music_manager.stop(), timeout=3.0)
+            except Exception as exc:
+                logger.warning("Failed to stop music playback during shutdown: %s", exc)
+
+        # Close native music pools to release backend resources cleanly.
+        shutdown_music_pool = locals().get("music_pool")
+        if shutdown_music_pool:
+            try:
+                await asyncio.wait_for(shutdown_music_pool.close(), timeout=2.0)
+            except Exception as exc:
+                logger.debug("Failed to close music pool during shutdown: %s", exc)
+        shutdown_music_control_pool = locals().get("music_control_pool")
+        if shutdown_music_control_pool:
+            try:
+                await asyncio.wait_for(shutdown_music_control_pool.close(), timeout=2.0)
+            except Exception as exc:
+                logger.debug("Failed to close control music pool during shutdown: %s", exc)
+
         capture.stop()
 
 

@@ -21,6 +21,14 @@ class FastPathParser:
         # "timer for 30 seconds"
         (r'timer\s+for\s+(\d+)\s*(min|minute|sec|second|hour)s?', 'set_timer'),
     ]
+
+    # Relative alarm setting patterns
+    ALARM_SET_PATTERNS = [
+        # "set an alarm for 10 seconds", "set alarm in 2 hours"
+        (r'set\s+(?:an?\s+)?alarm\s+(?:for|in)\s+(\d+)\s*(min|minute|sec|second|hour)s?', 'set_alarm_relative'),
+        # "alarm for 30 seconds"
+        (r'alarm\s+(?:for|in)\s+(\d+)\s*(min|minute|sec|second|hour)s?', 'set_alarm_relative'),
+    ]
     
     # Timer query patterns
     TIMER_QUERY_PATTERNS = [
@@ -65,6 +73,7 @@ class FastPathParser:
     def __init__(self):
         self.compiled_patterns = []
         for pattern, action in (self.TIMER_PATTERNS +
+                       self.ALARM_SET_PATTERNS +
                                self.TIMER_QUERY_PATTERNS +
                                self.TIMER_CANCEL_PATTERNS +
                                self.ALARM_STOP_PATTERNS):
@@ -104,6 +113,22 @@ class FastPathParser:
             return ('set_timer', {
                 'duration_seconds': duration_seconds,
                 'label': label
+            })
+
+        elif action == 'set_alarm_relative':
+            amount = int(match.group(1))
+            unit_raw = match.group(2).lower()
+            if unit_raw.startswith('sec'):
+                unit = 'second'
+            elif unit_raw.startswith('hour'):
+                unit = 'hour'
+            else:
+                unit = 'minute'
+
+            trigger_time = f"in {amount} {unit}{'s' if amount != 1 else ''}"
+            return ('set_alarm', {
+                'trigger_time': trigger_time,
+                'label': '',
             })
         
         elif action == 'list_timers':

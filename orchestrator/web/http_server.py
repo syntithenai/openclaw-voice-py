@@ -369,6 +369,10 @@ def start_http_servers(service: Any, ssl_context: ssl.SSLContext | None) -> None
                     preview_path = manager.resolve_preview_path(self._query_path(query, "/"))
                     self._send_file(preview_path)
                     return True
+                if path == "/api/file-manager/search":
+                    q = str((query.get("q") or [""])[0] or "")
+                    self._send_json(manager.search_files(q))
+                    return True
                 self._send_json({"error": "Not found"}, status=404)
                 return True
             except FileManagerError as exc:
@@ -523,6 +527,39 @@ def start_http_servers(service: Any, ssl_context: ssl.SSLContext | None) -> None
                 return
 
             if self._handle_file_manager_put(path, query, body):
+                return
+
+            self._send_json({"error": "Not found"}, status=404)
+
+
+        def _handle_file_manager_patch(self, path: str, query: dict[str, list[str]], body: bytes) -> bool:
+            if path not in {"/api/file-manager/file", "/api/file-manager/folder"}:
+                return False
+            try:
+                manager = self._require_file_manager()
+                payload = json.loads(body.decode("utf-8") or "{}")
+                new_name = str(payload.get("newName", ""))
+                target_path = self._query_path(query, "/")
+                self._send_json(manager.rename_entry(target_path, new_name))
+                return True
+            except json.JSONDecodeError:
+                self._send_json({"error": "invalid request body"}, status=400)
+                return True
+            except FileManagerError as exc:
+                self._send_json({"error": exc.message}, status=exc.status)
+                return True
+
+        def do_PATCH(self) -> None:  # noqa: N802
+            path = self._parse_request_path()
+            query = self._parse_query_params()
+            content_length = int(self.headers.get("Content-Length", 0) or 0)
+            body = self.rfile.read(content_length) if content_length > 0 else b""
+
+            if service.should_protect_http_path(path) and not self._is_authenticated():
+                self._send(b"Authentication required", status=401, content_type="text/plain")
+                return
+
+            if self._handle_file_manager_patch(path, query, body):
                 return
 
             self._send_json({"error": "Not found"}, status=404)

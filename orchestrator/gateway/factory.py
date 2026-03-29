@@ -23,6 +23,7 @@ def build_gateway(config: VoiceConfig) -> BaseGateway:
             agent_id=config.gateway_agent_id or "assistant",
             session_prefix=config.gateway_session_prefix,
             timeout_s=timeout_s,
+            agent_response_timeout_s=max(timeout_s, int(config.gateway_agent_response_timeout_ms / 1000)),
         )
     if provider in {"generic", "fake", "http", "test"}:
         return GenericGateway(
@@ -82,4 +83,5 @@ def build_gateway(config: VoiceConfig) -> BaseGateway:
         agent_id=config.gateway_agent_id or "assistant",
         session_prefix=config.gateway_session_prefix,
         timeout_s=timeout_s,
+        agent_response_timeout_s=max(timeout_s, int(config.gateway_agent_response_timeout_ms / 1000)),
     )

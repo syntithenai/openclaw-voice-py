@@ -28,6 +28,7 @@ except ImportError:
     _JWT_AVAILABLE = False
 from orchestrator.observability.latency_trace import emit as emit_latency_trace
 from orchestrator.observability.latency_trace import scoped_action
+from orchestrator.web.file_manager_service import WorkspaceFileManager
 from orchestrator.web.http_server import start_http_servers
 
 logger = logging.getLogger("orchestrator.web.realtime")
@@ -68,6 +69,11 @@ class EmbeddedVoiceWebService:
         auth_session_cookie_name: str = "openclaw_ui_session",
         auth_session_ttl_hours: int = 24,
         auth_cookie_secure: bool = True,
+        file_manager_enabled: bool = True,
+        file_manager_root: str = "",
+        file_manager_excluded_folders: str = "recordings,playlists,timers,.media,.openclaw",
+        file_manager_top_level_config_files: str = "SOUL.md,BOOTSTRAP.md,TOOLS.md,HEARTBEAT.md,IDENTITY.md,USER.md,AGENTS.md",
+        file_manager_max_editable_bytes: int = 2_000_000,
     ):
         self.host = host
         self.ui_port = ui_port
@@ -99,6 +105,21 @@ class EmbeddedVoiceWebService:
         self.media_files_root = str(media_root.resolve())
         self.media_files_allow_listing = bool(media_files_allow_listing)
 
+        fm_root = (
+            Path(file_manager_root).expanduser()
+            if file_manager_root
+            else Path(openclaw_workspace_root).expanduser() if openclaw_workspace_root else workspace_root
+        )
+        self.file_manager_enabled = bool(file_manager_enabled)
+        excluded = [x.strip() for x in file_manager_excluded_folders.split(',') if x.strip()]
+        top_cfg = [x.strip() for x in file_manager_top_level_config_files.split(',') if x.strip()]
+        self.file_manager = WorkspaceFileManager(
+            root=str(fm_root.resolve()),
+            excluded_folders=excluded,
+            excluded_top_level_config_files=top_cfg,
+            max_editable_bytes=file_manager_max_editable_bytes,
+        ) if self.file_manager_enabled else None
+
         self._http_server: HTTPServer | None = None
         self._http_thread: threading.Thread | None = None
         self._http_redirect_server: HTTPServer | None = None
@@ -109,6 +130,7 @@ class EmbeddedVoiceWebService:
 
         self._clients: set[Any] = set()
         self._active_client: Any | None = None
+        self._browser_audio_owner: Any | None = None
         self._latest_browser_audio: dict[str, float] = {"rms": 0.0, "peak": 0.0}
         self._browser_pcm_frames: deque[bytes] = deque(maxlen=400)
         self._last_browser_pcm_ts: float | None = None
@@ -708,6 +730,7 @@ class EmbeddedVoiceWebService:
                 {
                     "type": "chat_reset",
                     "active_chat_id": self._active_chat_id,
+                    "active_chat_thread_id": self._active_chat_thread_id,
                     "chat": [],
                     "chat_threads": list(self._chat_threads),
                 }
@@ -730,6 +753,58 @@ class EmbeddedVoiceWebService:
                 {
                     "type": "chat_threads_update",
                     "active_chat_id": self._active_chat_id,
+                    "active_chat_thread_id": self._active_chat_thread_id,
+                    "chat_threads": list(self._chat_threads),
+                }
+            )
+        )
+        return True
+
+    def clear_chat_threads(self) -> bool:
+        if not self._chat_threads:
+            return False
+        active_tid = str(self._active_chat_thread_id or "").strip()
+        if active_tid:
+            self._chat_threads = [
+                t for t in self._chat_threads if str(t.get("id", "")).strip() == active_tid
+            ]
+        else:
+            self._chat_threads = []
+        self._persist_chat_state()
+        asyncio.create_task(
+            self.broadcast(
+                {
+                    "type": "chat_threads_update",
+                    "active_chat_id": self._active_chat_id,
+                    "active_chat_thread_id": self._active_chat_thread_id,
+                    "chat_threads": list(self._chat_threads),
+                }
+            )
+        )
+        return True
+
+    def select_chat_thread(self, thread_id: str) -> bool:
+        tid = str(thread_id or "").strip()
+        if not tid or tid == "active":
+            return False
+        selected = next((t for t in self._chat_threads if str(t.get("id", "")).strip() == tid), None)
+        if not selected:
+            return False
+        messages = selected.get("messages")
+        if isinstance(messages, list):
+            self._chat_messages = list(messages[-self.chat_history_limit:])
+        else:
+            self._chat_messages = []
+        self._active_chat_id = "active"
+        self._active_chat_thread_id = tid
+        self._persist_chat_state()
+        asyncio.create_task(
+            self.broadcast(
+                {
+                    "type": "chat_reset",
+                    "active_chat_id": self._active_chat_id,
+                    "active_chat_thread_id": self._active_chat_thread_id,
+                    "chat": list(self._chat_messages),
                     "chat_threads": list(self._chat_threads),
                 }
             )
@@ -741,6 +816,21 @@ class EmbeddedVoiceWebService:
         msg = dict(message)
         msg.setdefault("id", self._chat_seq)
         msg.setdefault("ts", time.time())
+        # raw_gateway messages are ephemeral debug frames - broadcast live but do not
+        # store in the persisted history, so they cannot evict actual conversation messages.
+        if msg.get("role") == "raw_gateway":
+            asyncio.create_task(
+                self.broadcast(
+                    {
+                        "type": "chat_append",
+                        "message": msg,
+                        "chat_threads": list(self._chat_threads),
+                        "active_chat_id": self._active_chat_id,
+                        "active_chat_thread_id": self._active_chat_thread_id,
+                    }
+                )
+            )
+            return
         self._chat_messages.append(msg)
         if len(self._chat_messages) > self.chat_history_limit:
             self._chat_messages = self._chat_messages[-self.chat_history_limit:]
@@ -753,6 +843,42 @@ class EmbeddedVoiceWebService:
                     "message": msg,
                     "chat_threads": list(self._chat_threads),
                     "active_chat_id": self._active_chat_id,
+                    "active_chat_thread_id": self._active_chat_thread_id,
+                }
+            )
+        )
+
+    def upsert_chat_message(self, message: dict[str, Any]) -> None:
+        """Insert or update a chat message by id, broadcasting append/update accordingly."""
+        msg = dict(message)
+        msg_id = msg.get("id")
+        if msg_id is None:
+            self._chat_seq += 1
+            msg_id = self._chat_seq
+            msg["id"] = msg_id
+        msg.setdefault("ts", time.time())
+
+        idx = next((i for i, m in enumerate(self._chat_messages) if str(m.get("id")) == str(msg_id)), -1)
+        is_update = idx >= 0
+        if is_update:
+            self._chat_messages[idx] = msg
+        else:
+            self._chat_messages.append(msg)
+
+        if len(self._chat_messages) > self.chat_history_limit:
+            self._chat_messages = self._chat_messages[-self.chat_history_limit:]
+
+        self._upsert_active_chat_thread()
+        self._persist_chat_state()
+
+        asyncio.create_task(
+            self.broadcast(
+                {
+                    "type": "chat_update" if is_update else "chat_append",
+                    "message": msg,
+                    "chat_threads": list(self._chat_threads),
+                    "active_chat_id": self._active_chat_id,
+                    "active_chat_thread_id": self._active_chat_thread_id,
                 }
             )
         )
@@ -805,6 +931,7 @@ class EmbeddedVoiceWebService:
                             "message": updated_msg,
                             "chat_threads": list(self._chat_threads),
                             "active_chat_id": self._active_chat_id,
+                            "active_chat_thread_id": self._active_chat_thread_id,
                         }
                     )
                 )
@@ -957,7 +1084,8 @@ class EmbeddedVoiceWebService:
         return self._active_client is not None and self._active_client in self._clients
 
     def has_recent_browser_audio(self, max_age_s: float = 1.0) -> bool:
-        if not self.has_active_client():
+        if self._browser_audio_owner is None or self._browser_audio_owner not in self._clients:
+            self._browser_audio_owner = None
             return False
         if self._last_browser_pcm_ts is None:
             return False
@@ -977,6 +1105,16 @@ class EmbeddedVoiceWebService:
 
     def latest_browser_audio(self) -> dict[str, float]:
         return dict(self._latest_browser_audio)
+
+    def _accept_browser_audio_from(self, websocket: Any | None) -> bool:
+        if websocket is None or websocket not in self._clients:
+            return False
+        if self._browser_audio_owner is websocket:
+            return True
+        if self._browser_audio_owner is None or self._browser_audio_owner not in self._clients:
+            self._browser_audio_owner = websocket
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Action handler registration
@@ -1167,14 +1305,19 @@ class EmbeddedVoiceWebService:
                 if isinstance(message, str):
                     asyncio.create_task(self._handle_text_action(message, client_id, websocket))
                 elif isinstance(message, (bytes, bytearray)):
-                    self._handle_pcm_chunk(bytes(message))
+                    self._handle_pcm_chunk(bytes(message), websocket)
         except Exception as exc:
             logger.debug("Web UI client %s disconnected: %s", client_id, exc)
         finally:
             self._clients.discard(websocket)
             if self._active_client is websocket:
                 self._active_client = next(iter(self._clients), None)
-            self._browser_pcm_frames.clear()
+            if self._browser_audio_owner is websocket:
+                self._browser_audio_owner = None
+                self._browser_pcm_frames.clear()
+                self._last_browser_pcm_ts = None
+                self._latest_browser_audio["rms"] = 0.0
+                self._latest_browser_audio["peak"] = 0.0
             logger.info("Web UI client disconnected (%s); clients=%d", client_id, len(self._clients))
 
     # ------------------------------------------------------------------
@@ -1195,6 +1338,8 @@ class EmbeddedVoiceWebService:
             logger.info("Web UI music action received (%s) from %s", msg_type, client_id)
 
         if msg_type == "browser_audio_level":
+            if not self._accept_browser_audio_from(websocket):
+                return
             try:
                 self._latest_browser_audio["rms"] = float(payload.get("rms", 0.0))
                 self._latest_browser_audio["peak"] = float(payload.get("peak", 0.0))
@@ -1937,9 +2082,21 @@ class EmbeddedVoiceWebService:
                 self.delete_chat_thread(thread_id)
             return
 
+        if msg_type == "chat_select":
+            thread_id = str(payload.get("thread_id", "")).strip()
+            if thread_id:
+                self.select_chat_thread(thread_id)
+            return
+
+        if msg_type == "chat_clear_all":
+            self.clear_chat_threads()
+            return
+
         logger.debug("Web UI: unhandled action '%s' from %s", msg_type, client_id)
 
-    def _handle_pcm_chunk(self, pcm_bytes: bytes) -> None:
+    def _handle_pcm_chunk(self, pcm_bytes: bytes, websocket: Any | None = None) -> None:
+        if not self._accept_browser_audio_from(websocket):
+            return
         if len(pcm_bytes) < 2:
             return
         sample_count = len(pcm_bytes) // 2
@@ -2038,9 +2195,10 @@ class EmbeddedVoiceWebService:
             "recordings_rev": self._recordings_rev,
             "timers": list(self._timers_state),
             "timers_rev": self._timers_rev,
-            "chat": list(self._chat_messages[-50:]),
+            "chat": list(self._chat_messages[-self.chat_history_limit:]),
             "chat_threads": list(self._chat_threads),
             "active_chat_id": self._active_chat_id,
+            "active_chat_thread_id": self._active_chat_thread_id,
         }
 
     # ------------------------------------------------------------------

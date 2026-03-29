@@ -42,6 +42,22 @@
         deleteTargetPath: '',
         deleteTargetName: '',
         deleteBusy: false,
+        renameModalOpen: false,
+        renameTargetType: '',
+        renameTargetPath: '',
+        renameTargetName: '',
+        renameName: '',
+        renameBusy: false,
+        filterText: '',
+        filterResults: null,
+        filterTimer: null,
+        treeScrollTop: 0,
+        filePickerModalOpen: false,
+        filePickerType: '',
+        filePickerTitle: '',
+        filePickerCurrentPath: '/',
+        filePickerExpandedPaths: { '/': true },
+        filePickerTree: {},
       };
     }
     return S.fileManager;
@@ -227,6 +243,98 @@
     }).join('');
   }
 
+  function highlightTokens(text, tokens) {
+    if (!tokens.length) return fmEsc(text);
+    const escaped = fmEsc(text);
+    let result = escaped;
+    for (const token of tokens) {
+      const regex = new RegExp('(' + token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
+      result = result.replace(regex, '<mark>$1</mark>');
+    }
+    return result;
+  }
+
+  function renderFilterResults() {
+    const st = fmState();
+    if (st.filterResults === null) {
+      return '<div class="px-3 py-3 text-sm text-gray-400">Searching...</div>';
+    }
+    const results = Array.isArray(st.filterResults) ? st.filterResults : [];
+    if (!results.length) {
+      return '<div class="px-3 py-3 text-sm text-gray-400">No results found.</div>';
+    }
+    const tokens = String(st.filterText || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
+    return results.map((item) => {
+      const p = String(item.path || '');
+      const kind = String(item.kind || 'file');
+      const isFolder = kind === 'folder' || kind === 'virtual-folder';
+      const active = isFolder ? st.selectedFolderPath === p : st.selectedFilePath === p;
+      const icon = isFolder ? 'DIR' : 'FILE';
+      const action = isFolder ? 'fm-select-folder' : 'fm-select-file';
+      return ''
+        + '<div class="fm-file-row ' + (active ? 'active' : '') + '" data-action="' + action + '" data-path="' + fmEsc(p) + '">'
+        + '<div class="text-xs text-gray-500">' + icon + '</div>'
+        + '<div class="min-w-0">'
+        + '<div class="text-sm truncate">' + fmEsc(item.name) + '</div>'
+        + '<div class="text-xs text-gray-500 truncate">' + highlightTokens(p, tokens) + '</div>'
+        + '</div>'
+        + '</div>';
+    }).join('');
+  }
+
+  function renderPreservingFilter() {
+    const fi = document.getElementById('fmFilterInput');
+    const focused = fi && document.activeElement === fi;
+    const selStart = fi ? fi.selectionStart : null;
+    const selEnd = fi ? fi.selectionEnd : null;
+    renderFileManagerPage(fmMain());
+    if (focused) {
+      const fi2 = document.getElementById('fmFilterInput');
+      if (fi2) {
+        fi2.focus();
+        if (selStart !== null) fi2.setSelectionRange(selStart, selEnd);
+      }
+    }
+  }
+
+  async function runFilter(text) {
+    const st = fmState();
+    const q = String(text || '').trim();
+    if (!q || st.filterText !== text) return;
+    try {
+      const data = await fmFetchJson(FM_API + '/search?q=' + encodeURIComponent(q));
+      if (st.filterText === text) {
+        st.filterResults = Array.isArray(data.results) ? data.results : [];
+        renderPreservingFilter();
+      }
+    } catch (err) {
+      if (st.filterText === text) {
+        st.filterResults = [];
+        st.error = String(err && err.message ? err.message : err);
+        renderPreservingFilter();
+      }
+    }
+  }
+
+  function queueFilter(text) {
+    const st = fmState();
+    if (st.filterTimer) {
+      clearTimeout(st.filterTimer);
+      st.filterTimer = null;
+    }
+    if (!String(text || '').trim()) {
+      st.filterResults = null;
+      renderPreservingFilter();
+      return;
+    }
+    st.filterResults = null;
+    renderPreservingFilter();
+    st.filterTimer = setTimeout(() => {
+      st.filterTimer = null;
+      void runFilter(text);
+    }, FM_DEBOUNCE_MS);
+  }
+
   function currentFolderName() {
     const st = fmState();
     const path = String(st.selectedFolderPath || '/');
@@ -286,7 +394,7 @@
     }
 
     return ''
-      + '<div class="p-3 space-y-2">'
+      + '<div class="fm-text-body">'
       + readOnly
       + '<textarea id="fmTextEditor" class="fm-textarea">' + fmEsc(file.content || '') + '</textarea>'
       + '</div>';
@@ -305,6 +413,27 @@
     st.activePlainEditorPath = '';
     st.activeMarkdownEditorPath = '';
     st.activeJsonEditorPath = '';
+  }
+
+  function hasLiveMarkdownEditor(path) {
+    const st = fmState();
+    if (!st.markdownEditor || st.activeMarkdownEditorPath !== path) {
+      return false;
+    }
+    const codemirror = st.markdownEditor.codemirror;
+    if (!codemirror || typeof codemirror.getWrapperElement !== 'function') {
+      return false;
+    }
+    const wrapper = codemirror.getWrapperElement();
+    return !!(wrapper && wrapper.isConnected);
+  }
+
+  function hasLiveJsonEditor(path, mount) {
+    const st = fmState();
+    if (!st.jsonEditor || st.activeJsonEditorPath !== path) {
+      return false;
+    }
+    return !!(mount && mount.isConnected && mount.childElementCount > 0);
   }
 
   async function mountEditors() {
@@ -330,7 +459,12 @@
 
     if (category === 'markdown') {
       const textarea = document.getElementById('fmMarkdownEditor');
-      if (!textarea || st.activeMarkdownEditorPath === file.path) return;
+      if (!textarea) return;
+      if (hasLiveMarkdownEditor(file.path)) return;
+      if (st.markdownEditor && typeof st.markdownEditor.toTextArea === 'function') {
+        st.markdownEditor.toTextArea();
+        st.markdownEditor = null;
+      }
       if (typeof EasyMDE !== 'function') {
         st.error = 'EasyMDE is not loaded';
         renderFileManagerPage(fmMain());
@@ -343,6 +477,23 @@
         spellChecker: false,
         forceSync: true,
         status: false,
+        toolbar: [
+          'bold', 'italic', 'heading', '|',
+          'quote', 'unordered-list', 'ordered-list', '|',
+          {
+            name: 'insertImage',
+            action: function() { openFilePicker('image'); },
+            className: 'fa fa-picture-o',
+            title: 'Insert Image',
+          },
+          {
+            name: 'insertLink',
+            action: function() { openFilePicker('link'); },
+            className: 'fa fa-link',
+            title: 'Insert Link',
+          },
+          '|', 'preview', 'side-by-side', 'fullscreen', '|', 'guide'
+        ],
       });
       st.markdownEditor.value(String(file.content || ''));
       st.markdownEditor.codemirror.on('change', () => {
@@ -354,7 +505,12 @@
 
     if (category === 'json') {
       const mount = document.getElementById('fmJsonEditor');
-      if (!mount || st.activeJsonEditorPath === file.path) return;
+      if (!mount) return;
+      if (hasLiveJsonEditor(file.path, mount)) return;
+      if (st.jsonEditor && typeof st.jsonEditor.destroy === 'function') {
+        st.jsonEditor.destroy();
+        st.jsonEditor = null;
+      }
 
       st.activeJsonEditorPath = file.path;
       let createJSONEditor = null;
@@ -418,6 +574,9 @@
     st.selectedFolderPath = path;
     st.selectedFilePath = '';
     st.currentFile = null;
+    st.filterText = '';
+    st.filterResults = null;
+    if (st.filterTimer) { clearTimeout(st.filterTimer); st.filterTimer = null; }
     destroyEditors();
     renderFileManagerPage(fmMain());
     try {
@@ -552,28 +711,252 @@
     }
   }
 
+
+  function openRenameModal(type, path, currentName) {
+    const st = fmState();
+    st.renameModalOpen = true;
+    st.renameTargetType = String(type || '');
+    st.renameTargetPath = String(path || '');
+    st.renameTargetName = String(currentName || '');
+    st.renameName = String(currentName || '');
+    st.renameBusy = false;
+    renderFileManagerPage(fmMain());
+    setTimeout(() => {
+      const inp = document.getElementById('fmRenameName');
+      if (inp) { inp.focus(); inp.select(); }
+    }, 0);
+  }
+
+  function closeRenameModal() {
+    const st = fmState();
+    st.renameModalOpen = false;
+    st.renameTargetType = '';
+    st.renameTargetPath = '';
+    st.renameTargetName = '';
+    st.renameName = '';
+    st.renameBusy = false;
+    renderFileManagerPage(fmMain());
+  }
+
+  async function confirmRename() {
+    const st = fmState();
+    if (st.renameBusy) return;
+    const targetPath = String(st.renameTargetPath || '');
+    const targetType = String(st.renameTargetType || '');
+    const newName = String(st.renameName || '').trim();
+    if (!newName || !targetPath) { closeRenameModal(); return; }
+
+    st.renameBusy = true;
+    st.error = '';
+    renderFileManagerPage(fmMain());
+
+    const endpoint = targetType === 'file' ? '/file' : '/folder';
+    try {
+      const result = await fmFetchJson(FM_API + endpoint + '?path=' + encodeURIComponent(targetPath), {
+        method: 'PATCH',
+        body: JSON.stringify({ newName }),
+      });
+      const newEntry = result && result.entry;
+      const newPath = newEntry ? String(newEntry.path || '') : '';
+      st.renameModalOpen = false;
+      st.renameTargetType = '';
+      st.renameTargetPath = '';
+      st.renameTargetName = '';
+      st.renameName = '';
+      st.renameBusy = false;
+      st.treeByPath = {};
+      await loadTree('/');
+      if (targetType === 'file') {
+        if (st.selectedFilePath === targetPath) {
+          st.selectedFilePath = '';
+          st.currentFile = null;
+          destroyEditors();
+        }
+        await selectFolder(st.selectedFolderPath || '/');
+      } else {
+        await selectFolder(newPath || parentPath(targetPath));
+      }
+    } catch (err) {
+      st.renameBusy = false;
+      st.error = String(err && err.message ? err.message : err);
+      st.renameModalOpen = false;
+      renderFileManagerPage(fmMain());
+    }
+  }
+
   function saveBadgeHtml() {
     return '<span id="fmSaveBadge" class="hidden px-2 py-1 rounded text-xs bg-gray-700"></span>';
   }
+
+  function renderFilePickerTree(path, depth, isRoot) {
+    const st = fmState();
+    const nodes = st.filePickerTree[path] || [];
+    if (!nodes.length && isRoot) {
+      return '';
+    }
+    return nodes.map((node) => {
+      const nodePath = String(node.path || '');
+      const isFolder = String(node.kind || '') === 'folder' || String(node.kind || '') === 'virtual-folder';
+      const isExpanded = !!st.filePickerExpandedPaths[nodePath];
+      const isCurrent = st.filePickerCurrentPath === nodePath;
+      const left = 10 + (depth * 14);
+
+      const branch = isFolder
+        ? '<button type="button" class="text-xs text-gray-300" data-action="fp-toggle-folder" data-path="' + fmEsc(nodePath) + '">' + (isExpanded ? '-' : '+') + '</button>'
+        : '<span class="text-xs text-gray-500">.</span>';
+
+      const selectAction = isFolder ? 'fp-enter-folder' : 'fp-select-file';
+      const row = ''
+        + '<div class="fm-tree-row ' + (isCurrent ? 'active' : '') + '" style="margin-left:' + left + 'px" data-action="' + selectAction + '" data-path="' + fmEsc(nodePath) + '">'
+        + branch
+        + '<span class="text-sm">' + fmEsc(node.name) + '</span>'
+        + '</div>';
+
+      if (isFolder && isExpanded) {
+        return row + renderFilePickerTree(nodePath, depth + 1, false);
+      }
+      return row;
+    }).join('');
+  }
+
+  function renderFilePickerChildren() {
+    const st = fmState();
+    const items = Array.isArray(st.filePickerChildren) ? st.filePickerChildren : [];
+    if (!items.length) {
+      return '<div class="px-3 py-3 text-sm text-gray-400">Folder is empty</div>';
+    }
+    return items.map((item) => {
+      const p = String(item.path || '');
+      const kind = String(item.kind || 'file');
+      const icon = kind === 'folder' || kind === 'virtual-folder' ? 'DIR' : 'FILE';
+      const selectAction = kind === 'folder' || kind === 'virtual-folder' ? 'fp-enter-folder' : 'fp-select-file';
+      const style = st.filePickerType === 'image'
+        ? (kind === 'folder' || kind === 'virtual-folder' ? '' : (isImageFile(p) ? '' : ' opacity-50'))
+        : '';
+      const disabled = st.filePickerType === 'image' && !(kind === 'folder' || kind === 'virtual-folder') && !isImageFile(p) ? ' data-disabled="true"' : '';
+      return ''
+        + '<div class="fm-file-row' + style + '" data-action="' + selectAction + '" data-path="' + fmEsc(p) + '"' + disabled + '>'
+        + '<div class="text-xs text-gray-500">' + icon + '</div>'
+        + '<div class="text-sm truncate">' + fmEsc(item.name) + '</div>'
+        + '</div>';
+    }).join('');
+  }
+
+  function isImageFile(path) {
+    const p = String(path || '').toLowerCase();
+    return /\.(png|jpg|jpeg|gif|webp|svg)$/i.test(p);
+  }
+
+  function openFilePicker(type) {
+    const st = fmState();
+    st.filePickerModalOpen = true;
+    st.filePickerType = type;
+    st.filePickerTitle = type === 'image' ? 'Select an Image' : 'Select a File';
+    st.filePickerCurrentPath = '/';
+    st.filePickerExpandedPaths = { '/': true };
+    st.filePickerTree = {};
+    delete st.filePickerChildren;
+    renderFileManagerPage(fmMain());
+    void loadFilePickerTree('/').then(() => loadFilePickerFolder('/')).then(() => {
+      renderFileManagerPage(fmMain());
+    });
+  }
+
+  function closeFilePicker() {
+    const st = fmState();
+    st.filePickerModalOpen = false;
+    st.filePickerType = '';
+    st.filePickerTitle = '';
+    delete st.filePickerChildren;
+    renderFileManagerPage(fmMain());
+  }
+
+  function insertFilePickerResult(filePath) {
+    const st = fmState();
+    const editor = st.markdownEditor;
+    if (!editor) return;
+
+    const path = String(filePath || '');
+    const fileName = path.split('/').pop() || 'file';
+
+    let markdownSyntax = '';
+    if (st.filePickerType === 'image') {
+      markdownSyntax = '![' + fileName + '](' + path + ')';
+    } else {
+      markdownSyntax = '[link](' + path + ')';
+    }
+
+    const cm = editor.codemirror;
+    const doc = cm.getDoc();
+    const selections = doc.listSelections();
+
+    if (selections && selections.length > 0) {
+      const selection = selections[0];
+      doc.replaceRange(markdownSyntax, selection.anchor, selection.head);
+    } else {
+      const lastLine = doc.lastLine();
+      const lastChar = doc.getLine(lastLine).length;
+      doc.replaceRange(markdownSyntax, { line: lastLine, ch: lastChar });
+    }
+
+    editor.codemirror.focus();
+  }
+
+
+  async function loadFilePickerTree(path) {
+    const st = fmState();
+    const url = FM_API + '/tree?path=' + encodeURIComponent(path);
+    try {
+      const data = await fmFetchJson(url, {});
+      if (Array.isArray(data)) {
+        st.filePickerTree[path] = data;
+      }
+    } catch (err) {
+      console.error('Failed to load file picker tree:', err);
+    }
+  }
+
+  async function loadFilePickerFolder(path) {
+    const st = fmState();
+    st.filePickerCurrentPath = path;
+    const url = FM_API + '/children?path=' + encodeURIComponent(path) + '&recursive=false';
+    try {
+      const data = await fmFetchJson(url, {});
+      if (Array.isArray(data)) {
+        st.filePickerChildren = data;
+      }
+    } catch (err) {
+      console.error('Failed to load file picker folder:', err);
+    }
+  }
+
 
   window.renderFileManagerPage = function renderFileManagerPage(main) {
     const st = fmState();
     if (!main) return;
     main.dataset.page = 'files';
 
+    // Save tree scroll position before re-rendering
+    const treePanel = main.querySelector('.fm-scroll');
+    if (treePanel) {
+      st.treeScrollTop = treePanel.scrollTop;
+    }
+
     const treeRows = renderTreeRows('/', 0);
     const showingFile = !!st.currentFile;
+    const filterActive = !showingFile && String(st.filterText || '').trim().length > 0;
     const folderItems = Array.isArray(st.folderChildren) ? st.folderChildren : [];
-    const folderIsEmpty = !showingFile && folderItems.length === 0;
+    const folderIsEmpty = !showingFile && !filterActive && folderItems.length === 0;
     const selectedFolderPath = String(st.selectedFolderPath || '/');
     const canDeleteEmptyFolder = folderIsEmpty && selectedFolderPath !== '/' && !isVirtualPath(selectedFolderPath);
-    const mainPanelBody = showingFile ? renderEditorPane() : renderFolderRows();
+    const mainPanelBody = showingFile ? renderEditorPane() : (filterActive ? renderFilterResults() : renderFolderRows());
     const mainPanelTitle = showingFile
       ? fmEsc(st.currentFile ? st.currentFile.name : 'Editor / Preview')
       : fmEsc(currentFolderName());
     const mainPanelActions = showingFile
-      ? '<div class="flex items-center gap-2"><button type="button" class="px-2 py-1 text-xs rounded bg-red-800 hover:bg-red-700" data-action="fm-open-delete-file">Delete</button><button type="button" class="px-2 py-1 text-xs rounded bg-gray-700 hover:bg-gray-600" data-action="fm-close-file">Back to folder</button>' + saveBadgeHtml() + '</div>'
+      ? '<div class="flex items-center gap-2"><button type="button" class="px-2 py-1 text-xs rounded bg-gray-700 hover:bg-gray-600" data-action="fm-open-rename-file">Rename</button><button type="button" class="px-2 py-1 text-xs rounded bg-red-800 hover:bg-red-700" data-action="fm-open-delete-file">Delete</button><button type="button" class="px-2 py-1 text-xs rounded bg-gray-700 hover:bg-gray-600" data-action="fm-close-file">Back to folder</button>' + saveBadgeHtml() + '</div>'
       : ('<div class="flex items-center gap-2">'
+        + (selectedFolderPath !== '/' && !isVirtualPath(selectedFolderPath) ? '<button type="button" class="px-2 py-1 text-xs rounded bg-gray-700 hover:bg-gray-600" data-action="fm-open-rename-folder">Rename</button>' : '')
         + (canDeleteEmptyFolder ? '<button type="button" class="px-2 py-1 text-xs rounded bg-red-800 hover:bg-red-700" data-action="fm-open-delete-folder">Delete Folder</button>' : '')
         + '<button type="button" class="px-2 py-1 text-xs rounded bg-blue-700 hover:bg-blue-600" data-action="fm-open-create-folder">Create Folder</button>'
         + '</div>');
@@ -608,6 +991,50 @@
         + '</div>';
     }
 
+    if (!st.deleteModalOpen && !st.createFolderModalOpen && st.renameModalOpen) {
+      const typeLabel = st.renameTargetType === 'folder' ? 'folder' : 'file';
+      const confirmLabel = st.renameBusy ? 'Renaming...' : 'Rename';
+      const disabledAttr = st.renameBusy ? ' disabled' : '';
+      modal = ''
+        + '<div class="fm-modal-backdrop">'
+        + '<div class="fm-modal space-y-3">'
+        + '<div class="text-sm font-semibold">Rename ' + typeLabel + '</div>'
+        + '<input id="fmRenameName" type="text" value="' + fmEsc(st.renameName || '') + '" class="w-full rounded bg-gray-800 border border-gray-700 px-3 py-2 text-sm" placeholder="New name" />'
+        + (st.error ? '<div class="text-xs text-red-300">' + fmEsc(st.error) + '</div>' : '')
+        + '<div class="flex justify-end gap-2">'
+        + '<button type="button" class="px-3 py-1.5 rounded bg-gray-700" data-action="fm-rename-cancel"' + disabledAttr + '>Cancel</button>'
+        + '<button id="fmRenameConfirm" type="button" class="px-3 py-1.5 rounded bg-blue-700 hover:bg-blue-600" data-action="fm-rename-confirm"' + disabledAttr + '>' + confirmLabel + '</button>'
+        + '</div>'
+        + '</div>'
+        + '</div>';
+    }
+
+    if (!st.deleteModalOpen && !st.createFolderModalOpen && !st.renameModalOpen && st.filePickerModalOpen) {
+      const fpTreeRows = renderFilePickerTree('/', 0, true);
+      const fpChildRows = renderFilePickerChildren();
+      const fpCurrentPath = String(st.filePickerCurrentPath || '/');
+      modal = ''
+        + '<div class="fm-modal-backdrop">'
+        + '<div class="fm-modal space-y-3">'
+        + '<div class="text-sm font-semibold">' + fmEsc(st.filePickerTitle) + '</div>'
+        + '<div style="display: flex; gap: 8px; max-height: 400px; min-height: 300px; border: 1px solid #374151; border-radius: 6px; overflow: hidden; background-color: #1f2937;">'
+        + '<div style="flex: 0 0 200px; border-right: 1px solid #374151; overflow-y: auto;">'
+        + '<div style="padding: 8px;">' + fpTreeRows + '</div>'
+        + '</div>'
+        + '<div style="flex: 1; overflow-y: auto;">'
+        + '<div style="padding: 8px;">'
+        + (fpCurrentPath && fpCurrentPath !== '/' ? '<div class="fm-file-row" data-action="fp-enter-folder" data-path="' + fmEsc(parentPath(fpCurrentPath)) + '"><div class="text-xs text-gray-500">..</div><div class="text-sm truncate">Parent</div></div>' : '')
+        + fpChildRows
+        + '</div>'
+        + '</div>'
+        + '</div>'
+        + '<div class="flex justify-end gap-2">'
+        + '<button type="button" class="px-3 py-1.5 rounded bg-gray-700" data-action="fp-cancel">Cancel</button>'
+        + '</div>'
+        + '</div>'
+        + '</div>';
+    }
+
     if (st.loading) {
       main.innerHTML = '<div class="px-4 py-4 text-sm text-gray-400">Loading file manager...</div>';
       return;
@@ -625,6 +1052,7 @@
       + '<div class="text-sm font-semibold truncate">' + mainPanelTitle + '</div>'
       + mainPanelActions
       + '</div>'
+      + (!showingFile ? '<div class="px-3 py-2 border-b border-gray-700"><input type="search" id="fmFilterInput" value="' + fmEsc(st.filterText || '') + '" class="w-full rounded bg-gray-800 border border-gray-700 px-3 py-1.5 text-sm" placeholder="Search all files and folders..." /></div>' : '')
       + '<div class="fm-scroll">' + mainPanelBody + '</div>'
       + '</section>'
       + '</div>'
@@ -640,6 +1068,12 @@
         if (input) input.focus();
       }, 0);
     }
+    if (st.renameModalOpen) {
+      setTimeout(() => {
+        const inp = document.getElementById('fmRenameName');
+        if (inp) { inp.focus(); inp.select(); }
+      }, 0);
+    }
     if (st.deleteModalOpen) {
       setTimeout(() => {
         const btn = document.getElementById('fmDeleteConfirm');
@@ -648,6 +1082,11 @@
     }
 
     setTimeout(() => {
+      // Restore tree scroll position after DOM update
+      const treePanel = main.querySelector('.fm-scroll');
+      if (treePanel && st.treeScrollTop > 0) {
+        treePanel.scrollTop = st.treeScrollTop;
+      }
       void mountEditors();
     }, 0);
   };
@@ -748,6 +1187,81 @@
       return true;
     }
 
+    const openRenameFile = target.closest('[data-action="fm-open-rename-file"]');
+    if (openRenameFile) {
+      event.preventDefault();
+      if (st.currentFile && st.currentFile.path) {
+        openRenameModal('file', st.currentFile.path, st.currentFile.name || st.currentFile.path);
+      }
+      return true;
+    }
+
+    const openRenameFolder = target.closest('[data-action="fm-open-rename-folder"]');
+    if (openRenameFolder) {
+      event.preventDefault();
+      const path = String(st.selectedFolderPath || '/');
+      if (path !== '/' && !isVirtualPath(path)) {
+        openRenameModal('folder', path, currentFolderName());
+      }
+      return true;
+    }
+
+    const cancelRename = target.closest('[data-action="fm-rename-cancel"]');
+    if (cancelRename) {
+      event.preventDefault();
+      if (!st.renameBusy) closeRenameModal();
+      return true;
+    }
+
+    const confirmRenameBtn = target.closest('[data-action="fm-rename-confirm"]');
+    if (confirmRenameBtn) {
+      event.preventDefault();
+      if (!st.renameBusy) void confirmRename();
+      return true;
+    }
+
+    const fpToggleFolder = target.closest('[data-action="fp-toggle-folder"]');
+    if (fpToggleFolder) {
+      event.preventDefault();
+      event.stopPropagation();
+      const path = String(fpToggleFolder.dataset.path || '/');
+      if (st.filePickerExpandedPaths[path]) {
+        delete st.filePickerExpandedPaths[path];
+      } else {
+        st.filePickerExpandedPaths[path] = true;
+        void loadFilePickerTree(path).then(() => renderFileManagerPage(fmMain()));
+      }
+      renderFileManagerPage(fmMain());
+      return true;
+    }
+
+    const fpEnterFolder = target.closest('[data-action="fp-enter-folder"]');
+    if (fpEnterFolder) {
+      event.preventDefault();
+      const path = String(fpEnterFolder.dataset.path || '/');
+      void loadFilePickerFolder(path).then(() => renderFileManagerPage(fmMain()));
+      return true;
+    }
+
+    const fpSelectFile = target.closest('[data-action="fp-select-file"]');
+    if (fpSelectFile) {
+      event.preventDefault();
+      if (fpSelectFile.dataset.disabled === 'true') {
+        return true;
+      }
+      const path = String(fpSelectFile.dataset.path || '');
+      insertFilePickerResult(path);
+      closeFilePicker();
+      return true;
+    }
+
+    const fpCancel = target.closest('[data-action="fp-cancel"]');
+    if (fpCancel) {
+      event.preventDefault();
+      closeFilePicker();
+      return true;
+    }
+
     return false;
   };
 
@@ -756,6 +1270,15 @@
     if (!target) return false;
     if (target.id === 'fmCreateFolderName') {
       st.createFolderName = String(target.value || '');
+      return true;
+    }
+    if (target.id === 'fmRenameName') {
+      st.renameName = String(target.value || '');
+      return true;
+    }
+    if (target.id === 'fmFilterInput') {
+      st.filterText = String(target.value || '');
+      queueFilter(st.filterText);
       return true;
     }
     return false;
@@ -768,6 +1291,15 @@
     if (t.id === 'fmCreateFolderName' && event.key === 'Enter') {
       event.preventDefault();
       void createFolder();
+      return true;
+    }
+    if (t.id === 'fmRenameName' && event.key === 'Enter') {
+      event.preventDefault();
+      if (!st.renameBusy) void confirmRename();
+      return true;
+    }
+    if (event.key === 'Escape' && st.renameModalOpen) {
+      if (!st.renameBusy) closeRenameModal();
       return true;
     }
     if (st.deleteModalOpen && event.key === 'Enter' && !st.deleteBusy) {
@@ -791,6 +1323,12 @@
 
   window.ensureFileManagerReady = function ensureFileManagerReady() {
     void ensureInitialized(false);
+  };
+
+  window.fmOpenFile = function fmOpenFile(path) {
+    if (!path) return;
+    navigate('files');
+    setTimeout(() => { void selectFile(path); }, 0);
   };
 
   window.handleFileManagerFsChanged = function handleFileManagerFsChanged(msg) {

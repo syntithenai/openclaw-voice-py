@@ -139,6 +139,20 @@ class ToolRouterLlmArgsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(result, "fast-path should have matched 'Cancel the timer.'")
         self.assertEqual(result.get("data", {}).get("cancelled_count"), 1)
 
+    async def test_fast_path_set_timer_relative_duration(self) -> None:
+        """'Set a timer for 10 seconds' should execute locally via deterministic parser."""
+        result = await self.router.try_deterministic_parse("Set a timer for 10 seconds.")
+        self.assertIsNotNone(result, "fast-path should have matched timer set")
+        self.assertTrue(result.get("success"), result)
+        self.assertIn("set for 10 seconds", result.get("response", "").lower())
+
+    async def test_fast_path_set_alarm_relative_duration(self) -> None:
+        """'Set an alarm for 10 seconds' should execute locally via deterministic parser."""
+        result = await self.router.try_deterministic_parse("Set an alarm for 10 seconds.")
+        self.assertIsNotNone(result, "fast-path should have matched alarm set")
+        self.assertTrue(result.get("success"), result)
+        self.assertIn("set for", result.get("response", "").lower())
+
 
 if __name__ == "__main__":
     unittest.main()

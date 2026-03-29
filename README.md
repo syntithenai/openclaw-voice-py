@@ -379,8 +379,10 @@ GATEWAY_HTTP_ENDPOINT=/api/short
 GATEWAY_WS_URL=ws://localhost:8000/ws
 
 # Gateway behavior
-GATEWAY_TIMEOUT_MS=30000                 # Request timeout
+GATEWAY_TIMEOUT_MS=30000                 # WebSocket/connect timeout
+GATEWAY_AGENT_RESPONSE_TIMEOUT_MS=1800000 # Long-running agent completion wait (30 min)
 GATEWAY_DEBOUNCE_MS=2000                 # Debounce rapid follow-ups
+GATEWAY_TTS_STREAMING_ENABLED=false      # true = sentence-chunk TTS stream, false = summarize final gateway reply
 GATEWAY_TTS_FAST_START_WORDS=5           # Start TTS after N words
 ```
 

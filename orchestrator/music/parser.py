@@ -29,11 +29,18 @@ class MusicFastPathParser:
     STOP_PATTERNS = [
         r"^(?:stop)$",
         r"^(?:stop)\s+(?:music|song|track|playing|playback|the music)$",
+        r"^stop\s+transcript(?:ion)?$",
     ]
     
     NEXT_PATTERNS = [
         r"^(?:next|skip)(?:\s+(?:song|track))?$",
         r"^(?:skip|next)\s+(?:song|track|this)$",
+        r"^(?:skip|next)\s+(?:this\s+)?(?:song|track)$",
+        r"^(?:next|skip)\s+one$",
+        r"^play\s+next$",
+        r"^play\s+(?:the\s+)?next(?:\s+(?:song|track))?$",
+        r"^go\s+(?:to\s+)?next(?:\s+(?:song|track))?$",
+        r"^go\s+next$",
     ]
     
     PREVIOUS_PATTERNS = [
@@ -180,6 +187,15 @@ class MusicFastPathParser:
             if trimmed == normalized:
                 break
             normalized = trimmed
+
+        # Drop common trailing failure chatter appended after a valid command,
+        # e.g. "stop playing. didn't work".
+        normalized = re.sub(
+            r"(?:[\s,.;:!?-]+(?:it\s+|that\s+|still\s+|it\s+still\s+|that\s+still\s+)?)?did(?:\s+not|n't)\s+work(?:[\s,.;:!?-].*)?$",
+            "",
+            normalized,
+            flags=re.IGNORECASE,
+        ).strip()
 
         # Trim polite/filler words and end punctuation to improve regex hit rate.
         normalized = re.sub(r"^(?:please\s+)", "", normalized)

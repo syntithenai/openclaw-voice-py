@@ -4,10 +4,60 @@ document.addEventListener('click', e=>{
     if(!target || !target.closest('#micControlWrap')) closeMicControlMenu();
 });
 document.addEventListener('keydown', e=>{ if(e.key==='Escape'){ closeMenu(); closeMicControlMenu(); } });
-document.querySelectorAll('[data-nav]').forEach(el=>el.addEventListener('click',e=>{ e.preventDefault(); navigate(el.dataset.nav); }));
+document.querySelectorAll('[data-nav]').forEach(el=>el.addEventListener('click',e=>{
+    e.preventDefault();
+    const nav = String(el.dataset.nav || '').trim();
+    if(nav === 'music'){
+        S.musicAddMode = false;
+        S.musicAddSearchPending = false;
+        S.musicAddPendingQuery = '';
+    }
+    if(nav && nav === S.page){
+        if(nav === 'music') renderMusicPage(document.getElementById('main'));
+        closeMenu();
+        updateNavActiveState();
+        return;
+    }
+    navigate(nav);
+}));
 document.addEventListener('click', e => {
     const target = (e.target && typeof e.target.closest==='function') ? e.target : (e.target && e.target.parentElement ? e.target.parentElement : null);
     if(!target) return;
+
+    if (S.page === 'files' && typeof handleFileManagerClick === 'function') {
+        if (handleFileManagerClick(target, e)) {
+            return;
+        }
+    }
+
+    const openInFilesBtn = target.closest('[data-action="open-in-files"]');
+    if (openInFilesBtn) {
+        const fp = String(openInFilesBtn.dataset.filePath || '').trim();
+        if (fp && typeof window.fmOpenFile === 'function') {
+            window.fmOpenFile(fp);
+        }
+        return;
+    }
+
+    const gatewayDebugCopyBtn = target.closest('[data-action="gateway-debug-copy"]');
+    if (gatewayDebugCopyBtn) {
+        e.preventDefault();
+        e.stopPropagation();
+        const details = gatewayDebugCopyBtn.closest('details');
+        const pre = details ? (details.querySelector('[data-debug-pre]') || details.querySelector('pre')) : null;
+        const text = String(pre && pre.textContent || '').trim();
+        if(!text) return;
+        navigator.clipboard.writeText(text).then(()=>{
+            const prev = gatewayDebugCopyBtn.textContent;
+            gatewayDebugCopyBtn.textContent = 'Copied!';
+            setTimeout(()=>{ gatewayDebugCopyBtn.textContent = prev; }, 1200);
+        }).catch(()=>{
+            const prev = gatewayDebugCopyBtn.textContent;
+            gatewayDebugCopyBtn.textContent = 'Failed';
+            setTimeout(()=>{ gatewayDebugCopyBtn.textContent = prev; }, 1200);
+        });
+        return;
+    }
 
     const authLoginBtn = target.closest('[data-action="auth-login"]');
     if (authLoginBtn) {
@@ -49,11 +99,26 @@ document.addEventListener('click', e => {
         return;
     }
 
+    const clearAllOpenBtn = target.closest('[data-action="chat-clear-all-open"]');
+    if (clearAllOpenBtn) {
+        if(!Array.isArray(S.chatThreads) || !S.chatThreads.length) return;
+        S.chatClearAllModalOpen = true;
+        renderPage();
+        return;
+    }
+
     const deleteThreadCancelBtn = target.closest('[data-action="chat-delete-cancel"]');
     if (deleteThreadCancelBtn) {
         S.chatDeleteModalOpen = false;
         S.chatDeleteTargetId = '';
         S.chatDeleteTargetTitle = '';
+        renderPage();
+        return;
+    }
+
+    const clearAllCancelBtn = target.closest('[data-action="chat-clear-all-cancel"]');
+    if (clearAllCancelBtn) {
+        S.chatClearAllModalOpen = false;
         renderPage();
         return;
     }
@@ -70,6 +135,17 @@ document.addEventListener('click', e => {
         S.chatDeleteModalOpen = false;
         S.chatDeleteTargetId = '';
         S.chatDeleteTargetTitle = '';
+        renderPage();
+        return;
+    }
+
+    const clearAllConfirmBtn = target.closest('[data-action="chat-clear-all-confirm"]');
+    if (clearAllConfirmBtn) {
+        S.chatThreads = [];
+        S.selectedChatId = 'active';
+        S.chatClearAllModalOpen = false;
+        persistChatCache();
+        sendAction({type:'chat_clear_all'});
         renderPage();
         return;
     }
@@ -531,6 +607,9 @@ document.addEventListener('submit', e => {
 document.addEventListener('keydown', e => {
     const t = e.target;
     if(!t) return;
+    if (S.page === 'files' && typeof handleFileManagerKeydown === 'function') {
+        if (handleFileManagerKeydown(e)) return;
+    }
     if(t.id==='musicAddSearch'){
         if(e.key!=='Enter') return;
         e.preventDefault();
@@ -687,10 +766,16 @@ function handleTextInputChange(t){
 }
 
 document.addEventListener('input', e => {
+    if (S.page === 'files' && typeof handleFileManagerInput === 'function') {
+        if (handleFileManagerInput(e.target)) return;
+    }
     handleTextInputChange(e.target);
 });
 
 document.addEventListener('search', e => {
+    if (S.page === 'files' && typeof handleFileManagerInput === 'function') {
+        if (handleFileManagerInput(e.target)) return;
+    }
     handleTextInputChange(e.target);
 });
 
@@ -770,6 +855,17 @@ function applyMusicHeader(){
     btn.classList.toggle('cursor-not-allowed', pendingCount>0);
     btn.textContent=pendingCount>0?'…':(m.state==='play'?'⏹':'▶');
     btn.title=pendingCount>0?'Processing…':(m.state==='play'?'Stop':'Play');
+
+    // Keep the queue page transport button in sync without forcing a full music page re-render.
+    const queueBtn=document.querySelector('[data-action="music-toggle"]');
+    if(queueBtn){
+        const queueDisabled=pendingCount>0;
+        queueBtn.disabled=queueDisabled;
+        queueBtn.style.opacity=queueDisabled?'0.5':'';
+        queueBtn.style.cursor=queueDisabled?'not-allowed':'';
+        queueBtn.textContent=queueDisabled?'… Pending':(m.state==='play'?'⏹ Stop':'▶ Play');
+    }
+
     applyTopMusicProgress();
 }
 
@@ -851,6 +947,13 @@ function renderPage(){
         if(!Array.isArray(S.recordings) || S.recordings.length===0){
             sendAction({type:'recordings_list'});
         }
+    } else if (S.page==='files') {
+        if (typeof renderFileManagerPage === 'function') {
+            renderFileManagerPage(main);
+        }
+        if (typeof ensureFileManagerReady === 'function') {
+            ensureFileManagerReady();
+        }
     } else {
         renderHomePage(main);
     }
@@ -866,6 +969,7 @@ function renderHomePage(main){
     const sidebarToggleText = S.chatSidebarOpen ? '&lt;&lt;' : '&gt;&gt;';
     const sidebarToggleTitle = S.chatSidebarOpen ? 'Hide chats' : 'Show chats';
     const selected = S.selectedChatId || 'active';
+    const hasChatThreads = Array.isArray(S.chatThreads) && S.chatThreads.length > 0;
 
     main.dataset.page='home';
     const chatDeleteModal = S.chatDeleteModalOpen
@@ -880,11 +984,27 @@ function renderHomePage(main){
             +'</div>'
         +'</div>'
         : '';
+    const chatClearAllModal = S.chatClearAllModalOpen
+        ? '<div class="fixed inset-0 z-20 bg-black/60 flex items-center justify-center px-4">'
+            +'<div class="w-full max-w-md rounded-xl border border-gray-700 bg-gray-900 p-4 space-y-3">'
+                +'<div class="text-sm font-semibold">Clear all chat histories</div>'
+                +'<p class="text-sm text-gray-300">Do you really want to clear all previous chat histories?</p>'
+                +'<p class="text-xs text-gray-400">Your current chat stays open.</p>'
+                +'<div class="flex justify-end gap-2">'
+                    +'<button data-action="chat-clear-all-cancel" class="px-3 py-1.5 rounded-lg text-sm bg-gray-700 hover:bg-gray-600 transition-colors">Cancel</button>'
+                    +'<button data-action="chat-clear-all-confirm" class="px-3 py-1.5 rounded-lg text-sm bg-red-700 hover:bg-red-600 transition-colors">Clear</button>'
+                +'</div>'
+            +'</div>'
+        +'</div>'
+        : '';
 
     main.innerHTML='<div class="w-full h-full flex min-h-0">'
         +'<aside id="chatSidebar" class="'+sidebarClass+' transition-all duration-200 overflow-hidden">'
             +'<div class="'+sidebarInnerClass+' h-full flex flex-col">'
-                +'<div class="px-0 py-3 text-xs uppercase tracking-wide text-gray-400 border-b border-gray-800">Previous chats</div>'
+                +'<div class="px-2 py-3 flex items-center gap-2 border-b border-gray-800">'
+                    +'<div class="text-xs uppercase tracking-wide text-gray-400">Previous chats</div>'
+                    +'<button data-action="chat-clear-all-open"'+(hasChatThreads?'':' disabled')+' class="ml-auto px-2.5 py-1 rounded-md text-[11px] font-medium uppercase tracking-wide transition-colors '+(hasChatThreads?'text-gray-300 bg-gray-800 hover:bg-red-700 hover:text-white':'text-gray-500 bg-gray-900 cursor-not-allowed')+'">Clear</button>'
+                +'</div>'
                 +'<div class="px-2 py-2 border-b border-gray-800">'
                     +'<input id="chatThreadSearch" type="search" value="'+esc(S.chatThreadFilter||'')+'" placeholder="Search chats" class="w-full rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
                 +'</div>'
@@ -901,7 +1021,8 @@ function renderHomePage(main){
             +'<div id="chatArea" class="flex-1 overflow-y-auto px-4 py-4 space-y-3 min-h-0"></div>'
         +'</div>'
     +'</div>'
-    +chatDeleteModal;
+    +chatDeleteModal
+    +chatClearAllModal;
 
     renderThreadList(selected);
     renderChatMessages(selected);
@@ -979,35 +1100,363 @@ function renderChatMessages(selectedId){
     updateScrollDownButton();
     updateScrollUpButton();
 }
+
+const ASSISTANT_STREAM_PATCH_MIN_INTERVAL_MS=120;
+let assistantStreamPatchTimerId=0;
+let assistantStreamPatchSelectedId='active';
+let assistantStreamPatchLastRunTs=0;
+let assistantStreamPatchPendingMessage=null;
+
+const CHAT_RENDER_MIN_INTERVAL_MS=140;
+let chatRenderTimerId=0;
+let chatRenderPendingSelectedId='active';
+let chatRenderLastRunTs=0;
+
+function scheduleChatMessagesRender(selectedId){
+    chatRenderPendingSelectedId=selectedId||'active';
+    if(chatRenderTimerId) return;
+    const now=Date.now();
+    const delay=Math.max(0, CHAT_RENDER_MIN_INTERVAL_MS-(now-chatRenderLastRunTs));
+    chatRenderTimerId=setTimeout(()=>{
+        chatRenderTimerId=0;
+        chatRenderLastRunTs=Date.now();
+        renderChatMessages(chatRenderPendingSelectedId);
+    }, delay);
+}
+
+function isAssistantStreamBubbleActive(){
+    const area=document.getElementById('chatArea');
+    if(!area) return false;
+    const streams=area.querySelectorAll('.chat-msg[data-role="assistant_stream_group"] details');
+    for(const details of streams){
+        if(details && details.open) return true;
+    }
+    return false;
+}
+
+function removeAssistantStreamRows(area, requestId){
+    if(!area) return;
+    const reqId=String(requestId||'');
+    if(!reqId) return;
+    const streamRows=area.querySelectorAll('.chat-msg[data-role="assistant_stream_group"][data-request-id="'+cssEsc(reqId)+'"]');
+    streamRows.forEach((row)=>row.remove());
+}
+
+function upsertActiveChatBubbleInPlace(message, mode){
+    const area=document.getElementById('chatArea');
+    if(!area) return false;
+    const msg=message && typeof message==='object' ? message : null;
+    if(!msg) return false;
+    const msgId=(msg.id!==undefined && msg.id!==null) ? String(msg.id) : '';
+    const role=String(msg.role||'').toLowerCase();
+    if(!role) return false;
+
+    const prevScrollTop=area.scrollTop;
+    const prevScrollHeight=area.scrollHeight;
+    const nearBottom=(prevScrollHeight-area.clientHeight-prevScrollTop)<=80;
+
+    if(mode==='update' && msgId){
+        const existing=area.querySelector('.chat-msg[data-msg-id="'+cssEsc(msgId)+'"]');
+        if(existing){
+            existing.replaceWith(mkBubble(msg));
+            if(role==='assistant') removeAssistantStreamRows(area, msg.request_id);
+            if((S.chatFollowLatest && nearBottom) || Date.now()<Number(S.autoScrollUntilTs||0)) scrollChat();
+            else area.scrollTop=prevScrollTop;
+            updateScrollDownButton();
+            updateScrollUpButton();
+            return true;
+        }
+    }
+
+    if(mode==='append'){
+        if(msgId){
+            const existing=area.querySelector('.chat-msg[data-msg-id="'+cssEsc(msgId)+'"]');
+            if(existing){
+                existing.replaceWith(mkBubble(msg));
+            }else{
+                area.appendChild(mkBubble(msg));
+            }
+        }else{
+            area.appendChild(mkBubble(msg));
+        }
+
+        // Final assistant message replaces the transient stream row in the incremental path.
+        if(role==='assistant'){
+            removeAssistantStreamRows(area, msg.request_id);
+        }
+
+        if((S.chatFollowLatest && nearBottom) || Date.now()<Number(S.autoScrollUntilTs||0)) scrollChat();
+        else area.scrollTop=prevScrollTop;
+        updateScrollDownButton();
+        updateScrollUpButton();
+        return true;
+    }
+
+    return false;
+}
+
+function cssEsc(value){
+    const raw=String(value||'');
+    if(typeof CSS!=='undefined' && CSS && typeof CSS.escape==='function') return CSS.escape(raw);
+    return raw.replace(/([\\"'\[\]#.:>+~*=()\s])/g, '\\$1');
+}
+
+function scheduleAssistantStreamBubbleUpdate(selectedId, streamMessage){
+    assistantStreamPatchSelectedId=selectedId||'active';
+    if(streamMessage && typeof streamMessage==='object'){
+        assistantStreamPatchPendingMessage={
+            request_id:(streamMessage.request_id!==undefined&&streamMessage.request_id!==null)?String(streamMessage.request_id):'',
+            text:String(streamMessage.text||''),
+        };
+    }
+    if(assistantStreamPatchTimerId) return;
+    const now=Date.now();
+    const delay=Math.max(0, ASSISTANT_STREAM_PATCH_MIN_INTERVAL_MS-(now-assistantStreamPatchLastRunTs));
+    assistantStreamPatchTimerId=setTimeout(()=>{
+        assistantStreamPatchTimerId=0;
+        assistantStreamPatchLastRunTs=Date.now();
+        const pendingMessage=assistantStreamPatchPendingMessage;
+        assistantStreamPatchPendingMessage=null;
+        const patched=updateAssistantStreamBubbleInPlace(assistantStreamPatchSelectedId, pendingMessage);
+        if(!patched) renderChatMessages(assistantStreamPatchSelectedId);
+    }, delay);
+}
+
+function updateAssistantStreamBubbleInPlace(selectedId, streamMessage){
+    const area=document.getElementById('chatArea');
+    if(!area) return false;
+
+    if(streamMessage && typeof streamMessage==='object'){
+        const requestedId=String(streamMessage.request_id||'');
+        const text=String(streamMessage.text||'');
+        const streamNodes=Array.from(area.querySelectorAll('[data-stream-content="true"]'));
+        if(streamNodes.length){
+            let bubble=null;
+            if(requestedId){
+                bubble=streamNodes.find((node)=>String(node.getAttribute('data-stream-request-id')||'')===requestedId) || null;
+            }
+            if(!bubble){
+                bubble=streamNodes[streamNodes.length-1];
+            }
+            if(bubble){
+                bubble.textContent=text;
+                updateScrollDownButton();
+                updateScrollUpButton();
+                return true;
+            }
+        }
+    }
+
+    const collated=collateChatMessages(getSelectedMessages(selectedId));
+    let latestStream=null;
+    for(let i=collated.length-1;i>=0;i--){
+        const msg=collated[i];
+        if(msg && msg.role==='assistant_stream_group'){
+            latestStream=msg;
+            break;
+        }
+        if(msg && msg.role==='assistant') break;
+    }
+    if(!latestStream) return false;
+
+    const streamRows=area.querySelectorAll('.chat-msg[data-role="assistant_stream_group"]');
+    if(!streamRows.length) return false;
+    const row=streamRows[streamRows.length-1];
+
+    let bubble=row.querySelector('[data-stream-content="true"]');
+    if(!bubble){
+        const blocks=row.querySelectorAll('div');
+        bubble=blocks.length ? blocks[blocks.length-1] : null;
+    }
+    if(!bubble) return false;
+
+    bubble.textContent=String((latestStream&&latestStream.text)||'');
+    updateScrollDownButton();
+    updateScrollUpButton();
+    return true;
+}
+
+const pendingGatewayDebugReqIds=new Set();
+let gatewayDebugRafId=0;
+
+function mergeRawGatewayFrames(rawMessages){
+    return (Array.isArray(rawMessages)?rawMessages:[]).map((msg, idx)=>{
+        const rawText=String((msg&&msg.text)||'');
+        if(!rawText.trim()) return {index:idx, rawText:''};
+        try{
+            return JSON.parse(rawText);
+        }catch(_){
+            return {index:idx, rawText};
+        }
+    });
+}
+
+function collectRawGatewayMessagesForRequest(selectedId, requestId){
+    const reqKey=String(requestId===undefined || requestId===null ? 'na' : requestId);
+    return getSelectedMessages(selectedId).filter((m)=>{
+        if(!m || m.role!=='raw_gateway') return false;
+        const msgReq=String((m&&m.request_id)!==undefined && (m&&m.request_id)!==null ? m.request_id : 'na');
+        return msgReq===reqKey;
+    });
+}
+
+function findDetailByKey(area, detailKey){
+    const nodes=area.querySelectorAll('details[data-detail-key]');
+    for(const el of nodes){
+        if(el.getAttribute('data-detail-key')===detailKey) return el;
+    }
+    return null;
+}
+
+function updateGatewayDebugBubbleInPlace(requestId, selectedId){
+    const area=document.getElementById('chatArea');
+    if(!area) return false;
+    const reqKey=String(requestId===undefined || requestId===null ? 'na' : requestId);
+    const detailKey='req:'+reqKey+':raw-group';
+    const detailEl=findDetailByKey(area, detailKey);
+    if(!detailEl) return false;
+
+    const rawMessages=collectRawGatewayMessagesForRequest(selectedId, requestId);
+    const mergedFrames=mergeRawGatewayFrames(rawMessages);
+    const mergedJson=JSON.stringify(mergedFrames, null, 2) || '[]';
+
+    const summaryLabel=detailEl.querySelector('[data-debug-label]');
+    if(summaryLabel) summaryLabel.textContent='Debug: raw gateway JSON ('+String(rawMessages.length)+')';
+
+    const pre=detailEl.querySelector('[data-debug-pre]') || detailEl.querySelector('pre');
+    if(pre) pre.textContent=mergedJson;
+
+    return true;
+}
+
+function scheduleGatewayDebugBubbleUpdate(requestId, selectedId){
+    pendingGatewayDebugReqIds.add(String(requestId===undefined || requestId===null ? 'na' : requestId));
+    if(gatewayDebugRafId) return;
+    gatewayDebugRafId=requestAnimationFrame(()=>{
+        gatewayDebugRafId=0;
+        const ids=Array.from(pendingGatewayDebugReqIds);
+        pendingGatewayDebugReqIds.clear();
+        let missing=false;
+        ids.forEach((id)=>{
+            const ok=updateGatewayDebugBubbleInPlace(id, selectedId);
+            if(!ok) missing=true;
+        });
+        if(missing){
+            renderChatMessages(selectedId);
+        } else {
+            updateScrollDownButton();
+            updateScrollUpButton();
+        }
+    });
+}
+
 function scrollChat(){ const a=document.getElementById('chatArea'); if(a){ a.scrollTop=a.scrollHeight; updateScrollDownButton(); } }
+
+function extractResultObject(parsed){
+    if(!parsed||typeof parsed!=='object') return null;
+    const outCandidates=[parsed.result, parsed.partialResult, parsed.output, parsed.stdout, parsed.stderr, parsed.message, parsed.text, parsed.content];
+    for(const c of outCandidates){
+        if(c===undefined || c===null) continue;
+        if(typeof c==='object') return c;
+        if(typeof c==='string'){
+            const t=String(c).trim();
+            if(!t) continue;
+            try{
+                const j=JSON.parse(t);
+                if(j && typeof j==='object') return j;
+            }catch(_ ){}
+        }
+    }
+    return null;
+}
+
+function extractReferencedPathsFromEvents(events){
+    const paths=[];
+    const addPath=(value)=>{
+        const text=String(value||'').trim();
+        if(!text) return;
+        if(!paths.includes(text)) paths.push(text);
+    };
+    const collectFromPayload=(obj)=>{
+        if(!obj || typeof obj!=='object') return;
+        const req=obj.args!==undefined ? obj.args : (obj.arguments!==undefined ? obj.arguments : obj.input);
+        if(req && typeof req==='object'){
+            [req.filePath, req.file_path, req.path, req.old_path, req.new_path, req.uri].forEach(addPath);
+            if(Array.isArray(req.filePaths)) req.filePaths.forEach(addPath);
+            if(Array.isArray(req.paths)) req.paths.forEach(addPath);
+        }
+        const resultObj=extractResultObject(obj);
+        if(resultObj && typeof resultObj==='object'){
+            [resultObj.filePath, resultObj.file_path, resultObj.path, resultObj.old_path, resultObj.new_path, resultObj.uri, resultObj.file].forEach(addPath);
+            if(Array.isArray(resultObj.filePaths)) resultObj.filePaths.forEach(addPath);
+            if(Array.isArray(resultObj.paths)) resultObj.paths.forEach(addPath);
+            if(Array.isArray(resultObj.files)) resultObj.files.forEach(addPath);
+        }
+    };
+
+    for(const ev of (events||[])){
+        if(!ev || ev.kind!=='tool') continue;
+        const p=ev.payload||{};
+        const n=String(p.name||p.text||'').toLowerCase();
+        const isRead=n==='read' || n.includes('read_file');
+        const isWrite=n==='write' || n.includes('write_file') || n.includes('create_file') || n.includes('str_replace') || n.includes('insert') || n.includes('delete');
+        if(!isRead && !isWrite) continue;
+        const phase=String(p.phase||'').toLowerCase();
+        if(phase!=='start' && phase!=='update' && phase!=='result' && phase!=='end') continue;
+        try{
+            const det=JSON.parse(String(p.details||'').trim());
+            if(det && typeof det==='object') collectFromPayload(det);
+        }catch{}
+    }
+    return paths;
+}
+
 function collateChatMessages(msgs){
     const out=[];
     let activeBucket=null;
 
     const flushBucket=()=>{
         if(!activeBucket) return;
-        if(activeBucket.events.length>0){
-            out.push({role:'context_group',request_id:activeBucket.reqId,events:activeBucket.events,steps:activeBucket.steps,interim:activeBucket.interim,hasFinal:activeBucket.finals.length>0});
+        if(activeBucket.events.length>0 || activeBucket.rawMsgs.length>0){
+            out.push({
+                role:'context_group',
+                request_id:activeBucket.reqId,
+                events:activeBucket.events,
+                steps:activeBucket.steps,
+                interim:activeBucket.interim,
+                raw_messages:activeBucket.rawMsgs,
+                hasFinal:activeBucket.finals.length>0,
+            });
         }
-        const validStreams=activeBucket.streams.filter(s=>String(s.text||'').trim().length>0);
+        const validStreams=activeBucket.streams.filter(s=>String(s.text||'').length>0);
+        const combinedStreamText=validStreams.map(s=>String(s.text||'')).join('');
         if(validStreams.length>0 && activeBucket.finals.length===0){
             out.push({
                 role:'assistant_stream_group',
                 request_id:activeBucket.reqId,
                 source:validStreams[0].source||'assistant',
-                text:validStreams.map(s=>String(s.text||'').trim()).filter(Boolean).join(' '),
+                text:combinedStreamText,
                 segments:validStreams,
                 latest:validStreams[validStreams.length-1],
+                hasFinal:false,
             });
         }
-        activeBucket.finals.forEach(f=>out.push(f));
+        const referencedFiles=extractReferencedPathsFromEvents(activeBucket.events);
+        activeBucket.finals.forEach((f, index)=>{
+            const extra=referencedFiles.length?{referenced_files:referencedFiles, written_files:referencedFiles}:{};
+            if(validStreams.length>0 && index===activeBucket.finals.length-1){
+                out.push({...f, ...extra, stream_text:combinedStreamText, stream_segments:validStreams});
+                return;
+            }
+            out.push({...f, ...extra});
+        });
         activeBucket=null;
     };
 
     const ensureActiveBucket=(reqId)=>{
         if(!activeBucket || activeBucket.reqId!==reqId){
             flushBucket();
-            activeBucket={reqId,streams:[],steps:[],interim:[],events:[],finals:[]};
+            activeBucket={reqId,rawMsgs:[],streams:[],steps:[],interim:[],events:[],finals:[]};
         }
         return activeBucket;
     };
@@ -1032,6 +1481,11 @@ function collateChatMessages(msgs){
             bucket.events.push({kind:'lifecycle',payload:m});
             return;
         }
+        if(role==='raw_gateway'){
+            const bucket=ensureActiveBucket(reqId);
+            bucket.rawMsgs.push(m);
+            return;
+        }
         if(role==='assistant'){
             const bucket=ensureActiveBucket(reqId);
             const segKind=String((m&&m.segment_kind)||'final').toLowerCase();
@@ -1050,16 +1504,211 @@ function collateChatMessages(msgs){
 const CHAT_MARKDOWN_ALLOWED_TAGS=['p','strong','em','h1','h2','h3','h4','h5','h6','ul','ol','li','code','pre','blockquote','a','hr','table','thead','tbody','tr','th','td','br','del','s'];
 const CHAT_MARKDOWN_ALLOWED_ATTR=['href','title'];
 const ASSISTANT_CHART_TAG_RE=/<(?:mermaidchart|pyramidchart)>([\s\S]*?)<\/(?:mermaidchart|pyramidchart)>/gi;
+const OUTER_MARKDOWN_FENCE_RE=/^\s*```(?:markdown|md)\s*\r?\n([\s\S]*?)\r?\n```\s*$/i;
+const OUTER_ANY_FENCE_RE=/^\s*```[^\n]*(?:\r?\n)?([\s\S]*?)(?:\r?\n)?```\s*$/i;
 let mermaidInitialized=false;
 let mermaidRenderSeq=0;
+
+function unwrapOuterMarkdownFence(raw){
+    const txt=String(raw||'');
+    // Try markdown-specific fences first, then any fence (including plain ```)
+    let m=OUTER_MARKDOWN_FENCE_RE.exec(txt);
+    if(m) return String(m[1]||'');
+    
+    m=OUTER_ANY_FENCE_RE.exec(txt);
+    if(m) return String(m[1]||'');
+    
+    return txt;
+}
+
+function decodeLikelyEscapedText(raw){
+    const txt=String(raw||'');
+    if(!txt) return '';
+    // Some providers return markdown with literal escape sequences (\\n, \\t)
+    // instead of real line breaks, which collapses formatting into one line.
+    if(txt.includes('\\r\\n') || txt.includes('\\n') || txt.includes('\\t')){
+        return txt
+            .replace(/\\r\\n/g, '\n')
+            .replace(/\\n/g, '\n')
+            .replace(/\\t/g, '\t');
+    }
+    return txt;
+}
+
+function restoreLikelyFlattenedMarkdown(raw){
+    let txt=String(raw||'');
+    if(!txt) return '';
+
+    const hasMarkdownSignals=(/(^|\s)#{1,6}\s?/.test(txt) || /\[[^\]]+\]\([^)]+\)/.test(txt) || /```/.test(txt) || /(^|\s)\d+\.\s/.test(txt));
+    if(!hasMarkdownSignals) return txt;
+
+    txt=txt.replace(/\r\n/g, '\n');
+
+    // Normalize headings with missing space after hashes: ##Title -> ## Title
+    txt=txt.replace(/(^|\n)(#{1,6})([^\s#])/g, '$1$2 $3');
+
+    // Insert line breaks before heading/list markers that were flattened into prose.
+    txt=txt
+        .replace(/[ \t]+(#{1,6}\s)/g, '\n$1')
+        .replace(/[ \t]+(>\s+)/g, '\n$1')
+        .replace(/[ \t]+([-*+]\s?)(?=\S)/g, '\n$1')
+        .replace(/[ \t]+(\d+\.\s+)/g, '\n$1')
+        .replace(/[ \t]+(```)/g, '\n$1');
+
+    // Ordered-list repair for compact forms: item1. First item2. Second
+    txt=txt.replace(/([a-zA-Z])(?=(\d+\.\s+[A-Z]))/g, '$1\n');
+
+    // Ensure list markers include a space after marker.
+    txt=txt
+        .replace(/(^|\n)([-*+])(?=\S)/g, '$1$2 ')
+        .replace(/(^|\n)(\d+\.)(?=\S)/g, '$1$2 ');
+
+    // Ensure fenced code blocks have a line break after opening fence.
+    txt=txt.replace(/```([a-zA-Z0-9_-]+)?\s+([^\n])/g, (_m, lang, first)=>`\n\`\`\`${lang||''}\n${first}`);
+
+    // Remove obvious heading-label artifacts that leak from explanatory prose.
+    txt=txt.replace(/(^|\n)-H([1-6])-\s*/g, '$1');
+
+    txt=txt.replace(/\n{3,}/g, '\n\n');
+    return txt.trim();
+}
+
+function looksLikeMarkdownDocument(raw){
+    const txt=String(raw||'').trim();
+    if(!txt) return false;
+    const checks=[
+        /^#{1,6}\s+/m,
+        /^\s*[-*+]\s+/m,
+        /^\s*\d+\.\s+/m,
+        /^\s*>\s+/m,
+        /\[[^\]]+\]\([^)]+\)/m,
+        /`[^`]+`/m,
+        /^\s*\|.+\|\s*$/m,
+    ];
+    return checks.some((re)=>re.test(txt));
+}
+
+function normalizeAssistantMarkdownSource(raw){
+    let txt=decodeLikelyEscapedText(raw);
+    txt=restoreLikelyFlattenedMarkdown(txt);
+    txt=unwrapOuterMarkdownFence(txt);
+    const anyFence=OUTER_ANY_FENCE_RE.exec(txt);
+    if(anyFence){
+        const inner=String(anyFence[1]||'');
+        if(looksLikeMarkdownDocument(inner)) txt=inner;
+    }
+    return txt;
+}
+
+function _escapeHtml(raw){
+    return String(raw||'')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function _inlineMarkdownToHtml(raw){
+    let s=_escapeHtml(raw);
+    s=s.replace(/`([^`]+)`/g, '<code>$1</code>');
+    s=s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    s=s.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+    s=s.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    return s;
+}
+
+function _fallbackMarkdownToHtml(raw){
+    const lines=String(raw||'').replace(/\r\n/g,'\n').split('\n');
+    const out=[];
+    let inUl=false;
+    let inOl=false;
+
+    const closeLists=()=>{
+        if(inUl){ out.push('</ul>'); inUl=false; }
+        if(inOl){ out.push('</ol>'); inOl=false; }
+    };
+
+    for(const line of lines){
+        const txt=String(line||'');
+        const h=txt.match(/^\s*(#{1,6})\s+(.+)$/);
+        if(h){
+            closeLists();
+            const level=Math.min(6, h[1].length);
+            out.push(`<h${level}>${_inlineMarkdownToHtml(h[2])}</h${level}>`);
+            continue;
+        }
+
+        const ul=txt.match(/^\s*[-*+]\s+(.+)$/);
+        if(ul){
+            if(inOl){ out.push('</ol>'); inOl=false; }
+            if(!inUl){ out.push('<ul>'); inUl=true; }
+            out.push(`<li>${_inlineMarkdownToHtml(ul[1])}</li>`);
+            continue;
+        }
+
+        const ol=txt.match(/^\s*\d+\.\s+(.+)$/);
+        if(ol){
+            if(inUl){ out.push('</ul>'); inUl=false; }
+            if(!inOl){ out.push('<ol>'); inOl=true; }
+            out.push(`<li>${_inlineMarkdownToHtml(ol[1])}</li>`);
+            continue;
+        }
+
+        if(!txt.trim()){
+            closeLists();
+            continue;
+        }
+
+        closeLists();
+        out.push(`<p>${_inlineMarkdownToHtml(txt)}</p>`);
+    }
+
+    closeLists();
+    return out.join('');
+}
+
+function _forceMarkdownLinksNewWindow(html){
+    const src=String(html||'');
+    if(!src.trim()) return '';
+    if(typeof document==='undefined') return src;
+    const tpl=document.createElement('template');
+    tpl.innerHTML=src;
+    tpl.content.querySelectorAll('a[href]').forEach((a)=>{
+        a.setAttribute('target', '_blank');
+        a.setAttribute('rel', 'noopener noreferrer');
+    });
+    return tpl.innerHTML;
+}
 
 function renderMarkdownHtml(raw){
     const txt=String(raw||'');
     if(!txt.trim()) return '';
-    if(typeof marked==='undefined' || typeof DOMPurify==='undefined') return '';
+
+    const markedApi=(typeof marked!=='undefined' && marked && typeof marked.parse==='function')
+        ? marked
+        : ((typeof window!=='undefined' && window.marked && typeof window.marked.parse==='function') ? window.marked : null);
+    const domPurifyApi=(typeof DOMPurify!=='undefined' && DOMPurify && typeof DOMPurify.sanitize==='function')
+        ? DOMPurify
+        : ((typeof window!=='undefined' && window.DOMPurify && typeof window.DOMPurify.sanitize==='function') ? window.DOMPurify : null);
+
     try{
-        marked.setOptions({breaks:true,gfm:true});
-        return DOMPurify.sanitize(marked.parse(txt),{ALLOWED_TAGS:CHAT_MARKDOWN_ALLOWED_TAGS,ALLOWED_ATTR:CHAT_MARKDOWN_ALLOWED_ATTR});
+        if(markedApi){
+            markedApi.setOptions({breaks:true,gfm:true});
+            const parsed=markedApi.parse(txt);
+            if(domPurifyApi){
+                const safe=domPurifyApi.sanitize(parsed,{ALLOWED_TAGS:CHAT_MARKDOWN_ALLOWED_TAGS,ALLOWED_ATTR:CHAT_MARKDOWN_ALLOWED_ATTR});
+                return _forceMarkdownLinksNewWindow(safe);
+            }
+            return _forceMarkdownLinksNewWindow(parsed);
+        }
+
+        const fallback=_fallbackMarkdownToHtml(txt);
+        if(domPurifyApi){
+            const safe=domPurifyApi.sanitize(fallback,{ALLOWED_TAGS:CHAT_MARKDOWN_ALLOWED_TAGS,ALLOWED_ATTR:CHAT_MARKDOWN_ALLOWED_ATTR});
+            return _forceMarkdownLinksNewWindow(safe);
+        }
+        return _forceMarkdownLinksNewWindow(fallback);
     }catch(_ ){
         return '';
     }
@@ -1164,14 +1813,17 @@ async function renderMermaidBlock(target, chartText){
 }
 
 function renderAssistantContent(target, raw){
-    const txt=String(raw||'');
+    const txt=normalizeAssistantMarkdownSource(raw);
     target.textContent='';
     if(!txt.trim()) return;
 
     const parts=splitAssistantContent(txt);
     if(!parts.length){
         const html=renderMarkdownHtml(txt);
-        if(html) target.innerHTML=html;
+        if(html){
+            target.classList.add('md-content');
+            target.innerHTML=html;
+        }
         else target.textContent=txt;
         return;
     }
@@ -1198,21 +1850,154 @@ function renderAssistantContent(target, raw){
     }
 }
 
+function makeResponseCopyButton(getText){
+    const btn=document.createElement('button');
+    btn.type='button';
+    btn.className='absolute px-2 py-0.5 rounded text-[10px] bg-gray-900/70 hover:bg-gray-800 text-gray-200 border border-gray-600 transition-colors';
+    btn.style.top='6px';
+    btn.style.right='6px';
+    btn.style.left='auto';
+    btn.style.zIndex='2';
+    btn.textContent='Copy';
+    btn.title='Copy response';
+    btn.addEventListener('click', async (e)=>{
+        e.preventDefault();
+        e.stopPropagation();
+        const text=normalizeCopiedAssistantText(getText?getText():'');
+        if(!text) return;
+        try{
+            await navigator.clipboard.writeText(text);
+            const prev=btn.textContent;
+            btn.textContent='Copied';
+            setTimeout(()=>{ btn.textContent=prev; }, 1200);
+        }catch(_){
+            const prev=btn.textContent;
+            btn.textContent='Failed';
+            setTimeout(()=>{ btn.textContent=prev; }, 1200);
+        }
+    });
+    return btn;
+}
+
+function normalizeCopiedAssistantText(raw){
+    const txt=String(raw||'');
+    if(!txt.trim()) return '';
+
+    // If the entire message is wrapped in a markdown fence, copy only the inner content.
+    const m=OUTER_MARKDOWN_FENCE_RE.exec(txt);
+    if(m) return String(m[1]||'').trim();
+
+    return txt.trim();
+}
+
+function attachPlainTriangleToDetails(detailsEl, summaryEl){
+    if(!detailsEl || !summaryEl) return;
+    if(summaryEl.querySelector('[data-expander-icon="true"]')) return;
+
+    summaryEl.classList.add('list-none');
+    summaryEl.style.listStyle='none';
+
+    const icon=document.createElement('span');
+    icon.setAttribute('data-expander-icon','true');
+    icon.className='inline-block text-white select-none flex-shrink-0';
+    icon.style.width='0.9rem';
+    icon.style.lineHeight='1';
+    icon.style.marginRight='0.15rem';
+    icon.textContent=detailsEl.open ? '▼' : '▶';
+
+    summaryEl.insertBefore(icon, summaryEl.firstChild);
+
+    const sync=()=>{
+        icon.textContent=detailsEl.open ? '▼' : '▶';
+    };
+    detailsEl.addEventListener('toggle', sync);
+}
+
 function mkBubble(m){
   const d=document.createElement('div');
     const role = (m&&m.role)||'';
     d.className='chat-msg flex '+(role==='user'?'justify-end':'justify-start');
         d.setAttribute('data-role', role);
+        const msgId=(m&&m.id!==undefined&&m.id!==null)?String(m.id):'';
+        if(msgId) d.setAttribute('data-msg-id', msgId);
+        const reqId=(m&&m.request_id!==undefined&&m&&m.request_id!==null)?String(m.request_id):'';
+        if(reqId) d.setAttribute('data-request-id', reqId);
+
+    if(role==='gateway_debug_group'){
+        const wrap=document.createElement('div');
+        wrap.className='max-w-xs sm:max-w-sm lg:max-w-md space-y-1';
+        const reqKey=String((m&&m.request_id)!==undefined && (m&&m.request_id)!==null ? m.request_id : 'na');
+        const rawMessages=Array.isArray(m.raw_messages) ? m.raw_messages : [];
+        const mergedFrames=mergeRawGatewayFrames(rawMessages);
+        const mergedJson=JSON.stringify(mergedFrames, null, 2);
+        const details=document.createElement('details');
+        details.setAttribute('data-detail-key', esc('req:'+reqKey+':raw-group'));
+        details.className='rounded-xl bg-gray-900/60 border border-fuchsia-700/60 text-xs overflow-hidden';
+        const summary=document.createElement('summary');
+        summary.className='px-3 py-1.5 cursor-pointer text-fuchsia-200 hover:text-fuchsia-100 select-none flex items-center';
+        const summaryLabel=document.createElement('span');
+        summaryLabel.className='flex-1';
+        summaryLabel.textContent='Debug: raw gateway JSON ('+String(rawMessages.length)+')';
+        const copyBtn=document.createElement('button');
+        copyBtn.type='button';
+        copyBtn.textContent='Copy';
+        copyBtn.className='px-1.5 py-0.5 rounded text-[10px] bg-fuchsia-900/60 hover:bg-fuchsia-800/80 text-fuchsia-200 border border-fuchsia-700/50 transition-colors';
+        copyBtn.style.marginLeft='1.5rem';
+        copyBtn.addEventListener('click', (e)=>{
+            e.preventDefault();
+            e.stopPropagation();
+            navigator.clipboard.writeText(mergedJson||'[]').then(()=>{
+                const orig=copyBtn.textContent;
+                copyBtn.textContent='Copied!';
+                setTimeout(()=>{ copyBtn.textContent=orig; }, 1500);
+            }).catch(()=>{});
+        });
+        summary.appendChild(summaryLabel);
+        summary.appendChild(copyBtn);
+        const body=document.createElement('div');
+        body.className='px-2 pb-2 pt-1';
+        const pre=document.createElement('pre');
+        pre.className='whitespace-pre-wrap break-words text-[11px] text-gray-300';
+        pre.textContent=mergedJson||'[]';
+        body.appendChild(pre);
+        details.appendChild(summary);
+        details.appendChild(body);
+        wrap.appendChild(details);
+        d.appendChild(wrap);
+        return d;
+    }
 
     if(role==='assistant_stream_group'){
         const wrap=document.createElement('div');
-        wrap.className='max-w-xs sm:max-w-sm lg:max-w-md';
+        wrap.className='max-w-xs sm:max-w-sm lg:max-w-md relative';
+
+        const reqKey=String((m&&m.request_id)!==undefined && (m&&m.request_id)!==null ? m.request_id : 'na');
+        const streamComplete=!!(m&&m.hasFinal);
+        const details=document.createElement('details');
+        details.className='rounded-2xl rounded-bl-md bg-gray-700 text-gray-100 overflow-hidden';
+        details.open=!streamComplete;
+
+        const summary=document.createElement('summary');
+        summary.className='px-4 py-2 cursor-pointer text-sm text-gray-100 hover:text-white select-none';
+        summary.textContent=streamComplete ? 'Streamed response' : 'Streaming response';
 
         const b=document.createElement('div');
-        b.className='px-4 py-2 rounded-2xl rounded-bl-md text-sm leading-relaxed bg-gray-700 text-gray-100 md-content';
+        b.className='px-4 pb-3 text-sm leading-relaxed text-gray-100 whitespace-pre-wrap break-words';
+        b.setAttribute('data-stream-content','true');
+        b.setAttribute('data-stream-request-id', reqKey);
         const _rawText=(m.text||'');
-        renderAssistantContent(b, _rawText);
-        wrap.appendChild(b);
+        b.textContent=_rawText;
+
+        details.appendChild(summary);
+        details.appendChild(b);
+
+        const isQuickAnswer=String((m&&m.source)||'')==='quick_answer';
+        if(!isQuickAnswer){
+            details.classList.add('pr-12');
+            wrap.appendChild(makeResponseCopyButton(()=>String((m&&m.text)||'')));
+        }
+
+        wrap.appendChild(details);
         d.appendChild(wrap);
         return d;
     }
@@ -1331,37 +2116,11 @@ function mkBubble(m){
             return '';
         };
 
-        const extractResultObject=(parsed)=>{
-            if(!parsed||typeof parsed!=='object') return null;
-            const outCandidates=[parsed.result, parsed.partialResult, parsed.output, parsed.stdout, parsed.stderr, parsed.message, parsed.text, parsed.content];
-            for(const c of outCandidates){
-                if(c===undefined || c===null) continue;
-                if(typeof c==='object') return c;
-                if(typeof c==='string'){
-                    const t=String(c).trim();
-                    if(!t) continue;
-                    try{
-                        const j=JSON.parse(t);
-                        if(j && typeof j==='object') return j;
-                    }catch(_ ){}
-                }
-            }
-            return null;
-        };
-
         const events=(m.events||[]);
-        if(events.length>0){
+        const rawMessages=Array.isArray(m.raw_messages) ? m.raw_messages : [];
+        if(events.length>0 || rawMessages.length>0){
             const toolGroups=new Map();
             const lifecycleItems=[];
-            const reasoningLines=[];
-            const seenReasoning=new Set();
-            const addReasoning=(line)=>{
-                const s=String(line||'').trim();
-                if(!s) return;
-                if(seenReasoning.has(s)) return;
-                seenReasoning.add(s);
-                reasoningLines.push(s);
-            };
 
             let hasLifecycleStart=false;
             let hasLifecycleEnd=false;
@@ -1529,13 +2288,9 @@ function mkBubble(m){
                 if((isLifecycleError || lifecycleTimeout) && !isTransientLifecycleError(phase||parsedPhase, lifecycleErrText)){
                     hasLifecycleHardError=true;
                 }
-                if(!isLifecycleError) addReasoning((payload.text||payload.name||'event')+': '+details);
             }
 
             const toolGroupList=[...toolGroups.values()];
-            for(const g of toolGroupList){
-                for(const mtxt of g.metas) addReasoning(mtxt);
-            }
 
             const allToolsTerminal=(toolGroupList.length>0) && toolGroupList.every((g)=>
                 g.phases.includes('result') || g.phases.includes('end') || g.phases.includes('error') || g.isError!==null
@@ -1669,14 +2424,19 @@ function mkBubble(m){
                     +'</div>';
             }).join('');
 
-            const interimBlock=reasoningLines.length
-                                ? '<details data-detail-key="'+esc('req:'+reqKey+':interim')+'" class="mt-2 rounded border border-gray-700/70 bg-gray-900/40">'
-                    +'<summary class="px-2 py-1 cursor-pointer text-[10px] text-gray-300 hover:text-gray-100">Interim/Reasoning</summary>'
-                    +'<pre class="px-2 pb-2 whitespace-pre-wrap break-words text-[11px] text-gray-300">'+esc(reasoningLines.join('\n'))+'</pre>'
+            const mergedFrames=mergeRawGatewayFrames(rawMessages);
+            const mergedJson=JSON.stringify(mergedFrames, null, 2) || '[]';
+            const debugBlock=rawMessages.length
+                ? '<details data-detail-key="'+esc('req:'+reqKey+':raw-group')+'" class="mt-2 rounded border border-fuchsia-700/60 bg-gray-900/40">'
+                    +'<summary class="px-2 py-1 cursor-pointer text-[10px] text-fuchsia-200 hover:text-fuchsia-100 flex items-center">'
+                        +'<span data-debug-label class="flex-1">Debug: raw gateway JSON ('+String(rawMessages.length)+')</span>'
+                        +'<button type="button" data-action="gateway-debug-copy" class="px-1.5 py-0.5 rounded text-[10px] bg-fuchsia-900/60 hover:bg-fuchsia-800/80 text-fuchsia-200 border border-fuchsia-700/50 transition-colors" style="margin-left:1.5rem">Copy</button>'
+                    +'</summary>'
+                    +'<pre data-debug-pre class="px-2 pb-2 whitespace-pre-wrap break-words text-[11px] text-gray-300">'+esc(mergedJson)+'</pre>'
                   +'</details>'
                 : '';
 
-            const executionSequenceContent=statusRow+waitingRow+toolRows+lifecycleRows+interimBlock;
+            const executionSequenceContent=statusRow+waitingRow+toolRows+lifecycleRows+debugBlock;
             if(executionSequenceContent){
                 const thinkingSummary=waiting
                     ? '<summary class="px-3 py-1.5 cursor-pointer text-gray-200 hover:text-gray-100 select-none flex items-center gap-2"><span class="inline-block w-3 h-3 border-2 border-yellow-300/80 border-t-transparent rounded-full animate-spin"></span><span>Thinking</span></summary>'
@@ -1686,6 +2446,14 @@ function mkBubble(m){
                     +thinkingSummary
                     +'<div class="px-2 pb-2 pt-1">'+executionSequenceContent+'</div>'
                     +'</details>';
+                const thinkingDetails=timeline.querySelector('details[data-detail-key="'+esc('req:'+reqKey+':thinking')+'"]');
+                if(thinkingDetails){
+                    attachPlainTriangleToDetails(thinkingDetails, thinkingDetails.querySelector('summary'));
+                }
+                const debugDetails=timeline.querySelector('details[data-detail-key="'+esc('req:'+reqKey+':raw-group')+'"]');
+                if(debugDetails){
+                    attachPlainTriangleToDetails(debugDetails, debugDetails.querySelector('summary'));
+                }
                 wrap.appendChild(timeline);
             }
         }
@@ -1695,12 +2463,60 @@ function mkBubble(m){
     }
 
   const b=document.createElement('div');
+    const isQuickAnswer=(m&&m.source)==='quick_answer';
     b.className='max-w-xs sm:max-w-sm lg:max-w-md px-4 py-2 rounded-2xl text-sm leading-relaxed '+
         (role==='user'?'bg-blue-700 text-white rounded-br-md':
          role==='system'?'bg-gray-700 text-gray-300 italic text-xs':
-     'bg-gray-700 text-gray-100 rounded-bl-md');
+     (isQuickAnswer?'bg-gray-600 border-2':'bg-gray-700')+' text-gray-100 rounded-bl-md');
+    if(isQuickAnswer) b.style.borderColor='#15803d';
     if(role==='assistant'){
-        renderAssistantContent(b, m.text||'');
+        if(!isQuickAnswer) b.classList.add('relative','pr-12');
+        const reqKey=String((m&&m.request_id)!==undefined && (m&&m.request_id)!==null ? m.request_id : 'na');
+        const summaryText=String((m&&m.text)||'');
+        const fullText=String((m&&m.full_text)||'').trim();
+        const hasExpandableFullText=!!fullText && fullText!==summaryText.trim();
+
+        const summaryBody=document.createElement('div');
+        renderAssistantContent(summaryBody, summaryText);
+
+        if(hasExpandableFullText){
+            const expandDetails=document.createElement('details');
+            expandDetails.setAttribute('data-detail-key', esc('req:'+reqKey+':full-response'));
+            const expandSummaryEl=document.createElement('summary');
+            expandSummaryEl.className='list-none flex items-start gap-1.5 cursor-pointer';
+            expandSummaryEl.appendChild(summaryBody);
+            const fullBody=document.createElement('div');
+            fullBody.className='mt-2 pt-2 border-t border-gray-600/50 text-sm leading-relaxed text-gray-200';
+            renderAssistantContent(fullBody, fullText);
+            expandDetails.appendChild(expandSummaryEl);
+            expandDetails.appendChild(fullBody);
+            attachPlainTriangleToDetails(expandDetails, expandSummaryEl);
+            b.appendChild(expandDetails);
+        } else {
+            b.appendChild(summaryBody);
+        }
+
+        const referencedFiles=(Array.isArray(m.referenced_files)?m.referenced_files:m.written_files)?.filter(fp=>String(fp||'').trim()) || [];
+        if(referencedFiles.length){
+            const filesDiv=document.createElement('div');
+            filesDiv.className='mt-2 flex flex-wrap gap-1';
+            for(const fp of referencedFiles){
+                const fname=String(fp).split('/').filter(Boolean).pop()||String(fp);
+                const btn=document.createElement('button');
+                btn.type='button';
+                btn.className='inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs bg-gray-800 border border-gray-600 hover:bg-gray-700 text-blue-300 hover:text-blue-200 transition-colors';
+                btn.setAttribute('data-action','open-in-files');
+                btn.setAttribute('data-file-path',fp);
+                btn.title=fp;
+                btn.textContent='\uD83D\uDCC4 '+fname;
+                filesDiv.appendChild(btn);
+            }
+            b.appendChild(filesDiv);
+        }
+
+        if(!isQuickAnswer){
+            b.appendChild(makeResponseCopyButton(()=>String((m&&m.text)||'')));
+        }
     }else{
         b.textContent=m.text||'';
     }

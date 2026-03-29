@@ -7,7 +7,9 @@ function handleMsg(msg){
   if (isLargePlaylist) console.time('🎵 music_queue render');
   
   switch(msg.type){
-    case 'hello': break;
+        case 'hello':
+                if(typeof syncBrowserAudioLeaseState==='function') syncBrowserAudioLeaseState();
+                break;
     case 'state_snapshot':
     if(msg.orchestrator){
         const rev = Number(msg.orchestrator.status_rev||0);
@@ -48,7 +50,7 @@ function handleMsg(msg){
     if(msg.recordings_rev!==undefined) S.lastRecordingsRev=Math.max(S.lastRecordingsRev, Number(msg.recordings_rev)||0);
     if(Array.isArray(msg.timers)) applyTimers(msg.timers);
     if(msg.timers_rev!==undefined) S.lastTimersRev=Math.max(S.lastTimersRev, Number(msg.timers_rev)||0);
-            applyServerChatState(msg.chat, msg.chat_threads, msg.active_chat_id);
+            applyServerChatState(msg.chat, msg.chat_threads, msg.active_chat_id, msg.active_chat_thread_id);
             if(S.page==='music' && (!Array.isArray(S.musicPlaylists) || S.musicPlaylists.length===0)){
                 sendAction({type:'music_list_playlists'});
             }
@@ -73,27 +75,48 @@ function handleMsg(msg){
     case 'status': if(msg.orchestrator) applyOrch(msg.orchestrator); break;
         case 'chat_append':
             if(msg.message){
-                applyServerChatState(undefined, msg.chat_threads, msg.active_chat_id);
+                applyServerChatState(undefined, msg.chat_threads, msg.active_chat_id, msg.active_chat_thread_id);
                 const nextMsg = normalizeChatMessage(msg.message);
                 if(nextMsg) S.chat.push(nextMsg);
                 if(nextMsg && nextMsg.role==='user') requestScrollToBottomBurst();
                 if(nextMsg && nextMsg.role==='user' && queueOptimisticTimerFromText(String(nextMsg.text||''), 'chat_append')){
                     renderTimerBar();
                 }
-                S.selectedChatId='active';
                 persistChatCache();
                 // Show toast notification on non-home pages
-                if(nextMsg) showMessageToast(String(nextMsg.text || ''), nextMsg.role);
+                if(nextMsg){
+                    const toastText = nextMsg.role === 'assistant'
+                        ? String(nextMsg.tts_text || nextMsg.text || '')
+                        : String(nextMsg.text || '');
+                    showMessageToast(toastText, nextMsg.role);
+                }
                 if(S.page==='home'){
                     renderThreadList('active');
-                    renderChatMessages('active');
+                    const segKind=String((nextMsg&&nextMsg.segment_kind)||'final').toLowerCase();
+                    const isAssistantStream=!!nextMsg && nextMsg.role==='assistant' && segKind==='stream';
+                    const isRawGateway=!!nextMsg && nextMsg.role==='raw_gateway';
+                    const isTransientContext=!!nextMsg && (nextMsg.role==='step' || nextMsg.role==='interim' || nextMsg.role==='raw_gateway');
+                    const patchedByRole=!!nextMsg && !isAssistantStream && !isTransientContext
+                        && typeof upsertActiveChatBubbleInPlace==='function'
+                        && upsertActiveChatBubbleInPlace(nextMsg, 'append');
+                    if(isAssistantStream && typeof scheduleAssistantStreamBubbleUpdate==='function'){
+                        scheduleAssistantStreamBubbleUpdate('active', nextMsg);
+                    }else if(isRawGateway && typeof scheduleGatewayDebugBubbleUpdate==='function'){
+                        scheduleGatewayDebugBubbleUpdate(nextMsg.request_id, 'active');
+                    }else if(isTransientContext && typeof isAssistantStreamBubbleActive==='function' && isAssistantStreamBubbleActive()){
+                        // Defer expensive grouped-context rerenders while stream bubble is active.
+                    }else if(typeof scheduleChatMessagesRender==='function'){
+                        if(!patchedByRole) scheduleChatMessagesRender('active');
+                    }else{
+                        if(!patchedByRole) renderChatMessages('active');
+                    }
                 }
             }
             break;
 
         case 'chat_update':
             if(msg.message){
-                applyServerChatState(undefined, msg.chat_threads, msg.active_chat_id);
+                applyServerChatState(undefined, msg.chat_threads, msg.active_chat_id, msg.active_chat_thread_id);
                 const updatedMsg = normalizeChatMessage(msg.message);
                 if(updatedMsg && updatedMsg.id){
                     // Find and replace message with same ID
@@ -101,8 +124,30 @@ function handleMsg(msg){
                     if(idx >= 0){
                         S.chat[idx] = updatedMsg;
                         // Show toast notification on non-home pages
-                        showMessageToast(String(updatedMsg.text || ''), updatedMsg.role);
-                        if(S.page==='home') renderChatMessages('active');
+                        const toastText = updatedMsg.role === 'assistant'
+                            ? String(updatedMsg.tts_text || updatedMsg.text || '')
+                            : String(updatedMsg.text || '');
+                        showMessageToast(toastText, updatedMsg.role);
+                        if(S.page==='home'){
+                            const segKind=String((updatedMsg.segment_kind||'final')).toLowerCase();
+                            const isAssistantStream=updatedMsg.role==='assistant' && segKind==='stream';
+                            const isRawGateway=updatedMsg.role==='raw_gateway';
+                            const isTransientContext=(updatedMsg.role==='step' || updatedMsg.role==='interim' || updatedMsg.role==='raw_gateway');
+                            const patchedByRole=!isAssistantStream && !isTransientContext
+                                && typeof upsertActiveChatBubbleInPlace==='function'
+                                && upsertActiveChatBubbleInPlace(updatedMsg, 'update');
+                            if(isAssistantStream && typeof scheduleAssistantStreamBubbleUpdate==='function'){
+                                scheduleAssistantStreamBubbleUpdate('active', updatedMsg);
+                            }else if(isRawGateway && typeof scheduleGatewayDebugBubbleUpdate==='function'){
+                                scheduleGatewayDebugBubbleUpdate(updatedMsg.request_id, 'active');
+                            }else if(isTransientContext && typeof isAssistantStreamBubbleActive==='function' && isAssistantStreamBubbleActive()){
+                                // Defer expensive grouped-context rerenders while stream bubble is active.
+                            }else if(typeof scheduleChatMessagesRender==='function'){
+                                if(!patchedByRole) scheduleChatMessagesRender('active');
+                            }else{
+                                if(!patchedByRole) renderChatMessages('active');
+                            }
+                        }
                     }
                 }
                 persistChatCache();
@@ -110,13 +155,12 @@ function handleMsg(msg){
             break;
 
         case 'chat_threads_update':
-            applyServerChatState(undefined, msg.chat_threads, msg.active_chat_id);
+            applyServerChatState(undefined, msg.chat_threads, msg.active_chat_id, msg.active_chat_thread_id);
             if(S.page==='home') renderPage();
             break;
         case 'chat_reset':
             S.chat=[];
-            applyServerChatState([], msg.chat_threads, msg.active_chat_id);
-            S.selectedChatId='active';
+            applyServerChatState([], msg.chat_threads, msg.active_chat_id, msg.active_chat_thread_id);
             persistChatCache();
             if(S.page==='home') renderPage();
             break;
@@ -652,14 +696,25 @@ registerProcessor('openclaw-capture-processor', CaptureProcessor);
     }
 
     async function startBrowserCapture(){
-  if(!S.browserAudioEnabled) return;
+  if(!S.browserAudioEnabled){
+      if(typeof stopBrowserCapture==='function') await stopBrowserCapture();
+      return;
+  }
   if(S.captureStartInProgress) return;
   S.captureStartInProgress = true;
   try {
+  if(typeof syncBrowserAudioLeaseState==='function') syncBrowserAudioLeaseState();
+  if(typeof tryAcquireBrowserAudioLease==='function' && !tryAcquireBrowserAudioLease()){
+      if(typeof stopBrowserCapture==='function') await stopBrowserCapture({ releaseLease: false });
+      clearCaptureRetry();
+      if(typeof applyMicControlToggles==='function') applyMicControlToggles();
+      return;
+  }
   const hasLiveTrack = !!(S.mediaStream && S.mediaStream.getAudioTracks().some(t=>t.readyState==='live'));
   if (hasLiveTrack && S.processor) {
       if (S.audioCtx && S.audioCtx.state === 'suspended') await S.audioCtx.resume();
       clearCaptureRetry();
+      if(typeof applyMicControlToggles==='function') applyMicControlToggles();
       return;
   }
 
@@ -710,6 +765,7 @@ registerProcessor('openclaw-capture-processor', CaptureProcessor);
                     if (!data || !data.samples) return;
                     if(!S.ws||S.ws.readyState!==WebSocket.OPEN) return;
                     if(!S.browserAudioEnabled) return;
+                    if(typeof currentTabOwnsBrowserAudio==='function' && !currentTabOwnsBrowserAudio()) return;
                     const inp = data.samples;
                     const rms = Number(data.rms) || 0;
                     const now=performance.now();
@@ -728,6 +784,7 @@ registerProcessor('openclaw-capture-processor', CaptureProcessor);
                 const rms=Math.sqrt(ss/Math.max(1,inp.length));
                 if(!S.ws||S.ws.readyState!==WebSocket.OPEN) return;
                 if(!S.browserAudioEnabled) return;
+                if(typeof currentTabOwnsBrowserAudio==='function' && !currentTabOwnsBrowserAudio()) return;
                 const now=performance.now();
                 if(now-S.lastLevel>=120){ S.lastLevel=now; S.ws.send(JSON.stringify({type:'browser_audio_level',rms,peak:rms})); }
                 const out=new Int16Array(inp.length);
@@ -738,6 +795,7 @@ registerProcessor('openclaw-capture-processor', CaptureProcessor);
     }
     S.processor=proc;
     clearCaptureRetry();
+        if(typeof applyMicControlToggles==='function') applyMicControlToggles();
   } finally {
     S.captureStartInProgress = false;
   }

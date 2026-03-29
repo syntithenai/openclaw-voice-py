@@ -208,6 +208,7 @@ class VoiceConfig(BaseSettings):
     gateway_auth_token: str = Field("", validation_alias=AliasChoices("GATEWAY_AUTH_TOKEN", "OPENCLAW_GATEWAY_TOKEN"))
     openclaw_gateway_url: str = Field("", validation_alias=AliasChoices("OPENCLAW_GATEWAY_URL"))
     gateway_timeout_ms: int = Field(30000, validation_alias=AliasChoices("VOICE_GATEWAY_TIMEOUT", "GATEWAY_TIMEOUT_MS"))
+    gateway_agent_response_timeout_ms: int = Field(1800000, validation_alias=AliasChoices("GATEWAY_AGENT_RESPONSE_TIMEOUT_MS"))  # Long-running agent completion wait (default 30 min)
     gateway_session_prefix: str = Field("voice", validation_alias=AliasChoices("VOICE_SESSION_PREFIX"))
     gateway_debounce_ms: int = Field(2000, validation_alias=AliasChoices("GATEWAY_DEBOUNCE_MS"))
     gateway_tts_fast_start_words: int = Field(5, validation_alias=AliasChoices("GATEWAY_TTS_FAST_START_WORDS"))
@@ -258,7 +259,26 @@ class VoiceConfig(BaseSettings):
     quick_answer_timeout_ms: int = Field(5000)  # Timeout for quick answer requests
     quick_answer_mirror_enabled: bool = Field(False)  # Mirror QA turns to the openclaw session so they appear in web chat
     quick_answer_bypass_window_ms: int = Field(8000)  # After a transcript is sent to gateway, bypass quick answer for this many ms (0=disabled)
+
+    # Quick Answer Model Tier Resolution
+    quick_answer_model_tier_fast_id: str = Field("")  # Fast tier model ID (e.g., for deterministic local tasks)
+    quick_answer_model_tier_basic_id: str = Field("")  # Basic tier model ID (fallback 1)
+    quick_answer_model_tier_capable_id: str = Field("")  # Capable tier model ID (fallback 2)
+    quick_answer_model_tier_smart_id: str = Field("")  # Smart tier model ID (fallback 3)
+    quick_answer_model_tier_genius_id: str = Field("")  # Genius tier model ID (fallback 4, recommended)
+
+    # Quick Answer Feature Flags
+    quick_answer_strict_routing_enabled: bool = Field(False)  # Enforce strict two-outcome contract (tool calls or model_recommendation only)
+    quick_answer_procedural_skill_routing_enabled: bool = Field(False)  # Use procedural routing for recorder/timer/music/etc (not just regex)
+
     new_session_suppress_welcome_message: bool = Field(True)  # Suppress gateway assistant output emitted immediately after /reset
+
+    # TTS long-response summary behavior (uses quick-answer endpoint for spoken compression)
+    tts_long_response_summary_enabled: bool = Field(True)
+    tts_long_response_summary_word_trigger: int = Field(30)
+    tts_long_response_summary_target_words: int = Field(20)
+    tts_long_response_summary_timeout_ms: int = Field(3500)
+    gateway_tts_streaming_enabled: bool = Field(False, validation_alias=AliasChoices("GATEWAY_TTS_STREAMING_ENABLED"))
 
     # STT ghost transcript suppression gate
     ghost_filter_enabled: bool = Field(True)
@@ -286,6 +306,8 @@ class VoiceConfig(BaseSettings):
     recorder_pyannote_auth_token: str = Field("")  # Hugging Face token for pyannote pipeline
     recorder_pyannote_model: str = Field("pyannote/speaker-diarization-3.1")
     recorder_pyannote_url: str = Field("http://localhost:10002")  # Remote pyannote diarization service URL
+    recorder_stop_hotword_extra_trim_ms: int = Field(900)  # Extra audio to trim before the hotword arm point
+    recorder_stop_hotword_max_trim_ms: int = Field(8000)  # Safety cap for total tail trim on hotword stop
 
     # Embedded realtime web UI / websocket bridge
     web_ui_enabled: bool = Field(False)  # Serve local UI + websocket bridge for continuous browser audio
@@ -594,6 +616,19 @@ class VoiceConfig(BaseSettings):
                 logger.warning("QUICK_ANSWER_MODEL not set - will default to 'gpt-3.5-turbo' (may not match LM Studio loaded model)")
             if self.quick_answer_timeout_ms <= 0:
                 errors.append(f"QUICK_ANSWER_TIMEOUT_MS={self.quick_answer_timeout_ms} must be > 0")
+
+        if self.tts_long_response_summary_word_trigger <= 0:
+            errors.append(
+                "TTS_LONG_RESPONSE_SUMMARY_WORD_TRIGGER must be > 0"
+            )
+        if self.tts_long_response_summary_target_words <= 0:
+            errors.append(
+                "TTS_LONG_RESPONSE_SUMMARY_TARGET_WORDS must be > 0"
+            )
+        if self.tts_long_response_summary_timeout_ms <= 0:
+            errors.append(
+                "TTS_LONG_RESPONSE_SUMMARY_TIMEOUT_MS must be > 0"
+            )
 
         # Validate ghost transcript filter settings
         if self.ghost_filter_playback_tail_ms < 0:

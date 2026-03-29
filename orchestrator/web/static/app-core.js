@@ -11,20 +11,40 @@ const PREF_BROWSER_AUDIO = 'openclaw.ui.browserAudioEnabled';
 const PREF_CONTINUOUS = 'openclaw.ui.continuousMode';
 const PREF_MUSIC_QUEUE_FILTER = 'openclaw.ui.musicQueueFilter';
 const PREF_MUSIC_PLAYLIST_FILTER = 'openclaw.ui.musicPlaylistFilter';
+const BROWSER_AUDIO_LOCK_KEY = 'openclaw.ui.browserAudioOwner';
+const BROWSER_AUDIO_LOCK_LEASE_MS = 4000;
+const BROWSER_AUDIO_LOCK_HEARTBEAT_MS = 1500;
 const CHAT_CACHE_VERSION = 1;
 const PENDING_ACTION_TIMEOUT_MS = 8000;
 const INLINE_ERROR_TTL_MS = 7000;
 const MUSIC_LIBRARY_SEARCH_MIN_LEN = 3;
 const WS_RECONNECT_MS = 1500;
 
+const TAB_ID = (() => {
+    const fallback = 'tab-' + Math.random().toString(16).slice(2) + Date.now().toString(16);
+    try {
+        const key = 'openclaw.ui.tabId';
+        const existing = sessionStorage.getItem(key);
+        if (existing) return existing;
+        const next = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
+            ? crypto.randomUUID()
+            : fallback;
+        sessionStorage.setItem(key, next);
+        return next;
+    } catch (_) {
+        return fallback;
+    }
+})();
+
 const S = {
   ws:null, wsConnected:false,
   micEnabled:!MIC_STARTS_DISABLED,
   voice_state:'idle', wake_state:'asleep', tts_playing:false, mic_rms:0,
     chat:[], music:{state:'stop',title:'',artist:'',queue_length:0,elapsed:0,duration:0,position:-1,loaded_playlist:''},
-    chatThreads:[], activeChatId:'active', selectedChatId:'active', chatSidebarOpen:true,
+    chatThreads:[], activeChatId:'active', activeChatThreadId:'', selectedChatId:'active', chatSidebarOpen:true,
                 chatThreadFilter:'',
         chatDeleteModalOpen:false, chatDeleteTargetId:'', chatDeleteTargetTitle:'',
+        chatClearAllModalOpen:false,
         chatFollowLatest:true,
     musicQueue:[], musicPlaylists:[], musicLibraryResults:[],
         musicQueueFilter:'', musicPlaylistFilter:'', musicQueueSelectionByIds:{}, musicQueueLastCheckedId:null,
@@ -43,6 +63,9 @@ const S = {
     feedbackAudioCtx:null,
     captureWorkletModuleReady:false,
     ttsMuted:true, browserAudioEnabled:true, continuousMode:false,
+    tabId:TAB_ID,
+    browserAudioOwnerTabId:'', browserAudioBlockedByOtherTab:false,
+    browserAudioLeaseTimer:null,
     pendingChatSends:new Set(), nextClientMsgId:1,
     nextMusicActionId:1, pendingMusicActions:{},
     nextTimerActionId:1, pendingTimerActions:{},
@@ -559,6 +582,155 @@ function writeStringPref(key, value){
     try { localStorage.setItem(key, String(value||'')); } catch(_) {}
 }
 
+function readBrowserAudioLockEntry(){
+    try {
+        const raw = localStorage.getItem(BROWSER_AUDIO_LOCK_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object') return null;
+        const tabId = String(parsed.tabId || '').trim();
+        const ts = Number(parsed.ts || 0);
+        if (!tabId || !Number.isFinite(ts) || ts <= 0) return null;
+        return { tabId, ts };
+    } catch (_) {
+        return null;
+    }
+}
+
+function isBrowserAudioLockFresh(entry, now){
+    const lock = entry && typeof entry === 'object' ? entry : null;
+    if (!lock) return false;
+    const ts = Number(lock.ts || 0);
+    if (!String(lock.tabId || '').trim() || !Number.isFinite(ts) || ts <= 0) return false;
+    return (Number(now || Date.now()) - ts) <= BROWSER_AUDIO_LOCK_LEASE_MS;
+}
+
+function currentTabOwnsBrowserAudio(){
+    return !!S.browserAudioOwnerTabId && S.browserAudioOwnerTabId === S.tabId;
+}
+
+function syncBrowserAudioLeaseState(){
+    const entry = readBrowserAudioLockEntry();
+    const ownerTabId = isBrowserAudioLockFresh(entry) ? String(entry.tabId || '') : '';
+    S.browserAudioOwnerTabId = ownerTabId;
+    S.browserAudioBlockedByOtherTab = !!(S.browserAudioEnabled && ownerTabId && ownerTabId !== S.tabId);
+    return ownerTabId;
+}
+
+function stopBrowserAudioLeaseHeartbeat(){
+    if (S.browserAudioLeaseTimer) {
+        clearInterval(S.browserAudioLeaseTimer);
+        S.browserAudioLeaseTimer = null;
+    }
+}
+
+function refreshBrowserAudioLease(){
+    const current = readBrowserAudioLockEntry();
+    if (isBrowserAudioLockFresh(current) && String(current.tabId || '') !== S.tabId) {
+        syncBrowserAudioLeaseState();
+        stopBrowserAudioLeaseHeartbeat();
+        return false;
+    }
+    try {
+        localStorage.setItem(BROWSER_AUDIO_LOCK_KEY, JSON.stringify({ tabId: S.tabId, ts: Date.now() }));
+    } catch (_) {
+        return false;
+    }
+    syncBrowserAudioLeaseState();
+    return currentTabOwnsBrowserAudio();
+}
+
+function ensureBrowserAudioLeaseHeartbeat(){
+    if (S.browserAudioLeaseTimer) return;
+    S.browserAudioLeaseTimer = setInterval(() => {
+        if (!currentTabOwnsBrowserAudio()) {
+            stopBrowserAudioLeaseHeartbeat();
+            syncBrowserAudioLeaseState();
+            return;
+        }
+        if (!S.browserAudioEnabled || !S.wsConnected) {
+            releaseBrowserAudioLease();
+            return;
+        }
+        refreshBrowserAudioLease();
+    }, BROWSER_AUDIO_LOCK_HEARTBEAT_MS);
+}
+
+function tryAcquireBrowserAudioLease(){
+    syncBrowserAudioLeaseState();
+    if (!S.browserAudioEnabled) return false;
+    const current = readBrowserAudioLockEntry();
+    if (isBrowserAudioLockFresh(current) && String(current.tabId || '') !== S.tabId) {
+        S.browserAudioBlockedByOtherTab = true;
+        return false;
+    }
+    const owned = refreshBrowserAudioLease();
+    if (owned) ensureBrowserAudioLeaseHeartbeat();
+    return owned;
+}
+
+function releaseBrowserAudioLease(force=false){
+    stopBrowserAudioLeaseHeartbeat();
+    const current = readBrowserAudioLockEntry();
+    const currentOwnerTabId = isBrowserAudioLockFresh(current) ? String(current.tabId || '') : '';
+    if (force || currentOwnerTabId === S.tabId || (!currentOwnerTabId && S.browserAudioOwnerTabId === S.tabId)) {
+        try { localStorage.removeItem(BROWSER_AUDIO_LOCK_KEY); } catch (_) {}
+    }
+    S.browserAudioOwnerTabId = '';
+    S.browserAudioBlockedByOtherTab = false;
+    syncBrowserAudioLeaseState();
+    if (typeof applyMicControlToggles === 'function') applyMicControlToggles();
+}
+
+function stealBrowserAudioLease(){
+    if (!S.browserAudioEnabled || !S.wsConnected) return false;
+    try {
+        localStorage.setItem(BROWSER_AUDIO_LOCK_KEY, JSON.stringify({ tabId: S.tabId, ts: Date.now() }));
+    } catch (_) {
+        return false;
+    }
+    syncBrowserAudioLeaseState();
+    ensureBrowserAudioLeaseHeartbeat();
+    return currentTabOwnsBrowserAudio();
+}
+
+window.addEventListener('storage', (evt) => {
+    if (!evt || evt.key !== BROWSER_AUDIO_LOCK_KEY) return;
+    const wasBlocked = !!S.browserAudioBlockedByOtherTab;
+    syncBrowserAudioLeaseState();
+    if (S.browserAudioBlockedByOtherTab) {
+        if (typeof stopBrowserCapture === 'function') {
+            Promise.resolve(stopBrowserCapture({ releaseLease: false })).catch(() => {});
+        }
+    } else if (wasBlocked && S.browserAudioEnabled && S.wsConnected && typeof ensureBrowserCapture === 'function') {
+        Promise.resolve(ensureBrowserCapture()).catch((err) => {
+            if (typeof reportCaptureFailure === 'function') reportCaptureFailure(err, 'ownership');
+        });
+    }
+    if (typeof applyMicControlToggles === 'function') applyMicControlToggles();
+});
+
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    if (!S.browserAudioEnabled || !S.wsConnected) return;
+    if (currentTabOwnsBrowserAudio()) return;
+    if (!stealBrowserAudioLease()) return;
+    if (typeof ensureBrowserCapture === 'function') {
+        Promise.resolve(ensureBrowserCapture()).catch((err) => {
+            if (typeof reportCaptureFailure === 'function') reportCaptureFailure(err, 'ownership');
+        });
+    }
+    if (typeof applyMicControlToggles === 'function') applyMicControlToggles();
+});
+
+window.addEventListener('pagehide', () => {
+    releaseBrowserAudioLease(true);
+});
+
+window.addEventListener('beforeunload', () => {
+    releaseBrowserAudioLease(true);
+});
+
 function canSearchMusicLibrary(query){
     return String(query||'').trim().length >= MUSIC_LIBRARY_SEARCH_MIN_LEN;
 }
@@ -608,6 +780,57 @@ function mergeChatThreads(serverThreads, cachedThreads){
     return [...merged.values()].sort((a,b)=>Number(b.updated_ts||0)-Number(a.updated_ts||0));
 }
 
+function isRawGatewayChatMessage(message){
+    return !!message && typeof message==='object' && String(message.role||'')==='raw_gateway';
+}
+
+function mergeCachedRawGatewayMessages(serverMessages, cachedMessages){
+    const nextMessages=(Array.isArray(serverMessages)?serverMessages:[]).map(normalizeChatMessage).filter(Boolean);
+    
+    // Collect server message IDs to avoid duplicates
+    const seenIds=new Set(nextMessages.map((message)=>String(message.id||'')).filter(Boolean));
+    
+    const merged=[...nextMessages];
+
+    // Restore cached raw_gateway messages unconditionally (they're ephemeral debug-only data).
+    // Only check: don't duplicate existing server messages by ID.
+    // On reconnect, request_ids may have changed, so we restore all cached debug frames.
+    (Array.isArray(cachedMessages)?cachedMessages:[])
+        .map(normalizeChatMessage)
+        .filter(Boolean)
+        .filter(isRawGatewayChatMessage)
+        .forEach((message)=>{
+            const msgId=String(message.id||'').trim();
+            if(msgId && seenIds.has(msgId)) return; // Skip if message ID already exists
+            
+            merged.push(message);
+            if(msgId) seenIds.add(msgId);
+        });
+
+    return merged.sort((a,b)=>Number(a.ts||0)-Number(b.ts||0));
+}
+
+function mergeCachedRawGatewayThreads(serverThreads, cachedThreads){
+    const cachedById=new Map(
+        (Array.isArray(cachedThreads)?cachedThreads:[])
+            .map(normalizeChatThread)
+            .filter(Boolean)
+            .map((thread)=>[thread.id, thread])
+    );
+
+    return (Array.isArray(serverThreads)?serverThreads:[])
+        .map(normalizeChatThread)
+        .filter(Boolean)
+        .map((thread)=>{
+            const cachedThread=cachedById.get(thread.id);
+            if(!cachedThread) return thread;
+            return Object.assign({}, thread, {
+                messages: mergeCachedRawGatewayMessages(thread.messages, cachedThread.messages),
+            });
+        })
+        .sort((a,b)=>Number(b.updated_ts||0)-Number(a.updated_ts||0));
+}
+
 function persistChatCache(){
     try {
         const payload = {
@@ -635,16 +858,31 @@ function hydrateChatCache(){
     } catch(_) {}
 }
 
-function applyServerChatState(chat, chatThreads, activeChatId){
-    if(Array.isArray(chat)) S.chat = chat.map(normalizeChatMessage).filter(Boolean);
+function applyServerChatState(chat, chatThreads, activeChatId, activeChatThreadId){
+    if(Array.isArray(chat)) S.chat = mergeCachedRawGatewayMessages(chat, S.chat);
     if(Array.isArray(chatThreads)){
-        S.chatThreads = chatThreads
-            .map(normalizeChatThread)
-            .filter(Boolean)
-            .sort((a,b)=>Number(b.updated_ts||0)-Number(a.updated_ts||0));
+        S.chatThreads = mergeCachedRawGatewayThreads(chatThreads, S.chatThreads);
     }
     if(activeChatId) S.activeChatId = String(activeChatId);
+    if(activeChatThreadId!==undefined){
+        S.activeChatThreadId = String(activeChatThreadId||'').trim();
+    }
+    const activeTid = String(S.activeChatThreadId||'').trim();
+    if(activeTid && (S.chatThreads||[]).some(t=>String(t.id||'')===activeTid)){
+        S.selectedChatId = activeTid;
+    } else if(activeChatThreadId!==undefined){
+        // Server explicitly reported no active thread (e.g. after New), so show active session.
+        S.selectedChatId = 'active';
+    }
     if(!S.selectedChatId) S.selectedChatId = 'active';
+    
+    // If we're about to hide the active session which contains raw_gateway (debug) messages,
+    // keep showing active session so debug blocks remain visible.
+    const hasRawGatewayInActive = (Array.isArray(S.chat)) && S.chat.some(m => m && m.role === 'raw_gateway');
+    if(hasRawGatewayInActive && S.selectedChatId !== 'active'){
+        S.selectedChatId = 'active';
+    }
+    
     const selected = String(S.selectedChatId||'active');
     if(selected!=='active' && !(S.chatThreads||[]).some(t=>String(t.id||'')===selected)) S.selectedChatId = 'active';
     persistChatCache();
@@ -656,6 +894,7 @@ function loadUiPrefs(){
     S.continuousMode = readBoolPref(PREF_CONTINUOUS, false);
     S.musicQueueFilter = readStringPref(PREF_MUSIC_QUEUE_FILTER, '');
     S.musicPlaylistFilter = readStringPref(PREF_MUSIC_PLAYLIST_FILTER, '');
+    syncBrowserAudioLeaseState();
 }
 
 function pushUiPrefsToServer(){
@@ -680,11 +919,12 @@ function applyMicControlToggles(){
     const ttsErr=(S.settingActionErrors&&S.settingActionErrors['tts_mute_set'])?S.settingActionErrors['tts_mute_set'].msg:'';
     const browserErr=(S.settingActionErrors&&S.settingActionErrors['browser_audio_set'])?S.settingActionErrors['browser_audio_set'].msg:'';
     const contErr=(S.settingActionErrors&&S.settingActionErrors['continuous_mode_set'])?S.settingActionErrors['continuous_mode_set'].msg:'';
+    const browserLockMsg=S.browserAudioBlockedByOtherTab?'Another tab is using browser audio':'';
     const ttsLabel=document.getElementById('ttsMuteLabel');
     const browserLabel=document.getElementById('browserAudioLabel');
     const contLabel=document.getElementById('continuousModeLabel');
     if(ttsLabel) ttsLabel.textContent='Mute TTS output'+(ttsErr?' ⚠ '+ttsErr:'');
-    if(browserLabel) browserLabel.textContent='Browser audio streaming'+(browserErr?' ⚠ '+browserErr:'');
+    if(browserLabel) browserLabel.textContent='Browser audio streaming'+(browserErr?' ⚠ '+browserErr:(browserLockMsg?' - '+browserLockMsg:''));
     if(contLabel) contLabel.textContent='Continuous mode'+(contErr?' ⚠ '+contErr:'');
 }
 
@@ -872,6 +1112,7 @@ function getPage(){
     const h=location.hash.replace('#','');
     if(h==='/music') return 'music';
     if(h==='/recordings') return 'recordings';
+    if(h==='/files') return 'files';
     return 'home';
 }
 function navigate(p){ location.hash='#/'+p; }
