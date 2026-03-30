@@ -52,6 +52,7 @@ class MusicRouter:
             "save_playlist": self._handle_save_playlist,
             "list_playlists": self._handle_list_playlists,
             "add_songs": self._handle_add_songs,
+            "play_playlist": self._handle_play_playlist,
             
             # Library management
             "update_library": self._handle_update_library,

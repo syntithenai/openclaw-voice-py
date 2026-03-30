@@ -1461,7 +1461,7 @@ class QuickAnswerClient:
                 fast_match = self.music_router.parser.parse(user_query)
             except Exception:
                 fast_match = None
-            if fast_match and fast_match[0] == "load_playlist":
+            if fast_match and fast_match[0] in ("load_playlist", "play_playlist"):
                 voice_music_action_id = self._new_voice_music_action_id()
                 voice_playlist_name = str((fast_match[1] or {}).get("name", "") or "").strip()
                 await self._emit_music_action_pending(

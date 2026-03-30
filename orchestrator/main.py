@@ -2332,6 +2332,16 @@ async def run_orchestrator() -> None:
                     logger.warning("Web UI music_list_playlists: %s", exc)
                     return []
 
+            async def _ui_music_list_genres(limit: int, client_id: str) -> list[dict[str, Any]]:
+                if not music_manager:
+                    return []
+                try:
+                    safe_limit = max(1, min(100, int(limit or 100)))
+                    return await music_manager.list_genres_for_ui(limit=safe_limit)
+                except Exception as exc:
+                    logger.warning("Web UI music_list_genres: %s", exc)
+                    return []
+
             def _push_schedule_state_now(reason: str = "") -> None:
                 if not web_service or not timer_manager:
                     return
@@ -2455,6 +2465,7 @@ async def run_orchestrator() -> None:
                 on_music_delete_playlist=_ui_music_delete_playlist,
                 on_music_search_library=_ui_music_search_library,
                 on_music_list_playlists=_ui_music_list_playlists,
+                on_music_list_genres=_ui_music_list_genres,
                 on_get_music_state=_ui_get_music_state_snapshot,
                 on_recordings_list=_ui_recordings_list,
                 on_recording_get=_ui_recording_get,

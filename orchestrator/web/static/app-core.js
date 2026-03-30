@@ -50,6 +50,7 @@ const S = {
         musicQueueFilter:'', musicPlaylistFilter:'', musicQueueSelectionByIds:{}, musicQueueLastCheckedId:null,
         musicAddMode:false, musicAddQuery:'', musicAddSelection:{}, musicAddLastCheckedFile:'', musicAddHasSearched:false,
         musicAddSearchPending:false, musicAddPendingQuery:'',
+        musicGenreCloud:[], musicGenreCloudPending:false,
         musicNewPlaylistName:'',
             musicPlaylistModalOpen:false, musicPlaylistModalMode:'', musicPlaylistModalName:'', musicPlaylistModalOriginalName:'',
             musicPlaylistModalAction:'', musicPlaylistModalActionName:'',
@@ -1113,11 +1114,7 @@ function getHashRouteInfo(){
     const qIdx = raw.indexOf('?');
     const route = qIdx >= 0 ? raw.slice(0, qIdx) : raw;
     const query = qIdx >= 0 ? raw.slice(qIdx + 1) : '';
-        return {
-            route,
-            query,
-        };
-    }
+    return {
         route: route || '/',
         params: new URLSearchParams(query),
     };
@@ -1152,7 +1149,12 @@ function applyFilesRouteFromHash(){
     if(S.page !== 'files') return;
     const path = getFilesRoutePathFromHash();
     if(!path) return;
-    if(typeof window.fmOpenFile === 'function'){
+    // Skip if already showing this path
+    const fm = S.fileManager;
+    if(fm && (fm.selectedFilePath === path || fm.selectedFolderPath === path)) return;
+    if(typeof window.fmNavigatePath === 'function'){
+        void window.fmNavigatePath(path);
+    } else if(typeof window.fmOpenFile === 'function'){
         window.fmOpenFile(path, { keepHash: true });
     }
 }

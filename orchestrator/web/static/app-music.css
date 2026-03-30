@@ -2,3 +2,23 @@
 .mermaidchart-label { font-size:0.68rem; letter-spacing:0.08em; text-transform:uppercase; color:#9aa3c0; margin-bottom:0.65em; }
 .mermaidchart-shell svg { display:block; max-width:100%; height:auto; margin:0 auto; }
 .mermaidchart-error { color:#fca5a5; }
+
+.music-genre-cloud-canvas {
+	position: relative;
+	min-height: 270px;
+	max-height: 360px;
+	overflow: hidden;
+	border: 1px dashed rgba(75, 85, 99, 0.7);
+	border-radius: 12px;
+	background:
+		radial-gradient(circle at center, rgba(59, 130, 246, 0.12), rgba(17, 24, 39, 0.08) 52%, rgba(17, 24, 39, 0.01) 75%),
+		radial-gradient(circle at center, rgba(156, 163, 175, 0.1) 1px, transparent 1px);
+	background-size: auto, 16px 16px;
+}
+
+.music-genre-tag {
+	position: absolute;
+	transform: translate(-50%, -50%);
+	white-space: nowrap;
+	line-height: 1.2;
+}

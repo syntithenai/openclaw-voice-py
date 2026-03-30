@@ -11,6 +11,11 @@ def test_stop_playing_with_still_did_not_work_clause_matches_stop() -> None:
     assert parser.parse("stop playing still didn't work") == ("stop", {})
 
 
+def test_id_like_you_to_stop_playing_matches_stop() -> None:
+    parser = MusicFastPathParser()
+    assert parser.parse("I'd like you to stop playing") == ("stop", {})
+
+
 def test_stop_transcript_maps_to_stop() -> None:
     parser = MusicFastPathParser()
     assert parser.parse("stop transcript") == ("stop", {})

@@ -196,6 +196,7 @@ class EmbeddedVoiceWebService:
         self._on_music_delete_playlist: Callable[[str, str], Awaitable[None]] | None = None
         self._on_music_search_library: Callable[[str, str], Awaitable[list[dict[str, Any]]]] | None = None
         self._on_music_list_playlists: Callable[[str], Awaitable[list[str]]] | None = None
+        self._on_music_list_genres: Callable[[int, str], Awaitable[list[dict[str, Any]]]] | None = None
         self._on_get_music_state: Callable[[], Awaitable[tuple[dict[str, Any], list[dict[str, Any]]]]] | None = None
         self._on_recordings_list: Callable[[str], Awaitable[list[dict[str, Any]]]] | None = None
         self._on_recording_get: Callable[[str, str], Awaitable[dict[str, Any] | None]] | None = None
@@ -1139,6 +1140,7 @@ class EmbeddedVoiceWebService:
         on_music_delete_playlist: Callable[[str, str], Awaitable[None]] | None = None,
         on_music_search_library: Callable[[str, str], Awaitable[list[dict[str, Any]]]] | None = None,
         on_music_list_playlists: Callable[[str], Awaitable[list[str]]] | None = None,
+        on_music_list_genres: Callable[[int, str], Awaitable[list[dict[str, Any]]]] | None = None,
         on_get_music_state: Callable[[], Awaitable[tuple[dict[str, Any], list[dict[str, Any]]]]] | None = None,
         on_recordings_list: Callable[[str], Awaitable[list[dict[str, Any]]]] | None = None,
         on_recording_get: Callable[[str, str], Awaitable[dict[str, Any] | None]] | None = None,
@@ -1188,6 +1190,8 @@ class EmbeddedVoiceWebService:
             self._on_music_search_library = on_music_search_library
         if on_music_list_playlists is not None:
             self._on_music_list_playlists = on_music_list_playlists
+        if on_music_list_genres is not None:
+            self._on_music_list_genres = on_music_list_genres
         if on_get_music_state is not None:
             self._on_get_music_state = on_get_music_state
         if on_recordings_list is not None:
@@ -1923,6 +1927,37 @@ class EmbeddedVoiceWebService:
                 })
             except Exception as exc:
                 logger.warning("music_list_playlists handler error: %s", exc)
+            return
+
+        if msg_type == "music_list_genres" and self._on_music_list_genres:
+            try:
+                limit = int(payload.get("limit", 100))
+            except Exception:
+                limit = 100
+            limit = max(1, min(100, limit))
+            try:
+                genres = await self._on_music_list_genres(limit, client_id)
+                out = [
+                    {
+                        "genre": str((item or {}).get("genre") or "").strip(),
+                        "count": int((item or {}).get("count") or 0),
+                    }
+                    for item in (genres or [])
+                    if str((item or {}).get("genre") or "").strip()
+                ]
+                await _send_ws_json({
+                    "type": "music_genre_cloud",
+                    "genres": out,
+                    "limit": limit,
+                })
+            except Exception as exc:
+                logger.warning("music_list_genres handler error: %s", exc)
+                await _send_ws_json({
+                    "type": "music_genre_cloud",
+                    "genres": [],
+                    "limit": limit,
+                    "error": str(exc),
+                })
             return
 
         if msg_type == "timer_cancel" and self._on_timer_cancel:

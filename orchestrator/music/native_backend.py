@@ -125,6 +125,7 @@ class _NativeMusicBackend:
         self._startup_index_lock = asyncio.Lock()
         self._startup_index_task: asyncio.Task[None] | None = None
         self._indexing_active = False
+        self.command_lock = asyncio.Lock()
         # Single persistent background task that watches the current player proc
         # and advances the queue when it exits naturally.
         self._auto_advance_task: asyncio.Task[None] | None = None
@@ -810,14 +811,17 @@ class NativeMusicConnection:
         return self._connected
 
     async def send_command(self, command: str, timeout: float | None = None) -> Dict[str, str]:
-        return await _BACKEND.execute(command, timeout)
+        async with _BACKEND.command_lock:
+            return await _BACKEND.execute(command, timeout)
 
     async def send_command_list(self, send_cmd: str = "", timeout: float | None = None) -> List[Dict[str, str]]:
-        return await _BACKEND.execute_list(send_cmd, timeout)
+        async with _BACKEND.command_lock:
+            return await _BACKEND.execute_list(send_cmd, timeout)
 
     async def send_command_batch(self, commands: List[str], timeout: float | None = None) -> None:
-        for command in commands:
-            await _BACKEND.execute(command, timeout)
+        async with _BACKEND.command_lock:
+            for command in commands:
+                await _BACKEND.execute(command, timeout)
 
 
 class NativeMusicClientPool:

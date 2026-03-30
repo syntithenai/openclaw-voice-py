@@ -164,6 +164,53 @@ def test_loop_aborts_when_user_stopped(monkeypatch: pytest.MonkeyPatch) -> None:
         backend.player.output_route = "local"
 
 
+@pytest.mark.asyncio
+async def test_connection_serializes_overlapping_load_and_play_commands(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("OPENCLAW_WORKSPACE_DIR", str(tmp_path))
+    backend = music_client._NativeMusicBackend()
+    conn = music_client.NativeMusicConnection("", 0)
+    await conn.connect()
+
+    stop_entered = asyncio.Event()
+    release_stop = asyncio.Event()
+    played_files: list[str] = []
+
+    async def fake_stop() -> None:
+        stop_entered.set()
+        await release_stop.wait()
+
+    async def fake_play(file_uri: str, seek_s: int = 0) -> bool:
+        del seek_s
+        played_files.append(file_uri)
+        return True
+
+    monkeypatch.setattr(music_client, "_BACKEND", backend)
+    monkeypatch.setattr(backend.player, "stop", fake_stop)
+    monkeypatch.setattr(backend.player, "play", fake_play)
+    monkeypatch.setattr(backend.playlists, "read_playlist", lambda name: ["new-song.mp3"])
+
+    backend.queue = [music_client.QueueItem(file="old-song.mp3", id=1)]
+    backend.current_pos = 0
+    backend.state = "play"
+
+    load_task = asyncio.create_task(conn.send_command('load "Roadtrip"'))
+    await asyncio.wait_for(stop_entered.wait(), timeout=1.0)
+
+    play_task = asyncio.create_task(conn.send_command("play 0"))
+    await asyncio.sleep(0)
+    assert not play_task.done()
+
+    release_stop.set()
+    await asyncio.gather(load_task, play_task)
+
+    assert [item.file for item in backend.queue] == ["new-song.mp3"]
+    assert backend.current_pos == 0
+    assert played_files == ["new-song.mp3"]
+
+
 def test_loop_handles_seekcur_race(monkeypatch: pytest.MonkeyPatch) -> None:
     """Loop must skip advance when proc was replaced by seekcur, then advance for the NEW proc."""
     backend = music_client._BACKEND

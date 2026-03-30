@@ -25,8 +25,69 @@ const VirtualScroll = (() => {
   };
 })();
 
+function buildMusicGenreCloudHtml(genres, pending){
+  const list=(Array.isArray(genres)?genres:[])
+    .map(item=>({
+      genre:String((item&&item.genre)||'').trim(),
+      count:Math.max(0, Number((item&&item.count)||0)||0),
+    }))
+    .filter(item=>item.genre)
+    .sort((a,b)=>{
+      if(b.count!==a.count) return b.count-a.count;
+      return a.genre.localeCompare(b.genre);
+    })
+    .slice(0,100);
+
+  if(!list.length){
+    return '<div class="music-genre-cloud mt-3 rounded-xl border border-gray-800 bg-gray-900/40 px-3 py-4">'
+      +(pending
+          ? '<p class="text-xs text-gray-400 inline-flex items-center gap-2"><span class="inline-block w-3 h-3 border-2 border-gray-500 border-t-transparent rounded-full animate-spin"></span>Loading genres…</p>'
+        : '<p class="text-xs text-gray-500">No genres available</p>')
+      +'</div>';
+  }
+
+  const maxCount=Math.max(...list.map(x=>x.count));
+  const minCount=Math.min(...list.map(x=>x.count));
+  const tags=list.map((item,idx)=>{
+    const weight=maxCount===minCount ? 1 : (item.count-minCount)/(maxCount-minCount);
+    const angleDeg=(idx*137.5)%360;
+    const angleRad=(angleDeg*Math.PI)/180;
+    const radius=idx===0 ? 0 : Math.min(45, 8 + Math.sqrt(idx)*6.5);
+    const x=Math.max(5, Math.min(95, 50 + (Math.cos(angleRad)*radius)));
+    const y=Math.max(9, Math.min(91, 50 + (Math.sin(angleRad)*radius*0.72)));
+    const size=(0.78 + weight*1.05).toFixed(2);
+    const alpha=(0.72 + weight*0.28).toFixed(2);
+    return '<button type="button" data-action="music-add-genre-search" data-genre="'+esc(item.genre)+'"'
+      +' class="music-genre-tag rounded-full border border-gray-700 bg-gray-800/80 px-3 py-1 text-gray-100 hover:bg-blue-800/60 hover:border-blue-500 transition-colors"'
+      +' style="left:'+x+'%;top:'+y+'%;font-size:'+size+'rem;opacity:'+alpha+';z-index:'+(200-idx)+'"'
+      +' title="Search '+esc(item.genre)+'">'
+      +esc(item.genre)
+      +'<span class="ml-1 text-[0.7em] text-gray-300">'+item.count+'</span>'
+      +'</button>';
+  }).join('');
+
+  return '<div class="music-genre-cloud mt-3 rounded-xl border border-gray-800 bg-gray-900/40 px-3 py-3">'
+    +'<div class="flex items-center justify-between gap-2 mb-2">'
+      +'<p class="text-xs uppercase tracking-wide text-gray-400">Browse Genres</p>'
+      +'<p class="text-[11px] text-gray-500">Top '+list.length+' by track count</p>'
+    +'</div>'
+    +'<div class="music-genre-cloud-canvas">'+tags+'</div>'
+  +'</div>';
+}
+
 function renderMusicPage(main){
   main.dataset.page='music';
+    const activeInput = document.activeElement;
+    const activeInputId = activeInput && activeInput.id
+      ? String(activeInput.id)
+      : '';
+    const preserveInputFocus = activeInputId === 'musicPlaylistSearch' || activeInputId === 'musicQueueSearch' || activeInputId === 'musicAddSearch';
+    const preserveSelStart = preserveInputFocus && typeof activeInput.selectionStart === 'number'
+      ? activeInput.selectionStart
+      : null;
+    const preserveSelEnd = preserveInputFocus && typeof activeInput.selectionEnd === 'number'
+      ? activeInput.selectionEnd
+      : null;
     const m=S.music, q=S.musicQueue||[];
     m.state=normalizeMusicState(m.state);
     const pendingMusicCount=Object.keys(S.pendingMusicActions||{}).length;
@@ -61,6 +122,8 @@ function renderMusicPage(main){
         const canSearch=canSearchMusicLibrary(S.musicAddQuery);
         const searchPending=!!S.musicAddSearchPending;
         const addPending=Object.values(S.pendingMusicActions||{}).some(item=>String((item&&item.type)||'')==='music_add_files');
+    const addQueryTrimmed=String(S.musicAddQuery||'').trim();
+    const showGenreCloud=!addQueryTrimmed;
     const addRows=(S.musicLibraryResults||[]).map(item=>{
       const file=String(item.file||'');
       const checked=!!S.musicAddSelection[file];
@@ -90,6 +153,7 @@ function renderMusicPage(main){
                                         +'<button id="musicAddSearchSubmit" data-action="music-add-search-submit" class="px-3 py-2 rounded-lg text-sm bg-blue-700 hover:bg-blue-600 transition-colors" '+((canSearch && !searchPending) ? '' : 'disabled style="opacity:.5;cursor:not-allowed"')+'>'+(searchPending?'Searching…':'Search')+'</button>'
                 +'</div>'
                                 +(canSearch ? '' : '<p id="musicAddMinHint" class="text-xs text-gray-500 mt-1">Enter at least '+MUSIC_LIBRARY_SEARCH_MIN_LEN+' letters to search</p>')
+                +(showGenreCloud ? buildMusicGenreCloudHtml(S.musicGenreCloud, !!S.musicGenreCloudPending) : '')
       +'</div>'
       +(addRows
             ? '<div class="px-2 flex items-center justify-end gap-1 text-xs text-gray-400">'
@@ -256,6 +320,16 @@ function renderMusicPage(main){
           +'</div>'
         : '')
   +'</div>';
+
+  if (preserveInputFocus && activeInputId) {
+    const restoredInput = document.getElementById(activeInputId);
+    if (restoredInput) {
+      restoredInput.focus();
+      if (preserveSelStart !== null && preserveSelEnd !== null) {
+        restoredInput.setSelectionRange(preserveSelStart, preserveSelEnd);
+      }
+    }
+  }
   
   // Set up virtual scroll for large queues (progressive rendering as user scrolls)
   setTimeout(() => {

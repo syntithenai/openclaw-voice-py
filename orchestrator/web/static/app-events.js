@@ -321,8 +321,23 @@ document.addEventListener('click', e => {
         S.musicAddHasSearched = false;
         S.musicAddSearchPending = false;
         S.musicAddPendingQuery = '';
+        S.musicGenreCloudPending = true;
         sendAction({type:'music_list_playlists'});
+        sendAction({type:'music_list_genres', limit: 100});
         renderMusicPage(document.getElementById('main'));
+        return;
+    }
+
+    const addGenreTagBtn = target.closest('[data-action="music-add-genre-search"]');
+    if (addGenreTagBtn && !addGenreTagBtn.disabled) {
+        const genre = String(addGenreTagBtn.dataset.genre || '').trim();
+        if (!genre) return;
+        S.musicAddQuery = genre;
+        S.musicAddHasSearched = false;
+        S.musicAddSearchPending = false;
+        S.musicAddPendingQuery = '';
+        renderMusicPage(document.getElementById('main'));
+        submitMusicLibrarySearch();
         return;
     }
 
@@ -729,8 +744,12 @@ function performQueuedMusicAction(actionType, actionName=''){
     if(action === 'music_load_playlist'){
         if(!name) return;
         console.log(`🎵 Loading playlist: "${name}"`);
+        // Reset playlist filter after a load so the full playlist list is visible.
+        S.musicPlaylistFilter = '';
+        writeStringPref(PREF_MUSIC_PLAYLIST_FILTER, S.musicPlaylistFilter);
         S.music.loaded_playlist = name;
         sendMusicAction('music_load_playlist', {name});
+        if(S.page==='music') renderMusicPage(document.getElementById('main'));
         console.log(`✓ Sent music_load_playlist action for "${name}"`);
         return;
     }
@@ -739,18 +758,31 @@ function performQueuedMusicAction(actionType, actionName=''){
     }
 }
 
+function renderMusicPagePreservingInput(inputId){
+    const input = document.getElementById(inputId);
+    const focused = !!input && document.activeElement === input;
+    const selStart = input ? input.selectionStart : null;
+    const selEnd = input ? input.selectionEnd : null;
+    renderMusicPage(document.getElementById('main'));
+    if(!focused) return;
+    const inputAfterRender = document.getElementById(inputId);
+    if(!inputAfterRender) return;
+    inputAfterRender.focus();
+    if(selStart !== null) inputAfterRender.setSelectionRange(selStart, selEnd);
+}
+
 function handleTextInputChange(t){
     if(!t) return;
     if(t.id==='musicQueueSearch'){
         S.musicQueueFilter = String(t.value||'');
         writeStringPref(PREF_MUSIC_QUEUE_FILTER, S.musicQueueFilter);
-        renderMusicPage(document.getElementById('main'));
+        renderMusicPagePreservingInput('musicQueueSearch');
         return;
     }
     if(t.id==='musicPlaylistSearch'){
         S.musicPlaylistFilter = String(t.value||'');
         writeStringPref(PREF_MUSIC_PLAYLIST_FILTER, S.musicPlaylistFilter);
-        renderMusicPage(document.getElementById('main'));
+        renderMusicPagePreservingInput('musicPlaylistSearch');
         return;
     }
     if(t.id==='chatThreadSearch'){
@@ -1432,6 +1464,32 @@ function extractReferencedPathsFromEvents(events){
     return paths;
 }
 
+function extractReferencedPathsFromText(text){
+    const paths=[];
+    const seen=new Set();
+    const add=(val)=>{
+        const v=String(val||'').trim();
+        if(!v || seen.has(v)) return;
+        if(!v.includes('/')) return;
+        seen.add(v);
+        paths.push(v);
+    };
+    const raw=String(text||'');
+    // Markdown links [text](path) where path is not a web URL and looks like a file
+    const mdLinkRe=/\[([^\]]*)\]\(([^)\s#?]+)\)/g;
+    let m;
+    while((m=mdLinkRe.exec(raw))!==null){
+        const url=m[2];
+        if(/^https?:\/\//i.test(url)) continue;
+        if(!url.includes('/')) continue;
+        if(/\.[a-zA-Z0-9]{1,10}$/.test(url) || url.startsWith('/')) add(url);
+    }
+    // Backtick spans containing absolute file paths like `/some/path/file.ext`
+    const btRe=/`(\/[^`\s]+\.[a-zA-Z0-9]{1,10})`/g;
+    while((m=btRe.exec(raw))!==null) add(m[1]);
+    return paths;
+}
+
 function collateChatMessages(msgs){
     const out=[];
     let activeBucket=null;
@@ -1452,6 +1510,13 @@ function collateChatMessages(msgs){
         const validStreams=activeBucket.streams.filter(s=>String(s.text||'').length>0);
         const combinedStreamText=validStreams.map(s=>String(s.text||'')).join('');
         const referencedFiles=extractReferencedPathsFromEvents(activeBucket.events);
+        // Also extract file paths mentioned directly in the response text
+        const responseCandidateTexts=[combinedStreamText, ...activeBucket.finals.map(f=>String(f.text||'')+' '+String(f.full_text||''))];
+        for(const t of responseCandidateTexts){
+            for(const p of extractReferencedPathsFromText(t)){
+                if(!referencedFiles.includes(p)) referencedFiles.push(p);
+            }
+        }
         if(validStreams.length>0 && activeBucket.finals.length===0){
             const extra=referencedFiles.length?{referenced_files:referencedFiles, written_files:referencedFiles}:{};
             out.push({
@@ -1514,6 +1579,16 @@ function collateChatMessages(msgs){
             const segKind=String((m&&m.segment_kind)||'final').toLowerCase();
             if(segKind==='stream') bucket.streams.push(m);
             else bucket.finals.push(m);
+            return;
+        }
+        // Handle bare tool/lifecycle events (with name/phase but no role field)
+        if(!role && (m.name || m.phase)){
+            const bucket=ensureActiveBucket(reqId);
+            const toolName=String(m.name||'tool').toLowerCase();
+            const isLifecycle=toolName==='lifecycle' || m.phase==='start' && !m.toolCallId;
+            bucket.steps.push(m);
+            if(isLifecycle) bucket.events.push({kind:'lifecycle',payload:m});
+            else bucket.events.push({kind:'tool',payload:m});
             return;
         }
         flushBucket();
@@ -2519,14 +2594,16 @@ function mkBubble(m){
             b.appendChild(summaryBody);
         }
 
-        const referencedFiles=(Array.isArray(m.referenced_files)?m.referenced_files:m.written_files)?.filter(fp=>String(fp||'').trim()) || [];
+const referencedFiles=(Array.isArray(m.referenced_files)?m.referenced_files:m.written_files)?.filter(fp=>String(fp||'').trim()) || [];
         if(referencedFiles.length){
             const filesDiv=document.createElement('div');
             filesDiv.className='mt-2 flex flex-wrap gap-1';
             for(const fp of referencedFiles){
                 const normalizedFp = normalizeFilesPath(fp);
                 if(!normalizedFp) continue;
+                // Check if file exists before showing chip
                 const href = buildFilesRouteHref(normalizedFp);
+                if(!href) continue;  // Skip if path normalization failed
                 const fname=normalizedFp.split('/').filter(Boolean).pop()||normalizedFp;
                 const link=document.createElement('a');
                 link.className='inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs bg-gray-800 border border-gray-600 hover:bg-gray-700 text-blue-300 hover:text-blue-200 transition-colors';
@@ -2537,7 +2614,7 @@ function mkBubble(m){
                 link.textContent='\uD83D\uDCC4 '+fname;
                 filesDiv.appendChild(link);
             }
-            b.appendChild(filesDiv);
+            if(filesDiv.children.length>0) b.appendChild(filesDiv);
         }
 
         if(!isQuickAnswer){

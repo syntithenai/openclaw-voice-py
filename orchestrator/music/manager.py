@@ -7,6 +7,7 @@ import os
 import sqlite3
 import shutil
 import time
+from pathlib import Path
 from collections import defaultdict, deque
 from typing import Dict, List, Optional
 from .native_client import NativeMusicClientPool
@@ -1317,6 +1318,55 @@ class MusicManager:
             return []
         except Exception as e:
             logger.error(f"Failed UI library search: {e}")
+            return []
+
+    async def list_genres_for_ui(self, limit: int = 100) -> List[Dict[str, int | str]]:
+        """Return top genres with track counts for the Add Songs genre cloud."""
+        safe_limit = max(1, min(100, int(limit or 100)))
+
+        def _query() -> List[Dict[str, int | str]]:
+            cwd = Path.cwd().resolve()
+            workspace = Path(os.getenv("OPENCLAW_WORKSPACE_DIR", str(cwd))).expanduser().resolve()
+            configured_db = str(os.getenv("MEDIA_INDEX_DB_PATH", "")).strip()
+            db_path = (
+                Path(configured_db).expanduser().resolve()
+                if configured_db
+                else (workspace / ".media" / "library.sqlite3").resolve()
+            )
+            if not db_path.exists():
+                return []
+
+            conn = sqlite3.connect(str(db_path))
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        MIN(TRIM(genre)) AS genre,
+                        COUNT(*) AS track_count
+                    FROM tracks
+                    WHERE genre IS NOT NULL
+                      AND TRIM(genre) != ''
+                    GROUP BY LOWER(TRIM(genre))
+                    ORDER BY track_count DESC, genre COLLATE NOCASE ASC
+                    LIMIT ?
+                    """,
+                    (safe_limit,),
+                ).fetchall()
+                return [
+                    {
+                        "genre": str(row[0] or "").strip(),
+                        "count": int(row[1] or 0),
+                    }
+                    for row in rows
+                    if str(row[0] or "").strip()
+                ]
+            finally:
+                conn.close()
+
+        try:
+            return await asyncio.to_thread(_query)
+        except Exception as exc:
+            logger.warning("Failed genre cloud query: %s", exc)
             return []
     
     # ========== Playlist Management ==========

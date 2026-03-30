@@ -355,6 +355,13 @@ function handleMsg(msg){
             if(Array.isArray(msg.playlists)) S.musicPlaylists = msg.playlists;
             if(S.page==='music') renderMusicPage(document.getElementById('main'));
             break;
+        case 'music_genre_cloud':
+            S.musicGenreCloudPending = false;
+            if(Array.isArray(msg.genres)){
+                S.musicGenreCloud = msg.genres;
+            }
+            if(S.page==='music' && S.musicAddMode) renderMusicPage(document.getElementById('main'));
+            break;
         case 'timer_action_ack':
             if(msg.action){
                 const key=String(msg.action)+':'+String(msg.id||'');

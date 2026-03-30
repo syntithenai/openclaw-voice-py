@@ -165,6 +165,12 @@ class MusicFastPathParser:
             normalized,
             flags=re.IGNORECASE,
         )
+        normalized = re.sub(
+            rf"^i(?:\s+would|\'d)\s+like\s+you\s+to\s+(?:please\s+)?(?={self.COMMAND_START_HINT}\b)",
+            "",
+            normalized,
+            flags=re.IGNORECASE,
+        )
 
         # Normalize colloquial playback phrasing to the existing command grammar.
         normalized = re.sub(r"^put\s+on\s+", "play ", normalized, flags=re.IGNORECASE)
@@ -364,7 +370,7 @@ class MusicFastPathParser:
             playlist = re.sub(r"^the\s+", "", playlist, flags=re.IGNORECASE).strip()
             return playlist
         
-        # Load playlist
+        # Load/play playlist — "play X playlist" auto-starts playback; "load/switch/open" just loads
         if "playlist" in text or text.startswith("load ") or text.startswith("switch ") or text.startswith("open "):
             for regex in self.load_playlist_regexes:
                 match = regex.match(text)
@@ -372,9 +378,9 @@ class MusicFastPathParser:
                     continue
                 playlist = _clean_playlist_name(match.group(1))
                 if playlist:
+                    if text.lower().startswith("play "):
+                        return ("play_playlist", {"name": playlist})
                     return ("load_playlist", {"name": playlist})
-        
-        # Save playlist
         if text.startswith("save playlist") or text.startswith("save as"):
             match = self.save_playlist_regex.match(text)
             if match:
