@@ -784,6 +784,55 @@ class EmbeddedVoiceWebService:
         )
         return True
 
+    def reload_chat_from_message(self, message_id: str, thread_id: str | None = None) -> str | None:
+        target_id = str(message_id or "").strip()
+        if not target_id:
+            return None
+        selected_tid = str(thread_id or "").strip()
+        if selected_tid and selected_tid != "active":
+            selected = next(
+                (t for t in self._chat_threads if str(t.get("id", "")).strip() == selected_tid),
+                None,
+            )
+            if not selected:
+                return None
+            messages = selected.get("messages")
+            self._chat_messages = list(messages[-self.chat_history_limit:]) if isinstance(messages, list) else []
+            self._active_chat_id = "active"
+            self._active_chat_thread_id = selected_tid
+        match_index = next(
+            (
+                index
+                for index, message in enumerate(self._chat_messages)
+                if str(message.get("id", "")).strip() == target_id
+            ),
+            -1,
+        )
+        if match_index < 0:
+            return None
+        target_message = self._chat_messages[match_index]
+        if str(target_message.get("role", "")).lower() != "user":
+            return None
+        text = str(target_message.get("text", "")).strip()
+        if not text:
+            return None
+        self._chat_messages = list(self._chat_messages[: match_index + 1])
+        self._active_chat_id = "active"
+        self._upsert_active_chat_thread()
+        self._persist_chat_state()
+        asyncio.create_task(
+            self.broadcast(
+                {
+                    "type": "chat_reset",
+                    "active_chat_id": self._active_chat_id,
+                    "active_chat_thread_id": self._active_chat_thread_id,
+                    "chat": list(self._chat_messages),
+                    "chat_threads": list(self._chat_threads),
+                }
+            )
+        )
+        return text
+
     def select_chat_thread(self, thread_id: str) -> bool:
         tid = str(thread_id or "").strip()
         if not tid or tid == "active":
@@ -2125,6 +2174,50 @@ class EmbeddedVoiceWebService:
 
         if msg_type == "chat_clear_all":
             self.clear_chat_threads()
+            return
+
+        if msg_type == "chat_reload" and self._on_chat_text:
+            message_id = str(payload.get("message_id", "")).strip()
+            client_msg_id = payload.get("client_msg_id")
+            thread_id = str(payload.get("thread_id", "")).strip()
+            if not message_id:
+                return
+            reload_text = self.reload_chat_from_message(message_id, thread_id)
+            if not reload_text:
+                try:
+                    await _send_ws_json(
+                        {
+                            "type": "chat_text_ack",
+                            "client_msg_id": client_msg_id,
+                            "ok": False,
+                            "error": "Unable to reload that message.",
+                        }
+                    )
+                except Exception:
+                    pass
+                return
+            try:
+                await self._on_chat_text(reload_text, client_id)
+                await _send_ws_json(
+                    {
+                        "type": "chat_text_ack",
+                        "client_msg_id": client_msg_id,
+                        "ok": True,
+                    }
+                )
+            except Exception as exc:
+                logger.warning("chat_reload handler error: %s", exc)
+                try:
+                    await _send_ws_json(
+                        {
+                            "type": "chat_text_ack",
+                            "client_msg_id": client_msg_id,
+                            "ok": False,
+                            "error": str(exc),
+                        }
+                    )
+                except Exception:
+                    pass
             return
 
         logger.debug("Web UI: unhandled action '%s' from %s", msg_type, client_id)

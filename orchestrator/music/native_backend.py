@@ -422,30 +422,35 @@ class _NativeMusicBackend:
                 await asyncio.sleep(0.1)
                 continue
 
-            # Guards: if anything changed while we waited, loop back and recheck.
-            if self.state != "play":
-                continue
-            if self.current_pos != pos:
-                continue
-            if self.player._proc is not proc:
-                continue
-            if not self.queue:
-                self.current_pos = -1
-                self._set_state("stop")
-                continue
+            # Acquire the command lock so this advance is serialized with all
+            # other queue/playback mutations (including status-poll fallback
+            # advances).  Using `continue` inside `async with` is valid: the
+            # context manager exits before the loop restarts.
+            async with self.command_lock:
+                # Guards: re-check under the lock since time passed during wait.
+                if self.state != "play":
+                    continue
+                if self.current_pos != pos:
+                    continue
+                if self.player._proc is not proc:
+                    continue
+                if not self.queue:
+                    self.current_pos = -1
+                    self._set_state("stop")
+                    continue
 
-            next_pos = (pos + 1) % len(self.queue)
-            logger.debug(
-                "⏭ Auto-advancing queue: pos %d → %d (queue length %d)",
-                pos,
-                next_pos,
-                len(self.queue),
-            )
-            try:
-                await self._play_pos(next_pos)
-            except Exception as exc:
-                logger.exception("Local auto-advance loop failed to start next track: %s", exc)
-                self._set_state("stop")
+                next_pos = (pos + 1) % len(self.queue)
+                logger.debug(
+                    "⏭ Auto-advancing queue: pos %d → %d (queue length %d)",
+                    pos,
+                    next_pos,
+                    len(self.queue),
+                )
+                try:
+                    await self._play_pos(next_pos)
+                except Exception as exc:
+                    logger.exception("Local auto-advance loop failed to start next track: %s", exc)
+                    self._set_state("stop")
 
     def _on_auto_advance_done(self, task: asyncio.Task[None]) -> None:
         if self._auto_advance_task is task:
@@ -479,6 +484,10 @@ class _NativeMusicBackend:
         pos = max(0, min(pos, len(self.queue) - 1))
         self.current_pos = pos
         self.elapsed_anchor_value = float(seek_s)
+        # Reset the anchor timestamp now so elapsed_now() stays near seek_s
+        # during the stop()→probe_async transition window.  _set_state("play")
+        # will overwrite this once the subprocess has actually started.
+        self.elapsed_anchor_ts = time.monotonic()
         ok = await self.player.play(self.queue[pos].file, seek_s=seek_s)
         if ok:
             self._sequential_failed_plays = 0
@@ -837,11 +846,11 @@ class NativeMusicClientPool:
             _BACKEND.start_startup_index()
         except Exception:
             pass
-            # Start the persistent queue-advance loop (idempotent).
-            try:
-                _BACKEND.start_auto_advance_loop()
-            except Exception:
-                pass
+        # Start the persistent queue-advance loop (idempotent; safe to call from each pool).
+        try:
+            _BACKEND.start_auto_advance_loop()
+        except Exception:
+            pass
         return True
 
     async def close(self):

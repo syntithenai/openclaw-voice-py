@@ -275,7 +275,7 @@ class VoiceConfig(BaseSettings):
 
     # TTS long-response summary behavior (uses quick-answer endpoint for spoken compression)
     tts_long_response_summary_enabled: bool = Field(True)
-    tts_long_response_summary_word_trigger: int = Field(30)
+    tts_long_response_summary_word_trigger: int = Field(40)
     tts_long_response_summary_target_words: int = Field(20)
     tts_long_response_summary_timeout_ms: int = Field(3500)
     gateway_tts_streaming_enabled: bool = Field(False, validation_alias=AliasChoices("GATEWAY_TTS_STREAMING_ENABLED"))

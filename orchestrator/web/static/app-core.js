@@ -43,6 +43,8 @@ const S = {
     chat:[], music:{state:'stop',title:'',artist:'',queue_length:0,elapsed:0,duration:0,position:-1,loaded_playlist:''},
     chatThreads:[], activeChatId:'active', activeChatThreadId:'', selectedChatId:'active', chatSidebarOpen:true,
                 chatThreadFilter:'',
+    chatReloadTargetId:'', chatReloadTargetThreadId:'',
+    chatReloadInFlight:null,
         chatDeleteModalOpen:false, chatDeleteTargetId:'', chatDeleteTargetTitle:'',
         chatClearAllModalOpen:false,
         chatFollowLatest:true,

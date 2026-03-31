@@ -48,30 +48,47 @@ function buildMusicGenreCloudHtml(genres, pending){
 
   const maxCount=Math.max(...list.map(x=>x.count));
   const minCount=Math.min(...list.map(x=>x.count));
-  const tags=list.map((item,idx)=>{
-    const weight=maxCount===minCount ? 1 : (item.count-minCount)/(maxCount-minCount);
-    const angleDeg=(idx*137.5)%360;
-    const angleRad=(angleDeg*Math.PI)/180;
-    const radius=idx===0 ? 0 : Math.min(45, 8 + Math.sqrt(idx)*6.5);
-    const x=Math.max(5, Math.min(95, 50 + (Math.cos(angleRad)*radius)));
-    const y=Math.max(9, Math.min(91, 50 + (Math.sin(angleRad)*radius*0.72)));
-    const size=(0.78 + weight*1.05).toFixed(2);
-    const alpha=(0.72 + weight*0.28).toFixed(2);
-    return '<button type="button" data-action="music-add-genre-search" data-genre="'+esc(item.genre)+'"'
-      +' class="music-genre-tag rounded-full border border-gray-700 bg-gray-800/80 px-3 py-1 text-gray-100 hover:bg-blue-800/60 hover:border-blue-500 transition-colors"'
-      +' style="left:'+x+'%;top:'+y+'%;font-size:'+size+'rem;opacity:'+alpha+';z-index:'+(200-idx)+'"'
-      +' title="Search '+esc(item.genre)+'">'
-      +esc(item.genre)
-      +'<span class="ml-1 text-[0.7em] text-gray-300">'+item.count+'</span>'
-      +'</button>';
-  }).join('');
+  const rowCount=Math.max(3, Math.min(9, Math.ceil(Math.sqrt(list.length))));
+  const centerRow=Math.floor(rowCount/2);
+  const rowOrder=[centerRow];
+  for(let offset=1; rowOrder.length<rowCount; offset++){
+    const above=centerRow-offset;
+    const below=centerRow+offset;
+    if(above>=0) rowOrder.push(above);
+    if(below<rowCount) rowOrder.push(below);
+  }
+
+  const rows=Array.from({length:rowCount}, ()=>[]);
+  list.forEach((item, idx)=>{
+    rows[rowOrder[idx%rowOrder.length]].push(item);
+  });
+
+  const rowHtml=rows
+    .filter(row=>row.length>0)
+    .map((row, visualRowIndex)=>{
+      const tags=row.map((item)=>{
+        const weight=maxCount===minCount ? 1 : (item.count-minCount)/(maxCount-minCount);
+        const size=(0.78 + weight*0.92).toFixed(2);
+        const alpha=(0.76 + weight*0.24).toFixed(2);
+        return '<button type="button" data-action="music-add-genre-search" data-genre="'+esc(item.genre)+'"'
+          +' class="music-genre-tag rounded-full border border-gray-700 bg-gray-800/80 px-3 py-1 text-gray-100 hover:bg-blue-800/60 hover:border-blue-500 transition-colors"'
+          +' style="font-size:'+size+'rem;opacity:'+alpha+'"'
+          +' title="Search '+esc(item.genre)+'">'
+          +esc(item.genre)
+          +'<span class="ml-1 text-[0.7em] text-gray-300">'+item.count+'</span>'
+          +'</button>';
+      }).join('');
+
+      const rowWeight=rowCount<=1 ? 1 : 1 - (Math.abs(visualRowIndex-centerRow)/rowCount);
+      return '<div class="music-genre-cloud-row" style="transform:scale('+(0.96 + rowWeight*0.05).toFixed(3)+')">'+tags+'</div>';
+    }).join('');
 
   return '<div class="music-genre-cloud mt-3 rounded-xl border border-gray-800 bg-gray-900/40 px-3 py-3">'
     +'<div class="flex items-center justify-between gap-2 mb-2">'
       +'<p class="text-xs uppercase tracking-wide text-gray-400">Browse Genres</p>'
       +'<p class="text-[11px] text-gray-500">Top '+list.length+' by track count</p>'
     +'</div>'
-    +'<div class="music-genre-cloud-canvas">'+tags+'</div>'
+    +'<div class="music-genre-cloud-canvas">'+rowHtml+'</div>'
   +'</div>';
 }
 
@@ -124,6 +141,7 @@ function renderMusicPage(main){
         const addPending=Object.values(S.pendingMusicActions||{}).some(item=>String((item&&item.type)||'')==='music_add_files');
     const addQueryTrimmed=String(S.musicAddQuery||'').trim();
     const showGenreCloud=!addQueryTrimmed;
+    const showSearchResults=!showGenreCloud && (searchPending || !!S.musicAddHasSearched);
     const addRows=(S.musicLibraryResults||[]).map(item=>{
       const file=String(item.file||'');
       const checked=!!S.musicAddSelection[file];
@@ -155,13 +173,15 @@ function renderMusicPage(main){
                                 +(canSearch ? '' : '<p id="musicAddMinHint" class="text-xs text-gray-500 mt-1">Enter at least '+MUSIC_LIBRARY_SEARCH_MIN_LEN+' letters to search</p>')
                 +(showGenreCloud ? buildMusicGenreCloudHtml(S.musicGenreCloud, !!S.musicGenreCloudPending) : '')
       +'</div>'
-      +(addRows
+            +(showSearchResults
+              ? (addRows
             ? '<div class="px-2 flex items-center justify-end gap-1 text-xs text-gray-400">'
             +'<button data-action="music-add-select-all" class="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 transition-colors">Select All</button>'
             +'<button data-action="music-add-select-none" class="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 transition-colors">Select None</button>'
             +'</div>'
             +'<div class="overflow-x-auto rounded-xl border border-gray-800"><table class="w-full text-left table-fixed"><thead><tr class="text-xs text-gray-400 border-b border-gray-800"><th class="px-2 py-2 w-8">#</th><th class="px-2 py-2 w-1/2">Title</th><th class="px-2 py-2 w-1/4">Artist</th><th class="px-2 py-2 w-1/4">Album</th></tr></thead><tbody>'+addRows+'</tbody></table></div>'
-                : '<p class="text-gray-500 text-center py-10 text-sm">'+(searchPending ? '<span class="inline-flex items-center gap-2"><span class="inline-block w-3 h-3 border-2 border-gray-400 border-t-transparent rounded-full animate-spin"></span>Searching…</span>' : (canSearch && S.musicAddHasSearched ? 'No matches found' : 'Search to find songs to add'))+'</p>')
+                : '<p class="text-gray-500 text-center py-10 text-sm">'+(searchPending ? '<span class="inline-flex items-center gap-2"><span class="inline-block w-3 h-3 border-2 border-gray-400 border-t-transparent rounded-full animate-spin"></span>Searching…</span>' : 'No matches found')+'</p>')
+              : (!showGenreCloud ? '<p class="text-gray-500 text-center py-10 text-sm">'+(canSearch ? 'Press Search to find songs to add' : 'Enter at least '+MUSIC_LIBRARY_SEARCH_MIN_LEN+' letters to search')+'</p>' : ''))
       +'</div>';
         main.onscroll=()=>{ updateScrollUpButton(); };
         updateScrollUpButton();
@@ -627,34 +647,18 @@ function formatCaptureError(err){
     return msg;
 }
 
-function clearCaptureRetry(){
-    if(S.captureRetryTimer){
-        clearTimeout(S.captureRetryTimer);
-        S.captureRetryTimer=null;
-    }
-}
-
-function scheduleCaptureRetry(delayMs=2500){
-    if(S.captureRetryTimer || S.wsManualDisconnect || !S.wsConnected) return;
-    S.captureRetryTimer=setTimeout(()=>{
-        S.captureRetryTimer=null;
-        ensureBrowserCapture().catch((err)=>reportCaptureFailure(err,'retry'));
-    }, Math.max(500, Number(delayMs)||2500));
-}
-
 function reportCaptureFailure(err, phase='capture'){
-    S.wsDebug.status='capture_error';
-    S.wsDebug.lastError=formatCaptureError(err);
-    updateWsDebugBanner();
-    try{ console.error('Browser capture '+phase+' failed:', err); }catch(_ ){}
-    try{ sendCaptureDiagnostics(err, phase); }catch(_ ){}
-    const retryMs=(err&&err.name==='NotFoundError'&&S.lastAudioInputCount===0)?10000:(err&&err.name==='InvalidStateError')?8000:2500;
-    scheduleCaptureRetry(retryMs);
+  S.wsDebug.status='capture_error';
+  S.wsDebug.lastError=formatCaptureError(err);
+  updateWsDebugBanner();
+  try{ console.error('Browser capture '+phase+' failed:', err); }catch(_ ){}
+  try{ sendCaptureDiagnostics(err, phase); }catch(_ ){}
+  const retryMs=(err&&err.name==='NotFoundError'&&S.lastAudioInputCount===0)?10000:(err&&err.name==='InvalidStateError')?8000:2500;
+  scheduleCaptureRetry(retryMs);
 }
 
 async function sendCaptureDiagnostics(err, phase='capture'){
     const payload={
-        type:'browser_capture_error',
         phase:String(phase||'capture'),
         name:(err&&err.name)?String(err.name):'',
         message:(err&&err.message)?String(err.message):String(err||''),

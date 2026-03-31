@@ -448,8 +448,12 @@
   async function mountEditors() {
     const st = fmState();
     if (!st.selectedFilePath || S.page !== 'files') return;
-    const file = await fmFetchJson(FM_API + '/file?path=' + encodeURIComponent(st.selectedFilePath));
-    if (!file || S.page !== 'files') return;
+    let file = st.currentFile;
+    if (!file || String(file.path || '') !== String(st.selectedFilePath || '')) {
+      file = await fmFetchJson(FM_API + '/file?path=' + encodeURIComponent(st.selectedFilePath));
+      if (!file || S.page !== 'files') return;
+      st.currentFile = file;
+    }
 
     const category = String(file.category || 'binary');
     if (!file.editable) return;
@@ -720,7 +724,7 @@
   function insertFilePickerResult(filePath) {
     const st = fmState();
     const editor = st.markdownEditor;
-    if (!editor) return;
+    if (!editor || !editor.codemirror) return;
 
     const path = String(filePath || '');
     const fileName = path.split('/').pop() || 'file';
@@ -752,6 +756,9 @@
       doc.setSelections(selection);
     }
     doc.replaceSelection(markdownSyntax, 'around');
+    if (st.currentFile && st.currentFile.path) {
+      queueSave(st.currentFile.path, editor.value());
+    }
     cm.focus();
     st.markdownEditorSelection = null;
   }

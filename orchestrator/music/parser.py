@@ -99,10 +99,42 @@ class MusicFastPathParser:
         r"^(?:scan|update)\s+(?:the\s+)?(?:music|library)$",
     ]
 
+    # Add songs patterns
+    # Handles: "add [some] [N] [more] <query> songs/tracks/tunes [to the playlist/queue]"
+    ADD_SONGS_PATTERN = (
+        r"^add\s+(?:some\s+)?(?:(\d+)\s+)?(?:more\s+)?(.+?)\s+"
+        r"(?:songs?|tracks?|tunes?)\s*(?:to\s+(?:the\s+)?(?:playlist|queue))?$"
+    )
+    # Handles: "add [some] <query> to the playlist/queue" (no songs/tracks suffix)
+    ADD_SONGS_TO_DEST_PATTERN = (
+        r"^add\s+(?:some\s+)?(.+?)\s+to\s+(?:the\s+)?(?:playlist|queue)$"
+    )
+
+    # New playlist + play patterns — clears queue, fills with genre/query, starts playing.
+    # Captures the genre/query in group 1.
+    # Examples:
+    #   "create a new playlist and add some pop music"
+    #   "new playlist with jazz"
+    #   "start a fresh playlist with 5 rock songs"
+    #   "create a new playlist of blues"
+    NEW_PLAYLIST_PATTERNS = [
+        # "create [a] [new] playlist and add [some] [N] <query> [songs/music/tracks]"
+        r"^(?:create|make|start)\s+(?:a\s+)?(?:new\s+)?(?:fresh\s+)?playlist\s+and\s+"
+        r"(?:add|play)\s+(?:some\s+)?(?:\d+\s+)?(.+?)(?:\s+(?:songs?|tracks?|tunes?|music))?$",
+        # "new playlist with [some] [N] <query> [songs/music/tracks]"
+        r"^(?:new|fresh)\s+playlist\s+with\s+(?:some\s+)?(?:\d+\s+)?(.+?)(?:\s+(?:songs?|tracks?|tunes?|music))?$",
+        # "create [a] [new] playlist of <query> [songs/music/tracks]"
+        r"^(?:create|make|start)\s+(?:a\s+)?(?:new\s+)?(?:fresh\s+)?playlist\s+(?:of|with)\s+"
+        r"(?:some\s+)?(?:\d+\s+)?(.+?)(?:\s+(?:songs?|tracks?|tunes?|music))?$",
+        # "start [a] [new] playlist [of/with] <query>"
+        r"^start\s+(?:a\s+)?(?:new\s+)?(?:fresh\s+)?playlist\s+(?:of\s+|with\s+)?(?:some\s+)?(?:\d+\s+)?"
+        r"(.+?)(?:\s+(?:songs?|tracks?|tunes?|music))?$",
+    ]
+
     COMMAND_START_HINT = (
         r"(?:play|put\s+on|resume|continue|unpause|pause|hold|stop|next|skip|previous|back|"
         r"volume|turn|increase|raise|decrease|lower|louder|quieter|what|current|"
-        r"now|update|scan|refresh|index|load|save)"
+        r"now|update|scan|refresh|index|load|save|add)"
     )
     
     def __init__(self):
@@ -130,6 +162,11 @@ class MusicFastPathParser:
         self.save_playlist_regex = re.compile(self.SAVE_PLAYLIST_PATTERN, re.IGNORECASE)
         
         self.library_regexes = [re.compile(p, re.IGNORECASE) for p in self.LIBRARY_PATTERNS]
+
+        self.add_songs_regex = re.compile(self.ADD_SONGS_PATTERN, re.IGNORECASE)
+        self.add_songs_to_dest_regex = re.compile(self.ADD_SONGS_TO_DEST_PATTERN, re.IGNORECASE)
+
+        self.new_playlist_regexes = [re.compile(p, re.IGNORECASE) for p in self.NEW_PLAYLIST_PATTERNS]
 
     def _normalize_for_matching(self, text: str) -> str:
         """Normalize transcript for deterministic command matching."""
@@ -205,6 +242,18 @@ class MusicFastPathParser:
             flags=re.IGNORECASE,
         ).strip()
 
+        # Normalize spoken word numbers to digits so patterns like (\d+) match them.
+        # Only replaces whole words to avoid corrupting artist/album names incidentally.
+        _word_nums = {
+            "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+            "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+            "eleven": "11", "twelve": "12", "thirteen": "13", "fourteen": "14",
+            "fifteen": "15", "sixteen": "16", "seventeen": "17", "eighteen": "18",
+            "nineteen": "19", "twenty": "20", "thirty": "30", "forty": "40", "fifty": "50",
+        }
+        for word, digit in _word_nums.items():
+            normalized = re.sub(rf"\b{word}\b", digit, normalized)
+
         # Trim polite/filler words and end punctuation to improve regex hit rate.
         normalized = re.sub(r"^(?:please\s+)", "", normalized)
         normalized = re.sub(r"[\s\.,!?;:]+$", "", normalized)
@@ -234,6 +283,15 @@ class MusicFastPathParser:
         
         # === Playback Control ===
         
+        # === New Playlist + Play ===
+        # "create a new playlist and add some pop music" → clear queue, fill genre, play
+        for regex in self.new_playlist_regexes:
+            match = regex.match(text)
+            if match:
+                query = match.group(1).strip()
+                if query:
+                    return ("play_genre", {"genre": query, "shuffle": True})
+
         if any(regex.match(text) for regex in self.play_regexes):
             return ("play", {})
         
@@ -360,9 +418,24 @@ class MusicFastPathParser:
         # Only match if it's a single word and matches a known genre
         if len(text.split()) == 1 and text.lower() in common_genres:
             return ("play_genre", {"genre": text.lower(), "shuffle": True})
-        
 
-        
+        # === Add Songs to Queue ===
+        # "add [some] [N] [more] <query> songs/tracks [to the playlist/queue]"
+        match = self.add_songs_regex.match(text)
+        if match:
+            count_str = match.group(1)
+            query = match.group(2).strip()
+            count = int(count_str) if count_str else 5
+            if query:
+                return ("add_songs", {"query": query, "count": count})
+
+        # "add [some] <query> to the playlist/queue" (no songs/tracks suffix)
+        match = self.add_songs_to_dest_regex.match(text)
+        if match:
+            query = match.group(1).strip()
+            if query:
+                return ("add_songs", {"query": query, "count": 5})
+
         # === Playlist Management ===
 
         def _clean_playlist_name(value: str) -> str:

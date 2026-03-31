@@ -77,14 +77,27 @@ function handleMsg(msg){
             if(msg.message){
                 applyServerChatState(undefined, msg.chat_threads, msg.active_chat_id, msg.active_chat_thread_id);
                 const nextMsg = normalizeChatMessage(msg.message);
-                if(nextMsg) S.chat.push(nextMsg);
-                if(nextMsg && nextMsg.role==='user') requestScrollToBottomBurst();
-                if(nextMsg && nextMsg.role==='user' && queueOptimisticTimerFromText(String(nextMsg.text||''), 'chat_append')){
+                let suppressReloadUserEcho=false;
+                const reloadRun=S.chatReloadInFlight;
+                if(nextMsg && nextMsg.role==='user' && reloadRun && !reloadRun.userEchoSuppressed){
+                    const incomingText=String(nextMsg.text||'').trim();
+                    const reloadText=String(reloadRun.text||'').trim();
+                    if(incomingText && incomingText===reloadText){
+                        suppressReloadUserEcho=true;
+                        reloadRun.userEchoSuppressed=true;
+                    }
+                }
+                if(nextMsg && !suppressReloadUserEcho) S.chat.push(nextMsg);
+                if(nextMsg && nextMsg.role==='assistant'){
+                    S.chatReloadInFlight=null;
+                }
+                if(nextMsg && nextMsg.role==='user' && !suppressReloadUserEcho) requestScrollToBottomBurst();
+                if(nextMsg && nextMsg.role==='user' && !suppressReloadUserEcho && queueOptimisticTimerFromText(String(nextMsg.text||''), 'chat_append')){
                     renderTimerBar();
                 }
                 persistChatCache();
                 // Show toast notification on non-home pages
-                if(nextMsg){
+                if(nextMsg && !suppressReloadUserEcho){
                     const toastText = nextMsg.role === 'assistant'
                         ? String(nextMsg.tts_text || nextMsg.text || '')
                         : String(nextMsg.text || '');
@@ -166,6 +179,7 @@ function handleMsg(msg){
             break;
         case 'chat_text_ack':
             if(msg.client_msg_id) S.pendingChatSends.delete(String(msg.client_msg_id));
+            if(msg.ok===false) S.chatReloadInFlight=null;
             if(S.page==='home') updateChatComposerState();
             break;
         case 'navigate':

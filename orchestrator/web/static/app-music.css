@@ -4,10 +4,10 @@
 .mermaidchart-error { color:#fca5a5; }
 
 .music-genre-cloud-canvas {
-	position: relative;
-	min-height: 270px;
-	max-height: 360px;
-	overflow: hidden;
+	display: flex;
+	flex-direction: column;
+	gap: 0.75rem;
+	padding: 1rem 0.75rem;
 	border: 1px dashed rgba(75, 85, 99, 0.7);
 	border-radius: 12px;
 	background:
@@ -16,9 +16,19 @@
 	background-size: auto, 16px 16px;
 }
 
+.music-genre-cloud-row {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: center;
+	align-items: center;
+	gap: 0.65rem 0.75rem;
+	width: 100%;
+}
+
 .music-genre-tag {
-	position: absolute;
-	transform: translate(-50%, -50%);
+	display: inline-flex;
+	align-items: baseline;
 	white-space: nowrap;
 	line-height: 1.2;
+	max-width: 100%;
 }

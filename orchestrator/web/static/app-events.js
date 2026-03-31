@@ -34,6 +34,61 @@ function buildFilesRouteHref(filePath){
     return '/#/files?path=' + encodeURIComponent(normalized);
 }
 
+function getChatReloadSelectedThreadId(){
+    return String(S.selectedChatId || 'active').trim() || 'active';
+}
+
+function clearChatReloadTarget(){
+    S.chatReloadTargetId = '';
+    S.chatReloadTargetThreadId = '';
+}
+
+function clearChatReloadInFlight(){
+    S.chatReloadInFlight = null;
+}
+
+function getChatMessageById(selectedId, messageId){
+    const messages = getSelectedMessages(selectedId);
+    const targetId = String(messageId || '').trim();
+    if(!targetId) return null;
+    return messages.find((message)=>String((message&&message.id)||'').trim()===targetId) || null;
+}
+
+function updateCachedThreadMessages(threadId, messages){
+    const tid = String(threadId || '').trim();
+    if(!tid || tid==='active') return;
+    const nextMessages = Array.isArray(messages) ? messages.map(normalizeChatMessage).filter(Boolean) : [];
+    const now = Date.now() / 1000;
+    S.chatThreads = (S.chatThreads || []).map((thread)=>{
+        if(String((thread&&thread.id)||'').trim()!==tid) return thread;
+        return Object.assign({}, thread, {
+            messages: nextMessages,
+            updated_ts: now,
+        });
+    });
+}
+
+function truncateChatLocallyAfterMessage(selectedId, messageId){
+    const selected = String(selectedId || 'active').trim() || 'active';
+    const targetId = String(messageId || '').trim();
+    if(!targetId) return null;
+    const messages = getSelectedMessages(selected);
+    const matchIndex = messages.findIndex((message)=>String((message&&message.id)||'').trim()===targetId);
+    if(matchIndex<0) return null;
+    const targetMessage = getChatMessageById(selected, targetId);
+    if(!targetMessage || String(targetMessage.role || '').toLowerCase()!=='user') return null;
+    const truncated = messages.slice(0, matchIndex + 1).map(normalizeChatMessage).filter(Boolean);
+    if(selected==='active'){
+        S.chat = truncated;
+        const activeThreadId = String(S.activeChatThreadId || '').trim();
+        if(activeThreadId) updateCachedThreadMessages(activeThreadId, truncated);
+    }else{
+        updateCachedThreadMessages(selected, truncated);
+    }
+    persistChatCache();
+    return targetMessage;
+}
+
 document.addEventListener('click', e => {
     const target = (e.target && typeof e.target.closest==='function') ? e.target : (e.target && e.target.parentElement ? e.target.parentElement : null);
     if(!target) return;
@@ -92,8 +147,57 @@ document.addEventListener('click', e => {
         return;
     }
 
+    const reloadResponseBtn = target.closest('[data-action="chat-reload-response"]');
+    if (reloadResponseBtn) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (S.pendingChatSends.size > 0) return;
+        const messageId = String(reloadResponseBtn.dataset.messageId || '').trim();
+        const threadId = String(reloadResponseBtn.dataset.threadId || getChatReloadSelectedThreadId()).trim() || 'active';
+        const targetMessage = truncateChatLocallyAfterMessage(threadId, messageId);
+        const text = String((targetMessage&&targetMessage.text) || '').trim();
+        if(!text) return;
+        clearChatReloadTarget();
+        S.chatReloadInFlight = {
+            threadId,
+            sourceMessageId: messageId,
+            text,
+            userEchoSuppressed: false,
+        };
+        const clientMsgId='c'+(S.nextClientMsgId++);
+        S.pendingChatSends.add(clientMsgId);
+        requestScrollToBottomBurst();
+        updateChatComposerState();
+        if(queueOptimisticTimerFromText(text, 'chat_submit')) renderTimerBar();
+        if(S.page==='home') renderChatMessages(threadId);
+        sendAction({
+            type:'chat_reload',
+            message_id: messageId,
+            client_msg_id: clientMsgId,
+            thread_id: threadId,
+        });
+        return;
+    }
+
+    const reloadSelectBtn = target.closest('[data-action="chat-select-reload"]');
+    if (reloadSelectBtn) {
+        e.preventDefault();
+        const messageId = String(reloadSelectBtn.dataset.messageId || '').trim();
+        const threadId = getChatReloadSelectedThreadId();
+        if(!messageId) return;
+        if(S.chatReloadTargetId===messageId && S.chatReloadTargetThreadId===threadId) clearChatReloadTarget();
+        else {
+            S.chatReloadTargetId = messageId;
+            S.chatReloadTargetThreadId = threadId;
+        }
+        if(S.page==='home') renderChatMessages(threadId);
+        return;
+    }
+
     const newChatBtn = target.closest('[data-action="chat-new"]');
     if (newChatBtn) {
+        clearChatReloadTarget();
+        clearChatReloadInFlight();
         sendAction({type:'chat_new'});
         S.selectedChatId = 'active';
         renderPage();
@@ -150,6 +254,7 @@ document.addEventListener('click', e => {
         if(tid && tid!=='active'){
             S.chatThreads = (S.chatThreads||[]).filter(t=>String((t&&t.id)||'')!==tid);
             if(String(S.selectedChatId||'active')===tid) S.selectedChatId='active';
+            if(S.chatReloadTargetThreadId===tid) clearChatReloadTarget();
             persistChatCache();
             sendAction({type:'chat_delete', thread_id: tid});
         }
@@ -164,6 +269,8 @@ document.addEventListener('click', e => {
     if (clearAllConfirmBtn) {
         S.chatThreads = [];
         S.selectedChatId = 'active';
+        clearChatReloadTarget();
+        clearChatReloadInFlight();
         S.chatClearAllModalOpen = false;
         persistChatCache();
         sendAction({type:'chat_clear_all'});
@@ -174,6 +281,8 @@ document.addEventListener('click', e => {
     const selectThreadBtn = target.closest('[data-action="chat-select"]');
     if (selectThreadBtn) {
         const tid = selectThreadBtn.dataset.threadId || 'active';
+        clearChatReloadTarget();
+        clearChatReloadInFlight();
         S.selectedChatId = tid;
         persistChatCache();
         renderPage();
@@ -291,7 +400,11 @@ document.addEventListener('click', e => {
     const addQuickAddBtn = target.closest('[data-action="music-add-quick-add"]');
     if (addQuickAddBtn) {
         const file = String(addQuickAddBtn.dataset.file || '').trim();
-        if(file) sendMusicAction('music_add_files', {files:[file]});
+        if(file){
+            const nextPos = getMusicQueueLength();
+            sendMusicAction('music_add_files', {files:[file]});
+            sendMusicAction('music_play_track', {position: nextPos});
+        }
         return;
     }
 
@@ -626,6 +739,8 @@ document.addEventListener('submit', e => {
     if (!input) return;
     const text = String(input.value || '').trim();
     if (!text) return;
+    clearChatReloadTarget();
+    clearChatReloadInFlight();
     const clientMsgId='c'+(S.nextClientMsgId++);
     S.pendingChatSends.add(clientMsgId);
     requestScrollToBottomBurst();
@@ -795,6 +910,9 @@ function handleTextInputChange(t){
         S.musicAddHasSearched = false;
         S.musicAddSearchPending = false;
         S.musicAddPendingQuery = '';
+        S.musicLibraryResults = [];
+        S.musicAddSelection = {};
+        S.musicAddLastCheckedFile = '';
         const canSearch=canSearchMusicLibrary(S.musicAddQuery);
         const btn=document.getElementById('musicAddSearchSubmit');
         if(btn){
@@ -805,6 +923,7 @@ function handleTextInputChange(t){
         }
         const hint=document.getElementById('musicAddMinHint');
         if(hint) hint.classList.toggle('hidden', canSearch);
+        renderMusicPagePreservingInput('musicAddSearch');
         return;
     }
     if(t.id==='musicNewPlaylistName'){
@@ -1423,7 +1542,9 @@ function extractResultObject(parsed){
     return null;
 }
 
-function extractReferencedPathsFromEvents(events){
+function extractReferencedPathsFromEvents(events, opts){
+    const includeRead=opts&&opts.includeRead!==undefined ? !!opts.includeRead : true;
+    const includeWrite=opts&&opts.includeWrite!==undefined ? !!opts.includeWrite : true;
     const paths=[];
     const addPath=(value)=>{
         const text=String(value||'').trim();
@@ -1453,6 +1574,7 @@ function extractReferencedPathsFromEvents(events){
         const n=String(p.name||p.text||'').toLowerCase();
         const isRead=n==='read' || n.includes('read_file');
         const isWrite=n==='write' || n.includes('write_file') || n.includes('create_file') || n.includes('str_replace') || n.includes('insert') || n.includes('delete');
+        if((isRead && !includeRead) || (isWrite && !includeWrite)) continue;
         if(!isRead && !isWrite) continue;
         const phase=String(p.phase||'').toLowerCase();
         if(phase!=='start' && phase!=='update' && phase!=='result' && phase!=='end') continue;
@@ -1464,7 +1586,7 @@ function extractReferencedPathsFromEvents(events){
     return paths;
 }
 
-function extractReferencedPathsFromText(text){
+function extractMarkdownLinkedPathsFromText(text){
     const paths=[];
     const seen=new Set();
     const add=(val)=>{
@@ -1475,19 +1597,42 @@ function extractReferencedPathsFromText(text){
         paths.push(v);
     };
     const raw=String(text||'');
-    // Markdown links [text](path) where path is not a web URL and looks like a file
-    const mdLinkRe=/\[([^\]]*)\]\(([^)\s#?]+)\)/g;
+    const mdLinkRe=/\[[^\]]*\]\(([^)\s#?]+)\)/g;
     let m;
     while((m=mdLinkRe.exec(raw))!==null){
-        const url=m[2];
-        if(/^https?:\/\//i.test(url)) continue;
+        const url=String(m[1]||'').trim();
+        if(!url || /^https?:\/\//i.test(url)) continue;
         if(!url.includes('/')) continue;
         if(/\.[a-zA-Z0-9]{1,10}$/.test(url) || url.startsWith('/')) add(url);
     }
-    // Backtick spans containing absolute file paths like `/some/path/file.ext`
-    const btRe=/`(\/[^`\s]+\.[a-zA-Z0-9]{1,10})`/g;
-    while((m=btRe.exec(raw))!==null) add(m[1]);
     return paths;
+}
+
+function normalizePathForMatch(path){
+    return String(path||'').trim().replace(/^file:\/\//i, '').replace(/\\/g, '/').replace(/^\.\//, '');
+}
+
+function pathsReferToSameFile(a, b){
+    const left=normalizePathForMatch(a);
+    const right=normalizePathForMatch(b);
+    if(!left || !right) return false;
+    if(left===right) return true;
+    return left.endsWith('/'+right) || right.endsWith('/'+left);
+}
+
+function intersectPathsByReference(basePaths, candidatePaths){
+    const out=[];
+    const seen=new Set();
+    for(const base of (basePaths||[])){
+        if(!base) continue;
+        const match=(candidatePaths||[]).some((cand)=>pathsReferToSameFile(base, cand));
+        if(!match) continue;
+        const key=normalizePathForMatch(base);
+        if(seen.has(key)) continue;
+        seen.add(key);
+        out.push(base);
+    }
+    return out;
 }
 
 function collateChatMessages(msgs){
@@ -1509,16 +1654,21 @@ function collateChatMessages(msgs){
         }
         const validStreams=activeBucket.streams.filter(s=>String(s.text||'').length>0);
         const combinedStreamText=validStreams.map(s=>String(s.text||'')).join('');
-        const referencedFiles=extractReferencedPathsFromEvents(activeBucket.events);
-        // Also extract file paths mentioned directly in the response text
+        const writeReferencedFiles=extractReferencedPathsFromEvents(activeBucket.events, {includeRead:false, includeWrite:true});
+        const referencedFiles=[];
+        // Extract only markdown-linked file paths from response text.
         const responseCandidateTexts=[combinedStreamText, ...activeBucket.finals.map(f=>String(f.text||'')+' '+String(f.full_text||''))];
+        const linkedPaths=[];
         for(const t of responseCandidateTexts){
-            for(const p of extractReferencedPathsFromText(t)){
-                if(!referencedFiles.includes(p)) referencedFiles.push(p);
+            for(const p of extractMarkdownLinkedPathsFromText(t)){
+                if(!linkedPaths.includes(p)) linkedPaths.push(p);
             }
         }
+        for(const p of intersectPathsByReference(writeReferencedFiles, linkedPaths)){
+            if(!referencedFiles.includes(p)) referencedFiles.push(p);
+        }
+        const extra={referenced_files:referencedFiles, written_files:referencedFiles};
         if(validStreams.length>0 && activeBucket.finals.length===0){
-            const extra=referencedFiles.length?{referenced_files:referencedFiles, written_files:referencedFiles}:{};
             out.push({
                 role:'assistant_stream_group',
                 request_id:activeBucket.reqId,
@@ -1531,7 +1681,6 @@ function collateChatMessages(msgs){
             });
         }
         activeBucket.finals.forEach((f, index)=>{
-            const extra=referencedFiles.length?{referenced_files:referencedFiles, written_files:referencedFiles}:{};
             if(validStreams.length>0 && index===activeBucket.finals.length-1){
                 out.push({...f, ...extra, stream_text:combinedStreamText, stream_segments:validStreams});
                 return;
@@ -1974,6 +2123,22 @@ function makeResponseCopyButton(getText){
             setTimeout(()=>{ btn.textContent=prev; }, 1200);
         }
     });
+    return btn;
+}
+
+function makeResponseReloadButton(messageId, threadId){
+    const btn=document.createElement('button');
+    btn.type='button';
+    btn.className='px-2 py-1 rounded text-[11px] bg-blue-800 hover:bg-blue-700 text-blue-100 border border-blue-600 transition-colors';
+    if(S.pendingChatSends.size>0){
+        btn.disabled=true;
+        btn.classList.add('opacity-60','cursor-not-allowed');
+    }
+    btn.textContent=S.pendingChatSends.size>0 ? 'Reloading...' : 'Reload';
+    btn.title='Clear later messages and rerun this prompt';
+    btn.setAttribute('data-action','chat-reload-response');
+    btn.setAttribute('data-message-id', String(messageId||''));
+    btn.setAttribute('data-thread-id', String(threadId||'active'));
     return btn;
 }
 
@@ -2562,11 +2727,20 @@ function mkBubble(m){
 
   const b=document.createElement('div');
     const isQuickAnswer=(m&&m.source)==='quick_answer';
+    const reloadThreadId=getChatReloadSelectedThreadId();
+    const isReloadSource=role==='user' && !!msgId && S.chatReloadTargetId===msgId && S.chatReloadTargetThreadId===reloadThreadId;
     b.className='max-w-xs sm:max-w-sm lg:max-w-md px-4 py-2 rounded-2xl text-sm leading-relaxed '+
         (role==='user'?'bg-blue-700 text-white rounded-br-md':
          role==='system'?'bg-gray-700 text-gray-300 italic text-xs':
      (isQuickAnswer?'bg-gray-600 border-2':'bg-gray-700')+' text-gray-100 rounded-bl-md');
     if(isQuickAnswer) b.style.borderColor='#15803d';
+    if(role==='user'){
+        b.setAttribute('data-action','chat-select-reload');
+        b.setAttribute('data-message-id', msgId);
+        b.classList.add('cursor-pointer','transition-colors');
+        b.title='Select this prompt to reload its response';
+        if(isReloadSource) b.classList.add('ring-2','ring-blue-300','ring-offset-2','ring-offset-gray-900');
+    }
     if(role==='assistant'){
         if(!isQuickAnswer) b.classList.add('relative','pr-12');
         const reqKey=String((m&&m.request_id)!==undefined && (m&&m.request_id)!==null ? m.request_id : 'na');
@@ -2619,6 +2793,16 @@ const referencedFiles=(Array.isArray(m.referenced_files)?m.referenced_files:m.wr
 
         if(!isQuickAnswer){
             b.appendChild(makeResponseCopyButton(()=>String((m&&m.text)||'')));
+        }
+    }else if(role==='user'){
+        const textWrap=document.createElement('div');
+        textWrap.textContent=m.text||'';
+        b.appendChild(textWrap);
+        if(isReloadSource){
+            const actions=document.createElement('div');
+            actions.className='mt-2 flex justify-end';
+            actions.appendChild(makeResponseReloadButton(msgId, reloadThreadId));
+            b.appendChild(actions);
         }
     }else{
         b.textContent=m.text||'';

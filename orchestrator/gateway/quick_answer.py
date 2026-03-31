@@ -1150,21 +1150,19 @@ class QuickAnswerClient:
         question = str(user_question or "").strip()
         if question:
             system_prompt = (
-                "You produce a concise spoken outcome/status reply for the user. "
-                f"Write exactly {target} words as one natural sentence. "
-                "Do not fulfill the user's creative/informational request in this reply. "
-                "Do not retell, quote, summarize, paraphrase, or excerpt generated assistant content. "
-                "State what was done for the user and any high-level result only. "
-                "Explicitly mention the request topic from the newest user turn. "
-                "No markdown, lists, or code."
+                "You produce a concise spoken reply for text-to-speech. "
+                f"Write approximately {target} words as one or two natural sentences. "
+                "Directly answer the user's question or summarise the key result in a natural, conversational tone. "
+                "Use the assistant's response to inform your reply — include the key facts, outcome, or answer. "
+                "Do not narrate what you are doing; just give the reply. "
+                "No markdown, bullet points, or code."
             )
             user_prompt = (
-                "User question context (oldest to newest contiguous user turns):\n"
+                "User asked (oldest to newest turns):\n"
                 f"{question}\n\n"
-                "Assistant generated output (for status grounding only; do not retell it):\n"
+                "Assistant's full response:\n"
                 f"{source_text}\n\n"
-                f"Write a {target}-word spoken status reply that tells the user what action was completed "
-                "and whether it succeeded."
+                f"Write a natural ~{target}-word spoken reply that answers the user based on the assistant's response."
             )
         else:
             system_prompt = (

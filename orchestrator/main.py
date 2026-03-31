@@ -7,16 +7,10 @@ warnings.filterwarnings(
 )
 
 import os
+import asyncio
 import shutil
 import subprocess
 import sys
-
-# Suppress FunASR/tqdm progress bars BEFORE any imports
-os.environ['TQDM_DISABLE'] = '1'
-os.environ['TQDM_MININTERVAL'] = '9999999'
-os.environ['FUNASR_CACHE_DIR'] = os.environ.get('MODELSCOPE_CACHE', '')
-
-import asyncio
 import io
 import json
 import logging
@@ -128,6 +122,7 @@ GHOST_ARTIFACT_TOKENS = {
     "hi",
     "thanks",
     "thank you",
+    "thanks for watching",
     "hmm",
     "sigh",
     "sighs",
@@ -137,6 +132,10 @@ GHOST_ARTIFACT_TOKENS = {
     "subtitles by the amara org community",
     "subtitles by amara org community",
     "subtitles by the amara org",
+    "i'm sorry",
+    "im sorry",
+    "i don't know",
+    "i dont know",
 }
 
 GHOST_ARTIFACT_PATTERNS = (
@@ -1572,6 +1571,7 @@ async def run_orchestrator() -> None:
 
             # Check if OpenClaw gateway has configured models available
             openclaw_models_available = True
+            from orchestrator.gateway.providers import OpenClawGateway
             if isinstance(gateway, OpenClawGateway):
                 try:
                     model_config_candidates = [
@@ -2072,15 +2072,59 @@ async def run_orchestrator() -> None:
                     tts_stop_event.set()
                     tts_playing = False
 
+            def _sync_music_output_route(reason: str) -> None:
+                if not music_manager or not web_service:
+                    return
+                if not hasattr(music_manager, "pool") or not hasattr(music_manager.pool, "set_output_route"):
+                    return
+                browser_audio_enabled = bool(web_service._ui_control_state.get("browser_audio_enabled", True))
+                target_route = "browser" if browser_audio_enabled else "local"
+                try:
+                    music_manager.pool.set_output_route(target_route)
+                    if getattr(music_manager, "control_pool", None) is not None and hasattr(music_manager.control_pool, "set_output_route"):
+                        music_manager.control_pool.set_output_route(target_route)
+                except Exception as exc:
+                    logger.debug("Failed to sync native music output route (%s): %s", reason, exc)
+
             async def _ui_browser_audio_set(enabled: bool, client_id: str) -> None:
+                prev_enabled = bool(web_service._ui_control_state.get("browser_audio_enabled", True))
                 web_service.update_ui_control_state(browser_audio_enabled=bool(enabled))
-                if music_manager and hasattr(music_manager, "pool") and hasattr(music_manager.pool, "set_output_route"):
-                    try:
-                        music_manager.pool.set_output_route("browser" if enabled else "local")
-                        if getattr(music_manager, "control_pool", None) is not None and hasattr(music_manager.control_pool, "set_output_route"):
-                            music_manager.control_pool.set_output_route("browser" if enabled else "local")
-                    except Exception as exc:
-                        logger.debug("Failed to update native music output route: %s", exc)
+                _sync_music_output_route("browser_audio_set")
+                if not music_manager or prev_enabled == bool(enabled):
+                    return
+
+                # Seamless route handoff: keep the same song/time when toggling
+                # browser-audio mode so only one output path is active.
+                try:
+                    status_before = await music_manager.get_status()
+                except Exception as exc:
+                    logger.debug("Browser-audio handoff status fetch failed: %s", exc)
+                    return
+
+                state_before = str((status_before or {}).get("state", "stop") or "stop").strip().lower()
+                if state_before not in {"play", "pause"}:
+                    return
+
+                try:
+                    song_pos = int((status_before or {}).get("song", -1))
+                except Exception:
+                    song_pos = -1
+                if song_pos < 0:
+                    return
+
+                try:
+                    elapsed_s = max(0, int(float((status_before or {}).get("elapsed", 0) or 0)))
+                except Exception:
+                    elapsed_s = 0
+
+                try:
+                    await music_manager.play(song_pos)
+                    if elapsed_s > 0:
+                        await music_manager.seek_to(float(elapsed_s))
+                    if state_before == "pause":
+                        await music_manager.pause()
+                except Exception as exc:
+                    logger.warning("Browser-audio handoff failed (target=%s): %s", "browser" if bool(enabled) else "local", exc)
 
             async def _ui_continuous_mode_set(enabled: bool, client_id: str) -> None:
                 nonlocal wake_state, state, last_wake_detected_ts, last_activity_ts, wake_sleep_ts
@@ -2143,6 +2187,7 @@ async def run_orchestrator() -> None:
             async def _ui_music_toggle(client_id: str) -> None:
                 if music_manager:
                     try:
+                        _sync_music_output_route("music_toggle")
                         await music_manager.toggle_playback()
                         asyncio.create_task(_ui_refresh_music_state("music_toggle"))
                     except Exception as exc:
@@ -2151,6 +2196,7 @@ async def run_orchestrator() -> None:
             async def _ui_music_stop(client_id: str) -> None:
                 if music_manager:
                     try:
+                        _sync_music_output_route("music_stop")
                         await music_manager.stop()
                         asyncio.create_task(_ui_refresh_music_state("music_stop"))
                     except Exception as exc:
@@ -2159,6 +2205,7 @@ async def run_orchestrator() -> None:
             async def _ui_music_play_track(position: int, client_id: str) -> None:
                 if music_manager:
                     try:
+                        _sync_music_output_route("music_play_track")
                         await music_manager.play(position)
                         asyncio.create_task(_ui_refresh_music_state("music_play_track"))
                     except Exception as exc:
@@ -2167,6 +2214,7 @@ async def run_orchestrator() -> None:
             async def _ui_music_seek(seconds: float, client_id: str) -> None:
                 if music_manager:
                     try:
+                        _sync_music_output_route("music_seek")
                         await music_manager.seek_to(seconds)
                         asyncio.create_task(_ui_refresh_music_state("music_seek"))
                     except Exception as exc:
@@ -2481,6 +2529,8 @@ async def run_orchestrator() -> None:
                 on_browser_audio_set=_ui_browser_audio_set,
                 on_continuous_mode_set=_ui_continuous_mode_set,
             )
+
+            _sync_music_output_route("post_web_handler_init")
 
             # If a browser connected before handlers were wired, push initial music data now.
             try:
@@ -3630,39 +3680,6 @@ async def run_orchestrator() -> None:
                 if not should_send_to_gateway:
                     return
 
-                # Final safety gate: never forward music-like requests upstream.
-                # This prevents external gateway-side music skills from executing
-                # when local parsing/tool handling misses a variant.
-                if config.music_enabled and music_router and music_router.is_music_related(combined_transcript):
-                    logger.info(
-                        "🚫 MUSIC UPSTREAM GUARD: suppressing upstream dispatch for music-like transcript: '%s'",
-                        combined_transcript[:120],
-                    )
-
-                    fallback_response = "I can only run local music controls. Try a direct command like play, stop, next, or previous."
-                    last_activity_ts = time.monotonic()
-                    await submit_tts(fallback_response, request_id=current_request_id)
-                    _safe_append_chat_message(
-                        {
-                            "role": "assistant",
-                            "text": fallback_response,
-                            "tts_text": fallback_response,
-                            "source": "music_upstream_guard",
-                            "request_id": current_request_id,
-                            "segment_kind": "final",
-                        },
-                        "music_upstream_guard_assistant",
-                    )
-                    last_assistant_text = fallback_response
-                    last_assistant_source = "music_upstream_guard"
-                    last_assistant_ts = time.monotonic()
-                    last_assistant_was_question = assistant_turn_is_question(fallback_response)
-                    last_assistant_expects_short_reply = assistant_turn_expects_short_reply(fallback_response)
-                    should_send_to_gateway = False
-                    last_user_went_upstream = False
-                    pending_transcripts.clear()
-                    return
-
                 # Clear all pending transcripts now (we're sending everything)
                 transcript_count = len(pending_transcripts)
                 pending_transcripts.clear()
@@ -4013,6 +4030,10 @@ async def run_orchestrator() -> None:
             "you re welcome",
             "you're welcome",
             "youre welcome",
+            "i'm sorry",
+            "im sorry",
+            "i don't know",
+            "i dont know",
         }:
             return True
 
