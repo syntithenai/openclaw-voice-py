@@ -49,6 +49,7 @@
         markdownEditorSelection: null,
         createFolderModalOpen: false,
         createFolderName: '',
+        createFolderParentPath: '/',
         deleteModalOpen: false,
         deleteTargetType: '',
         deleteTargetPath: '',
@@ -927,7 +928,7 @@
     const st = fmState();
     const name = String(st.createFolderName || '').trim();
     if (!name) { st.createFolderModalOpen = false; renderFileManagerPage(fmMain()); return; }
-    const parent = String(st.selectedFolderPath || '/');
+    const parent = String(st.createFolderParentPath || st.selectedFolderPath || '/');
     try {
       await fmFetchJson(FM_API + '/folder?path=' + encodeURIComponent(parent), {
         method: 'POST',
@@ -935,6 +936,7 @@
       });
       st.createFolderModalOpen = false;
       st.createFolderName = '';
+      st.createFolderParentPath = '/';
       st.treeByPath = {};
       await loadTree('/');
       await loadFolder(parent);
@@ -942,8 +944,17 @@
     } catch (err) {
       st.error = String(err && err.message ? err.message : err);
       st.createFolderModalOpen = false;
+      st.createFolderParentPath = '/';
       renderFileManagerPage(fmMain());
     }
+  }
+
+  function openCreateFolderModal(parentPath) {
+    const st = fmState();
+    st.createFolderModalOpen = true;
+    st.createFolderName = '';
+    st.createFolderParentPath = String(parentPath || st.selectedFolderPath || '/');
+    renderFileManagerPage(fmMain());
   }
 
   window.renderFileManagerPage = function renderFileManagerPage(main) {
@@ -1059,7 +1070,10 @@
       + '<div class="h-full min-h-0 p-2">'
       + '<div class="fm-layout">'
       + '<section class="fm-panel">'
-      + '<div class="px-3 py-2 border-b border-gray-800 text-sm font-semibold">Workspace Tree</div>'
+      + '<div class="px-3 py-2 border-b border-gray-800 flex items-center justify-between gap-2">'
+      + '<div class="text-sm font-semibold">Workspace Tree</div>'
+      + '<button type="button" class="px-2 py-1 text-xs rounded bg-blue-700 hover:bg-blue-600 whitespace-nowrap" data-action="fm-open-create-root-folder">Create Folder</button>'
+      + '</div>'
       + '<div class="fm-scroll px-2 py-2">' + treeRows + '</div>'
       + '</section>'
       + '<section class="fm-panel">'
@@ -1145,9 +1159,14 @@
     const openCreate = target.closest('[data-action="fm-open-create-folder"]');
     if (openCreate) {
       event.preventDefault();
-      st.createFolderModalOpen = true;
-      st.createFolderName = '';
-      renderFileManagerPage(fmMain());
+      openCreateFolderModal(st.selectedFolderPath || '/');
+      return true;
+    }
+
+    const openCreateRoot = target.closest('[data-action="fm-open-create-root-folder"]');
+    if (openCreateRoot) {
+      event.preventDefault();
+      openCreateFolderModal('/');
       return true;
     }
 
@@ -1175,6 +1194,7 @@
       event.preventDefault();
       st.createFolderModalOpen = false;
       st.createFolderName = '';
+      st.createFolderParentPath = '/';
       renderFileManagerPage(fmMain());
       return true;
     }
@@ -1330,6 +1350,7 @@
     if (event.key === 'Escape' && st.createFolderModalOpen) {
       st.createFolderModalOpen = false;
       st.createFolderName = '';
+      st.createFolderParentPath = '/';
       renderFileManagerPage(fmMain());
       return true;
     }

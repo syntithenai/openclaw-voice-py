@@ -624,21 +624,82 @@ class OpenClawGateway(BaseGateway):
                         if event_name == "agent":
                             agent_stream = payload.get("stream")
                             if agent_stream == "tool":
-                                step_data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-                                if not isinstance(step_data, dict):
-                                    step_data = {}
+                                raw_step_data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+                                if not isinstance(raw_step_data, dict):
+                                    raw_step_data = {}
+
+                                def _flatten_tool_step_dict(candidate: dict) -> dict:
+                                    """Unwrap nested tool event shapes into a single step dict."""
+                                    queue = [candidate]
+                                    seen: set[int] = set()
+                                    best = candidate
+                                    while queue:
+                                        cur = queue.pop(0)
+                                        if not isinstance(cur, dict):
+                                            continue
+                                        oid = id(cur)
+                                        if oid in seen:
+                                            continue
+                                        seen.add(oid)
+
+                                        if any(
+                                            k in cur
+                                            for k in (
+                                                "name",
+                                                "tool",
+                                                "toolName",
+                                                "tool_name",
+                                                "toolCallId",
+                                                "tool_call_id",
+                                                "callId",
+                                            )
+                                        ):
+                                            best = cur
+
+                                        for key in ("data", "message", "payload", "tool", "event"):
+                                            nested = cur.get(key)
+                                            if isinstance(nested, dict):
+                                                queue.append(nested)
+
+                                        for key in ("content", "items", "events"):
+                                            nested_list = cur.get(key)
+                                            if isinstance(nested_list, list):
+                                                for item in nested_list:
+                                                    if isinstance(item, dict):
+                                                        queue.append(item)
+
+                                    return best
+
+                                step_data = _flatten_tool_step_dict(raw_step_data)
+
                                 name = (
                                     step_data.get("name")
                                     or step_data.get("tool")
                                     or step_data.get("toolName")
                                     or step_data.get("tool_name")
+                                    or raw_step_data.get("name")
+                                    or raw_step_data.get("tool")
+                                    or raw_step_data.get("toolName")
+                                    or raw_step_data.get("tool_name")
                                     or ""
                                 )
+                                if isinstance(name, dict):
+                                    name = (
+                                        name.get("name")
+                                        or name.get("toolName")
+                                        or name.get("tool")
+                                        or ""
+                                    )
+
                                 raw_phase = (
                                     step_data.get("phase")
                                     or step_data.get("status")
                                     or step_data.get("state")
                                     or step_data.get("event")
+                                    or raw_step_data.get("phase")
+                                    or raw_step_data.get("status")
+                                    or raw_step_data.get("state")
+                                    or raw_step_data.get("event")
                                     or ""
                                 )
                                 phase_text = str(raw_phase).strip().lower()
@@ -653,6 +714,9 @@ class OpenClawGateway(BaseGateway):
                                     step_data.get("toolCallId")
                                     or step_data.get("tool_call_id")
                                     or step_data.get("callId")
+                                    or raw_step_data.get("toolCallId")
+                                    or raw_step_data.get("tool_call_id")
+                                    or raw_step_data.get("callId")
                                     or ""
                                 )
                                 if name:

@@ -4519,9 +4519,7 @@ async def run_orchestrator() -> None:
         tts_streaming_enabled = bool(config.gateway_tts_streaming_enabled)
         first_chunk_word_threshold = max(0, config.gateway_tts_fast_start_words) if tts_streaming_enabled else 0
         active_buffer_request_id = 0
-        active_ui_stream_request_id = 0
-        ui_stream_text = ""
-        ui_stream_message_id = ""
+        ui_stream_state_by_request_id: dict[int, dict[str, str]] = {}
         kickoff_sent_request_id = 0
         reconnect_delay_s = 1.0
         reconnect_delay_max_s = 8.0
@@ -4532,22 +4530,28 @@ async def run_orchestrator() -> None:
         )
 
         def _push_ui_stream_chunk(request_id: int, chunk_text: str) -> None:
-            nonlocal active_ui_stream_request_id, ui_stream_text, ui_stream_message_id
             if not web_service or request_id <= 0:
                 return
             if not chunk_text:
                 return
 
-            if request_id != active_ui_stream_request_id:
-                active_ui_stream_request_id = request_id
-                ui_stream_text = ""
-                ui_stream_message_id = f"assistant-stream-{request_id}"
+            stream_state = ui_stream_state_by_request_id.get(request_id)
+            if stream_state is None:
+                stream_state = {
+                    "id": f"assistant-stream-{request_id}",
+                    "text": "",
+                }
+                ui_stream_state_by_request_id[request_id] = stream_state
+                if len(ui_stream_state_by_request_id) > 64:
+                    stale_request_ids = sorted(ui_stream_state_by_request_id.keys())[:-32]
+                    for stale_request_id in stale_request_ids:
+                        ui_stream_state_by_request_id.pop(stale_request_id, None)
 
-            ui_stream_text += chunk_text
+            stream_state["text"] += chunk_text
             stream_msg = {
-                "id": ui_stream_message_id,
+                "id": stream_state["id"],
                 "role": "assistant",
-                "text": ui_stream_text,
+                "text": stream_state["text"],
                 "source": "gateway_stream",
                 "request_id": request_id,
                 "segment_kind": "stream",

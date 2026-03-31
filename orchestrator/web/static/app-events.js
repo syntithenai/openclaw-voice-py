@@ -22,10 +22,33 @@ document.querySelectorAll('[data-nav]').forEach(el=>el.addEventListener('click',
 }));
 
 function normalizeFilesPath(value){
-    const raw = String(value||'').trim();
+    const raw = String(value||'').trim().replace(/\\/g, '/');
     if(!raw) return '';
-    if(raw.startsWith('/')) return raw;
-    return '/' + raw.replace(/^\/+/, '');
+
+    const stripWorkspacePrefix = (path)=>{
+        const markers=[
+            '/workspace-voice/',
+            '/openclaw-voice/',
+            '/openclaw/',
+        ];
+        for(const marker of markers){
+            const idx=path.toLowerCase().lastIndexOf(marker.toLowerCase());
+            if(idx>=0){
+                const suffix=path.slice(idx + marker.length).replace(/^\/+/, '');
+                if(suffix) return '/'+suffix;
+            }
+        }
+
+        // Generic container/workspace roots (e.g. /home/node/.openclaw/workspace-*/...)
+        const generic=path.match(/\/workspace-[^/]+\/(.+)$/i);
+        if(generic && generic[1]) return '/'+String(generic[1]).replace(/^\/+/, '');
+
+        return path;
+    };
+
+    const normalizedRaw=stripWorkspacePrefix(raw);
+    if(normalizedRaw.startsWith('/')) return normalizedRaw;
+    return '/' + normalizedRaw.replace(/^\/+/, '');
 }
 
 function buildFilesRouteHref(filePath){
@@ -1280,7 +1303,7 @@ const ASSISTANT_STREAM_PATCH_MIN_INTERVAL_MS=120;
 let assistantStreamPatchTimerId=0;
 let assistantStreamPatchSelectedId='active';
 let assistantStreamPatchLastRunTs=0;
-let assistantStreamPatchPendingMessage=null;
+const assistantStreamPatchPendingByRequestId=new Map();
 
 const CHAT_RENDER_MIN_INTERVAL_MS=140;
 let chatRenderTimerId=0;
@@ -1379,10 +1402,11 @@ function cssEsc(value){
 function scheduleAssistantStreamBubbleUpdate(selectedId, streamMessage){
     assistantStreamPatchSelectedId=selectedId||'active';
     if(streamMessage && typeof streamMessage==='object'){
-        assistantStreamPatchPendingMessage={
-            request_id:(streamMessage.request_id!==undefined&&streamMessage.request_id!==null)?String(streamMessage.request_id):'',
+        const requestId=(streamMessage.request_id!==undefined&&streamMessage.request_id!==null)?String(streamMessage.request_id):'';
+        assistantStreamPatchPendingByRequestId.set(requestId, {
+            request_id:requestId,
             text:String(streamMessage.text||''),
-        };
+        });
     }
     if(assistantStreamPatchTimerId) return;
     const now=Date.now();
@@ -1390,10 +1414,13 @@ function scheduleAssistantStreamBubbleUpdate(selectedId, streamMessage){
     assistantStreamPatchTimerId=setTimeout(()=>{
         assistantStreamPatchTimerId=0;
         assistantStreamPatchLastRunTs=Date.now();
-        const pendingMessage=assistantStreamPatchPendingMessage;
-        assistantStreamPatchPendingMessage=null;
-        const patched=updateAssistantStreamBubbleInPlace(assistantStreamPatchSelectedId, pendingMessage);
-        if(!patched) renderChatMessages(assistantStreamPatchSelectedId);
+        const pendingMessages=Array.from(assistantStreamPatchPendingByRequestId.values());
+        assistantStreamPatchPendingByRequestId.clear();
+        let patchedAny=false;
+        for(const pendingMessage of pendingMessages){
+            if(updateAssistantStreamBubbleInPlace(assistantStreamPatchSelectedId, pendingMessage)) patchedAny=true;
+        }
+        if(!patchedAny) renderChatMessages(assistantStreamPatchSelectedId);
     }, delay);
 }
 
@@ -1409,8 +1436,8 @@ function updateAssistantStreamBubbleInPlace(selectedId, streamMessage){
             let bubble=null;
             if(requestedId){
                 bubble=streamNodes.find((node)=>String(node.getAttribute('data-stream-request-id')||'')===requestedId) || null;
-            }
-            if(!bubble){
+                if(!bubble) return false;
+            }else if(!bubble){
                 bubble=streamNodes[streamNodes.length-1];
             }
             if(bubble){
@@ -1703,7 +1730,9 @@ function collateChatMessages(msgs){
                 if(!linkedPaths.includes(p)) linkedPaths.push(p);
             }
         }
-        for(const p of intersectPathsByReference(writeReferencedFiles, linkedPaths)){
+        const matchedWriteFiles=intersectPathsByReference(writeReferencedFiles, linkedPaths);
+        const fallbackWriteFiles=matchedWriteFiles.length ? matchedWriteFiles : writeReferencedFiles;
+        for(const p of fallbackWriteFiles){
             if(!referencedFiles.includes(p)) referencedFiles.push(p);
         }
         const extra={referenced_files:referencedFiles, written_files:referencedFiles};
@@ -2168,8 +2197,8 @@ function makeResponseCopyButton(getText){
 function makeUserMessageCopyButton(text){
     const btn=document.createElement('button');
     btn.type='button';
-    btn.className='px-2 py-1 rounded text-[11px] bg-gray-700 hover:bg-gray-600 text-gray-100 border border-gray-500 transition-colors';
-    btn.textContent='Copy';
+    btn.className='inline-flex items-center justify-center w-6 h-6 rounded text-[11px] bg-gray-700 hover:bg-gray-600 text-gray-100 border border-gray-500 transition-colors';
+    btn.textContent='⧉';
     btn.title='Copy this message to clipboard';
     btn.setAttribute('data-action','copy-user-message');
     btn.addEventListener('click', async(e) => {
@@ -2177,7 +2206,7 @@ function makeUserMessageCopyButton(text){
         try {
             await navigator.clipboard.writeText(text);
             const originalText=btn.textContent;
-            btn.textContent='Copied!';
+            btn.textContent='✓';
             btn.disabled=true;
             setTimeout(() => {
                 btn.textContent=originalText;
@@ -2185,26 +2214,10 @@ function makeUserMessageCopyButton(text){
             }, 2000);
         } catch(err) {
             console.error('Failed to copy:', err);
-            btn.textContent='Error';
-            setTimeout(() => { btn.textContent='Copy'; }, 1500);
+            btn.textContent='!';
+            setTimeout(() => { btn.textContent='⧉'; }, 1500);
         }
     });
-    return btn;
-}
-
-function makeResponseReloadButton(messageId, threadId){
-    const btn=document.createElement('button');
-    btn.type='button';
-    btn.className='px-2 py-1 rounded text-[11px] bg-blue-800 hover:bg-blue-700 text-blue-100 border border-blue-600 transition-colors';
-    if(S.pendingChatSends.size>0){
-        btn.disabled=true;
-        btn.classList.add('opacity-60','cursor-not-allowed');
-    }
-    btn.textContent=S.pendingChatSends.size>0 ? 'Reloading...' : 'Reload';
-    btn.title='Clear later messages and rerun this prompt';
-    btn.setAttribute('data-action','chat-reload-response');
-    btn.setAttribute('data-message-id', String(messageId||''));
-    btn.setAttribute('data-thread-id', String(threadId||'active'));
     return btn;
 }
 
@@ -2640,8 +2653,15 @@ function mkBubble(m){
             );
             const hasToolError=failedGroups.length>0;
             const hasLifecycleError=hasLifecycleHardError;
-            // Keep waiting active until a real completion signal arrives.
-            const waiting=(hasLifecycleStart && !hasLifecycleError && !m.hasFinal && (lastLifecyclePhase ? lastLifecyclePhase==='start' : !hasLifecycleEnd));
+            // Treat lifecycle end/result and terminal tool phases as completion,
+            // even when no final assistant message is emitted.
+            const hasCompletionSignal = !!(
+                hasLifecycleEnd
+                || lastLifecyclePhase === 'end'
+                || lastLifecyclePhase === 'result'
+                || allToolsTerminal
+            );
+            const waiting=(hasLifecycleStart && !hasLifecycleError && !hasToolError && !m.hasFinal && !hasCompletionSignal);
             const waitingRow=waiting
                 ? '<div class="px-2 py-1 border-b border-gray-800/60 text-[11px] text-yellow-300 flex items-center gap-2">'
                     +'<span class="inline-block w-3 h-3 border-2 border-yellow-300/80 border-t-transparent rounded-full animate-spin"></span>'
@@ -2821,20 +2841,11 @@ function mkBubble(m){
 
   const b=document.createElement('div');
     const isQuickAnswer=(m&&m.source)==='quick_answer';
-    const reloadThreadId=getChatReloadSelectedThreadId();
-    const isReloadSource=role==='user' && !!msgId && S.chatReloadTargetId===msgId && S.chatReloadTargetThreadId===reloadThreadId;
     b.className='max-w-xs sm:max-w-sm lg:max-w-md px-4 py-2 rounded-2xl text-sm leading-relaxed '+
         (role==='user'?'bg-blue-700 text-white rounded-br-md':
          role==='system'?'bg-gray-700 text-gray-300 italic text-xs':
      (isQuickAnswer?'bg-gray-600 border-2':'bg-gray-700')+' text-gray-100 rounded-bl-md');
     if(isQuickAnswer) b.style.borderColor='#15803d';
-    if(role==='user'){
-        b.setAttribute('data-action','chat-select-reload');
-        b.setAttribute('data-message-id', msgId);
-        b.classList.add('cursor-pointer','transition-colors');
-        b.title='Select this prompt to reload its response';
-        if(isReloadSource) b.classList.add('ring-2','ring-blue-300','ring-offset-2','ring-offset-gray-900');
-    }
     if(role==='assistant'){
         if(!isQuickAnswer) b.classList.add('relative','pr-12');
         const reqKey=String((m&&m.request_id)!==undefined && (m&&m.request_id)!==null ? m.request_id : 'na');
@@ -2892,13 +2903,10 @@ const referencedFiles=(Array.isArray(m.referenced_files)?m.referenced_files:m.wr
         const textWrap=document.createElement('div');
         textWrap.textContent=m.text||'';
         b.appendChild(textWrap);
-        if(isReloadSource){
-            const actions=document.createElement('div');
-            actions.className='mt-2 flex justify-end gap-2';
-            actions.appendChild(makeUserMessageCopyButton(m.text||''));
-            actions.appendChild(makeResponseReloadButton(msgId, reloadThreadId));
-            b.appendChild(actions);
-        }
+        const actions=document.createElement('div');
+        actions.className='mt-2 flex justify-end';
+        actions.appendChild(makeUserMessageCopyButton(m.text||''));
+        b.appendChild(actions);
     }else{
         b.textContent=m.text||'';
     }
