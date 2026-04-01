@@ -1,5 +1,6 @@
 from orchestrator.gateway.quick_answer import (
     QuickAnswerClient,
+    _truncate_to_target_words,
     build_system_prompt,
     build_tool_definitions,
     classify_upstream_decision,
@@ -22,6 +23,14 @@ def test_sanitize_quick_answer_text_collapses_whitespace_after_strip() -> None:
 
 def test_sanitize_quick_answer_text_handles_non_string() -> None:
     assert sanitize_quick_answer_text(None) == ""
+
+
+def test_truncate_to_target_words_caps_summary_at_50_words() -> None:
+    text = " ".join(f"word{i}" for i in range(1, 61))
+    truncated = _truncate_to_target_words(text, 50)
+    assert len(truncated.split()) == 50
+    assert truncated.split()[0] == "word1"
+    assert truncated.split()[-1] == "word50"
 
 
 def test_sanitize_quick_answer_text_extracts_nested_tool_result_response() -> None:
@@ -120,6 +129,19 @@ def test_classify_document_authoring_reason_for_lesson_plan_request() -> None:
 
 def test_should_not_force_upstream_for_recorder_intent_when_enabled() -> None:
     assert should_force_upstream("start recording", recorder_enabled=True) is False
+
+
+def test_should_force_upstream_for_transcript_request_when_recorder_enabled() -> None:
+    assert should_force_upstream("get the transcript for this youtube video", recorder_enabled=True) is True
+
+
+def test_classify_transcript_reason_when_recorder_enabled() -> None:
+    decision, reason = classify_upstream_decision(
+        "download captions from this video",
+        recorder_enabled=True,
+    )
+    assert decision is True
+    assert reason == "transcript_upstream"
 
 
 def test_should_not_force_upstream_for_recorder_intent_when_disabled() -> None:

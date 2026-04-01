@@ -339,6 +339,16 @@ ACTION_INTENT_PATTERNS = [
     r"\b(open|go to|navigate to|visit)\b\s+([\w-]+\.)+[a-z]{2,}\b",
 ]
 
+# Transcript retrieval/summarization should be handled upstream so the
+# video-transcript-downloader skill can run instead of recorder actions.
+TRANSCRIPT_INTENT_PATTERNS = [
+    r"\btranscript(?:s)?\b",
+    r"\bcaption(?:s)?\b",
+    r"\bsubtitle(?:s)?\b",
+    r"\byoutube\b.*\b(transcript|caption|subtitle)\b",
+    r"\b(video|youtube)\b.*\b(download|get|fetch|pull|extract)\b.*\b(transcript|captions?|subtitles?)\b",
+]
+
 # Long-form authoring/research requests should bypass quick answer and go upstream.
 DOCUMENT_AUTHORING_PATTERNS = [
     r"\b(write|draft|create|generate|prepare|compile)\b.*\b(document|doc|report|plan|lesson\s*plan|outline)\b",
@@ -399,6 +409,9 @@ def classify_upstream_decision(
 
     if any(re.search(pattern, query) for pattern in DOCUMENT_AUTHORING_PATTERNS):
         return True, "document_authoring"
+
+    if any(re.search(pattern, query) for pattern in TRANSCRIPT_INTENT_PATTERNS):
+        return True, "transcript_upstream"
 
     # If timers/alarms or music tooling is available, keep those intents local.
     if timers_enabled and any(re.search(pattern, query) for pattern in TIMER_ALARM_INTENT_PATTERNS):

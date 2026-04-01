@@ -208,6 +208,7 @@ class EmbeddedVoiceWebService:
         self._on_alarm_cancel: Callable[[str, str], Awaitable[None]] | None = None
         self._on_chat_new: Callable[[str], Awaitable[None]] | None = None
         self._on_chat_text: Callable[[str, str], Awaitable[None]] | None = None
+        self._on_chat_load_thread_messages: Callable[[str, str], Awaitable[list[dict[str, Any]] | None]] | None = None
         self._on_tts_mute_set: Callable[[bool, str], Awaitable[None]] | None = None
         self._on_browser_audio_set: Callable[[bool, str], Awaitable[None]] | None = None
         self._on_continuous_mode_set: Callable[[bool, str], Awaitable[None]] | None = None
@@ -771,6 +772,25 @@ class EmbeddedVoiceWebService:
             ]
         else:
             self._chat_threads = []
+    def set_active_chat_thread_id(self, thread_id: str) -> None:
+        tid = str(thread_id or "").strip()
+        self._active_chat_thread_id = tid or None
+        self._persist_chat_state()
+
+    def get_active_chat_thread_id(self) -> str | None:
+        return self._active_chat_thread_id
+
+    def replace_chat_threads(self, threads: list[dict[str, Any]], active_thread_id: str | None = None) -> None:
+        normalized = [dict(t) for t in threads if isinstance(t, dict)]
+        self._chat_threads = normalized[: self._chat_thread_limit]
+        requested_tid = str(active_thread_id or "").strip()
+        if requested_tid and any(str(t.get("id", "")).strip() == requested_tid for t in self._chat_threads):
+            self._active_chat_thread_id = requested_tid
+        elif self._active_chat_thread_id and not any(
+            str(t.get("id", "")).strip() == str(self._active_chat_thread_id or "").strip()
+            for t in self._chat_threads
+        ):
+            self._active_chat_thread_id = None
         self._persist_chat_state()
         asyncio.create_task(
             self.broadcast(
@@ -778,6 +798,36 @@ class EmbeddedVoiceWebService:
                     "type": "chat_threads_update",
                     "active_chat_id": self._active_chat_id,
                     "active_chat_thread_id": self._active_chat_thread_id,
+                    "chat_threads": list(self._chat_threads),
+                }
+            )
+        )
+
+    def select_chat_thread(self, thread_id: str, messages_override: list[dict[str, Any]] | None = None) -> bool:
+        tid = str(thread_id or "").strip()
+        if not tid or tid == "active":
+            return False
+        selected = next((t for t in self._chat_threads if str(t.get("id", "")).strip() == tid), None)
+        if not selected:
+            return False
+        if messages_override is not None:
+            selected["messages"] = list(messages_override)
+            selected["updated_ts"] = time.time()
+        messages = selected.get("messages")
+        if isinstance(messages, list):
+            self._chat_messages = list(messages[-self.chat_history_limit:])
+        else:
+            self._chat_messages = []
+        self._active_chat_id = "active"
+        self._active_chat_thread_id = tid
+        self._persist_chat_state()
+        asyncio.create_task(
+            self.broadcast(
+                {
+                    "type": "chat_reset",
+                    "active_chat_id": self._active_chat_id,
+                    "active_chat_thread_id": self._active_chat_thread_id,
+                    "chat": list(self._chat_messages),
                     "chat_threads": list(self._chat_threads),
                 }
             )
@@ -832,34 +882,6 @@ class EmbeddedVoiceWebService:
             )
         )
         return text
-
-    def select_chat_thread(self, thread_id: str) -> bool:
-        tid = str(thread_id or "").strip()
-        if not tid or tid == "active":
-            return False
-        selected = next((t for t in self._chat_threads if str(t.get("id", "")).strip() == tid), None)
-        if not selected:
-            return False
-        messages = selected.get("messages")
-        if isinstance(messages, list):
-            self._chat_messages = list(messages[-self.chat_history_limit:])
-        else:
-            self._chat_messages = []
-        self._active_chat_id = "active"
-        self._active_chat_thread_id = tid
-        self._persist_chat_state()
-        asyncio.create_task(
-            self.broadcast(
-                {
-                    "type": "chat_reset",
-                    "active_chat_id": self._active_chat_id,
-                    "active_chat_thread_id": self._active_chat_thread_id,
-                    "chat": list(self._chat_messages),
-                    "chat_threads": list(self._chat_threads),
-                }
-            )
-        )
-        return True
 
     def append_chat_message(self, message: dict[str, Any]) -> None:
         self._chat_seq += 1
@@ -1201,6 +1223,7 @@ class EmbeddedVoiceWebService:
         on_alarm_cancel: Callable[[str, str], Awaitable[None]] | None = None,
         on_chat_new: Callable[[str], Awaitable[None]] | None = None,
         on_chat_text: Callable[[str, str], Awaitable[None]] | None = None,
+        on_chat_load_thread_messages: Callable[[str, str], Awaitable[list[dict[str, Any]] | None]] | None = None,
         on_tts_mute_set: Callable[[bool, str], Awaitable[None]] | None = None,
         on_browser_audio_set: Callable[[bool, str], Awaitable[None]] | None = None,
         on_continuous_mode_set: Callable[[bool, str], Awaitable[None]] | None = None,
@@ -1263,6 +1286,8 @@ class EmbeddedVoiceWebService:
             self._on_chat_new = on_chat_new
         if on_chat_text is not None:
             self._on_chat_text = on_chat_text
+        if on_chat_load_thread_messages is not None:
+            self._on_chat_load_thread_messages = on_chat_load_thread_messages
         if on_tts_mute_set is not None:
             self._on_tts_mute_set = on_tts_mute_set
         if on_browser_audio_set is not None:
@@ -2168,8 +2193,15 @@ class EmbeddedVoiceWebService:
 
         if msg_type == "chat_select":
             thread_id = str(payload.get("thread_id", "")).strip()
+            logger.warning("chat_select received: thread_id=%r client=%s", thread_id, client_id)
             if thread_id:
-                self.select_chat_thread(thread_id)
+                loaded_messages: list[dict[str, Any]] | None = None
+                if self._on_chat_load_thread_messages is not None:
+                    try:
+                        loaded_messages = await self._on_chat_load_thread_messages(thread_id, client_id)
+                    except Exception as exc:
+                        logger.warning("chat_select loader error: %s", exc)
+                self.select_chat_thread(thread_id, messages_override=loaded_messages)
             return
 
         if msg_type == "chat_clear_all":

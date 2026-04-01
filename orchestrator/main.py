@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Sequence
 from urllib.parse import urlsplit
 from urllib.request import urlretrieve
+from uuid import uuid4
 
 from orchestrator.config import VoiceConfig
 from orchestrator.state import VoiceState, WakeState
@@ -679,6 +680,12 @@ async def run_orchestrator() -> None:
     gateway_collation_active_request_id = 0
     gateway_collation_last_frame_ts: float | None = None
     gateway_collation_close_task: asyncio.Task | None = None
+    gateway_lifecycle_watchdog_enabled = bool(config.gateway_lifecycle_watchdog_enabled)
+    gateway_watchdog_active_request_id = 0
+    gateway_watchdog_pending_error_text = ""
+    gateway_watchdog_abort_future: asyncio.Future | None = None
+    gateway_watchdog_error_grace_task: asyncio.Task | None = None
+    gateway_watchdog_post_retry_task: asyncio.Task | None = None
     dropped_out_of_window_gateway_frames = 0
     last_user_text = ""
     last_user_accepted_ts: float | None = None
@@ -738,6 +745,13 @@ async def run_orchestrator() -> None:
     last_wake_conf_log_ts = 0.0
     last_timeout_progress_log_ts = 0.0  # Rate-limit for inactivity progress logs
     warned_missing_playerctl = False
+
+    if gateway_lifecycle_watchdog_enabled:
+        logger.info(
+            "🛡️ Gateway lifecycle watchdog enabled (error grace=%dms, post-retry stall=%dms)",
+            max(500, int(config.gateway_lifecycle_error_grace_ms)),
+            max(1000, int(config.gateway_post_retry_stall_ms)),
+        )
 
     wake_detector = None
     active_wake_engine = None
@@ -841,11 +855,21 @@ async def run_orchestrator() -> None:
     
     # Native media backend runs in-process and does not require external daemon startup.
     
-    # Use the session prefix directly as a stable session name rather than appending a
-    # timestamp.  A stable name means all voice interactions accumulate in one persistent
-    # session (e.g. agent:voice:main) so the web chat UI always shows the full history.
-    session_id = config.gateway_session_prefix
     agent_id = config.gateway_agent_id or "assistant"
+    session_prefix = (config.gateway_session_prefix or "voice").strip() or "voice"
+
+    def _new_session_id() -> str:
+        return f"{session_prefix}-{uuid4().hex[:12]}"
+
+    def _session_key_for(sid: str) -> str:
+        return f"agent:{agent_id}:{sid}"
+
+    session_id = _new_session_id()
+    if hasattr(gateway, "set_session_id"):
+        try:
+            gateway.set_session_id(session_id)
+        except Exception as exc:
+            logger.debug("Gateway initial session hook failed: %s", exc)
     
     # Tool System (timers/alarms)
     tool_router = None
@@ -1880,27 +1904,11 @@ async def run_orchestrator() -> None:
     debounce_task: asyncio.Task | None = None
     processing_request = False  # Flag to prevent concurrent gateway requests
     web_service = None
-    new_session_reset_task: asyncio.Task | None = None
-
-    async def _send_gateway_session_reset(source: str) -> None:
-        try:
-            await gateway.send_message(
-                "/reset",
-                session_id=session_id,
-                agent_id=agent_id,
-                metadata={"source": source},
-            )
-            logger.info("✓ Gateway session reset via /reset")
-        except asyncio.CancelledError:
-            logger.info("↪ Gateway /reset task cancelled (source=%s)", source)
-            raise
-        except Exception as exc:
-            logger.warning("Gateway /reset failed (continuing with local reset): %s", exc)
 
     async def _start_new_session(*, source: str, client_id: str | None = None) -> str:
         nonlocal pending_transcripts, debounce_task, processing_request, current_request_id
         nonlocal suppress_gateway_messages_for_new_session
-        nonlocal new_session_reset_task
+        nonlocal session_id
         if client_id:
             logger.info("🆕 New session requested by %s (client=%s)", source, client_id)
         else:
@@ -1918,16 +1926,135 @@ async def run_orchestrator() -> None:
             _tts_clear_all(f"{source} new session")
             tts_stop_event.set()
 
+            old_session_id = session_id
+            old_session_key = _session_key_for(old_session_id)
             if web_service:
+                web_service.set_active_chat_thread_id(old_session_key)
                 web_service.start_new_chat()
 
-            if new_session_reset_task and not new_session_reset_task.done():
-                new_session_reset_task.cancel()
-            new_session_reset_task = asyncio.create_task(_send_gateway_session_reset(source))
+            session_id = _new_session_id()
+            if hasattr(gateway, "set_session_id"):
+                try:
+                    gateway.set_session_id(session_id)
+                except Exception as exc:
+                    logger.debug("Gateway session id rotate hook failed: %s", exc)
+            if web_service:
+                web_service.set_active_chat_thread_id(_session_key_for(session_id))
+            logger.info("🆕 Session rotated: %s -> %s", old_session_key, _session_key_for(session_id))
+            await _refresh_web_ui_chat_threads_from_gateway("new_session")
 
             return "Started a new session."
         finally:
             tts_stop_event.clear()
+
+    async def _refresh_web_ui_chat_threads_from_gateway(reason: str) -> None:
+        if not web_service or not config.web_ui_gateway_sessions_list_on_startup:
+            logger.warning("Web UI session list refresh skipped (%s): web_service=%s list_on_startup=%s", reason, bool(web_service), config.web_ui_gateway_sessions_list_on_startup)
+            return
+        if not hasattr(gateway, "list_sessions"):
+            logger.warning("Web UI session list refresh skipped (%s): gateway has no list_sessions method (type=%s)", reason, type(gateway).__name__)
+            return
+
+        try:
+            rows = await gateway.list_sessions(
+                agent_id=agent_id,
+                limit=config.web_ui_gateway_sessions_limit,
+                include_derived_titles=True,
+                include_last_message=True,
+            )
+        except Exception as exc:
+            logger.warning("Web UI session list refresh failed (%s): %s", reason, exc)
+            return
+
+        agent_key_prefix = f"agent:{agent_id}:"
+        now_s = time.time()
+        threads: list[dict[str, Any]] = []
+        for row in rows:
+            key = str(row.get("key", "")).strip()
+            if not key or not key.startswith(agent_key_prefix):
+                continue
+            updated_at = row.get("updatedAt")
+            updated_s = now_s
+            if isinstance(updated_at, (int, float)):
+                updated_s = float(updated_at) / 1000.0 if float(updated_at) > 1e12 else float(updated_at)
+            title = str(row.get("derivedTitle") or "").strip()
+            if not title:
+                title = str(row.get("lastMessagePreview") or "").strip()[:72]
+            if not title:
+                title = str(row.get("label") or "").strip()
+            if not title:
+                title = "Chat"
+            threads.append(
+                {
+                    "id": key,
+                    "title": title,
+                    "messages": [],
+                    "created_ts": updated_s,
+                    "updated_ts": updated_s,
+                    "source": "gateway",
+                }
+            )
+
+        active_key = _session_key_for(session_id)
+        if active_key and not any(str(t.get("id", "")).strip() == active_key for t in threads):
+            threads.insert(
+                0,
+                {
+                    "id": active_key,
+                    "title": "New chat",
+                    "messages": [],
+                    "created_ts": now_s,
+                    "updated_ts": now_s,
+                    "source": "gateway",
+                },
+            )
+        web_service.replace_chat_threads(threads, active_thread_id=active_key)
+        logger.warning("Web UI session list refresh (%s): %d thread(s)", reason, len(threads))
+
+    async def _ui_chat_load_thread_messages(thread_id: str, client_id: str) -> list[dict[str, Any]] | None:
+        nonlocal session_id
+        tid = str(thread_id or "").strip()
+        if not tid:
+            return None
+
+        # Selecting a thread switches the active upstream session for subsequent turns.
+        active_prefix = f"agent:{agent_id}:"
+        if tid.startswith(active_prefix):
+            selected_session_id = tid[len(active_prefix):]
+            if selected_session_id and selected_session_id != session_id:
+                logger.warning("Web UI chat_select switched active session: %s -> %s", session_id, selected_session_id)
+                session_id = selected_session_id
+                if hasattr(gateway, "set_session_id"):
+                    try:
+                        gateway.set_session_id(session_id)
+                    except Exception as exc:
+                        logger.debug("Gateway session switch hook failed: %s", exc)
+                if web_service:
+                    web_service.set_active_chat_thread_id(_session_key_for(session_id))
+
+        if not config.web_ui_gateway_sessions_lazy_load:
+            return None
+        if not hasattr(gateway, "fetch_chat_history"):
+            return None
+
+        try:
+            raw_messages = await gateway.fetch_chat_history(
+                session_key=tid,
+                limit=config.web_ui_chat_history_limit,
+            )
+            from orchestrator.gateway.session_mapper import map_gateway_messages_to_voice_format
+
+            mapped = map_gateway_messages_to_voice_format(raw_messages)
+            logger.warning(
+                "Web UI chat_select loaded %d messages from gateway for %s (client=%s)",
+                len(mapped),
+                tid,
+                client_id,
+            )
+            return mapped
+        except Exception as exc:
+            logger.warning("Web UI chat_select load failed for %s: %s", tid, exc)
+            return None
 
     if quick_answer_client:
         quick_answer_client.set_new_session_handler(
@@ -1998,6 +2125,22 @@ async def run_orchestrator() -> None:
                 mic_rms=0.0,
                 queue_depth=0,
             )
+
+            persisted_thread_id = web_service.get_active_chat_thread_id() if web_service else None
+            persisted_prefix = f"agent:{agent_id}:"
+            if isinstance(persisted_thread_id, str) and persisted_thread_id.startswith(persisted_prefix):
+                persisted_session_id = persisted_thread_id[len(f"agent:{agent_id}:"):]
+                if persisted_session_id:
+                    session_id = persisted_session_id
+                    if hasattr(gateway, "set_session_id"):
+                        try:
+                            gateway.set_session_id(session_id)
+                        except Exception as exc:
+                            logger.debug("Gateway session restore hook failed: %s", exc)
+                    logger.info("Restored active session from persisted chat state: %s", _session_key_for(session_id))
+
+            await _refresh_web_ui_chat_threads_from_gateway("startup")
+
             ui_scheme = "https" if config.web_ui_ssl_certfile and config.web_ui_ssl_keyfile else "http"
             ws_scheme = "wss" if ui_scheme == "https" else "ws"
             logger.info(
@@ -2023,6 +2166,8 @@ async def run_orchestrator() -> None:
             # Register web UI action handlers
             async def _ui_mic_toggle(client_id: str) -> None:
                 nonlocal wake_state, state, wake_sleep_ts, last_wake_detected_ts, last_activity_ts
+                nonlocal pending_transcripts, debounce_task, chunk_frames, chunk_start_ts
+                nonlocal last_speech_ts, cut_in_triggered_ts
 
                 if recording_blocks_tools and recorder_tool and recorder_tool.is_recording():
                     logger.info("🎛️ Web mic button stopping active recording")
@@ -2069,6 +2214,22 @@ async def run_orchestrator() -> None:
                     wake_sleep_ts = time.monotonic()
                     last_wake_detected_ts = None
                     state = VoiceState.IDLE
+                    # Discard any buffered audio and pending transcripts so that
+                    # in-flight STT results don't fire the debounce after sleep.
+                    pending_transcripts.clear()
+                    if debounce_task and not debounce_task.done():
+                        debounce_task.cancel()
+                    debounce_task = None
+                    chunk_frames = []
+                    chunk_start_ts = None
+                    last_speech_ts = None
+                    cut_in_triggered_ts = None
+                    ring_buffer.clear()
+                    if wake_detector and hasattr(wake_detector, 'reset_state'):
+                        try:
+                            wake_detector.reset_state()
+                        except Exception as e:
+                            logger.debug("Failed to reset wake detector on manual sleep: %s", e)
                     _play_sleep_feedback()
                 else:
                     web_service.update_ui_control_state(mic_enabled=True)
@@ -2546,6 +2707,7 @@ async def run_orchestrator() -> None:
                 on_alarm_cancel=_ui_alarm_cancel,
                 on_chat_new=_ui_chat_new,
                 on_chat_text=_ui_chat_text,
+                on_chat_load_thread_messages=_ui_chat_load_thread_messages,
                 on_tts_mute_set=_ui_tts_mute_set,
                 on_browser_audio_set=_ui_browser_audio_set,
                 on_continuous_mode_set=_ui_continuous_mode_set,
@@ -3066,6 +3228,178 @@ async def run_orchestrator() -> None:
                 logger.info("🧩 Closed gateway collation window [req#%d] (%s)", request_id, reason)
 
         gateway_collation_close_task = asyncio.create_task(_close_later())
+
+    def _clear_gateway_watchdog(request_id: int | None = None, reason: str = "") -> None:
+        nonlocal gateway_watchdog_active_request_id, gateway_watchdog_pending_error_text
+        nonlocal gateway_watchdog_abort_future, gateway_watchdog_error_grace_task, gateway_watchdog_post_retry_task
+
+        if request_id is not None and gateway_watchdog_active_request_id not in (0, int(request_id)):
+            return
+
+        if gateway_watchdog_error_grace_task and not gateway_watchdog_error_grace_task.done():
+            gateway_watchdog_error_grace_task.cancel()
+        if gateway_watchdog_post_retry_task and not gateway_watchdog_post_retry_task.done():
+            gateway_watchdog_post_retry_task.cancel()
+        gateway_watchdog_error_grace_task = None
+        gateway_watchdog_post_retry_task = None
+
+        if gateway_watchdog_abort_future is not None and not gateway_watchdog_abort_future.done():
+            gateway_watchdog_abort_future.cancel()
+        gateway_watchdog_abort_future = None
+
+        if gateway_watchdog_active_request_id > 0 and reason:
+            logger.debug(
+                "🛡️ Cleared gateway watchdog [req#%d] (%s)",
+                gateway_watchdog_active_request_id,
+                reason,
+            )
+
+        gateway_watchdog_active_request_id = 0
+        gateway_watchdog_pending_error_text = ""
+
+    def _signal_gateway_watchdog_abort(request_id: int, error_text: str) -> None:
+        nonlocal gateway_watchdog_active_request_id, gateway_watchdog_pending_error_text
+        nonlocal gateway_watchdog_abort_future, gateway_watchdog_error_grace_task, gateway_watchdog_post_retry_task
+
+        if request_id <= 0 or gateway_watchdog_active_request_id != int(request_id):
+            return
+
+        if gateway_watchdog_error_grace_task and not gateway_watchdog_error_grace_task.done():
+            gateway_watchdog_error_grace_task.cancel()
+        if gateway_watchdog_post_retry_task and not gateway_watchdog_post_retry_task.done():
+            gateway_watchdog_post_retry_task.cancel()
+        gateway_watchdog_error_grace_task = None
+        gateway_watchdog_post_retry_task = None
+
+        message = error_text.strip() if isinstance(error_text, str) else ""
+        if not message:
+            message = "gateway run stalled before a terminal lifecycle event was received"
+
+        if gateway_watchdog_abort_future is not None and not gateway_watchdog_abort_future.done():
+            gateway_watchdog_abort_future.set_result(message)
+
+        logger.warning("🛑 Gateway watchdog abort [req#%d]: %s", request_id, message)
+        gateway_watchdog_active_request_id = 0
+        gateway_watchdog_pending_error_text = ""
+
+    def _schedule_gateway_watchdog_error_grace(request_id: int, error_text: str) -> None:
+        nonlocal gateway_watchdog_pending_error_text, gateway_watchdog_error_grace_task, gateway_watchdog_post_retry_task
+
+        if not gateway_lifecycle_watchdog_enabled:
+            return
+        if request_id <= 0 or gateway_watchdog_active_request_id != int(request_id):
+            return
+
+        if gateway_watchdog_post_retry_task and not gateway_watchdog_post_retry_task.done():
+            gateway_watchdog_post_retry_task.cancel()
+            gateway_watchdog_post_retry_task = None
+
+        if gateway_watchdog_error_grace_task and not gateway_watchdog_error_grace_task.done():
+            gateway_watchdog_error_grace_task.cancel()
+
+        normalized_error = str(error_text or "").strip()
+        if not normalized_error:
+            normalized_error = "gateway lifecycle error"
+        gateway_watchdog_pending_error_text = normalized_error
+        grace_ms = max(500, int(config.gateway_lifecycle_error_grace_ms))
+
+        async def _grace_timeout() -> None:
+            try:
+                await asyncio.sleep(grace_ms / 1000.0)
+            except asyncio.CancelledError:
+                return
+            _signal_gateway_watchdog_abort(request_id, normalized_error)
+
+        gateway_watchdog_error_grace_task = asyncio.create_task(_grace_timeout())
+        logger.info(
+            "🛡️ Armed lifecycle-error grace timer [req#%d] (%dms)",
+            request_id,
+            grace_ms,
+        )
+
+    def _schedule_gateway_watchdog_post_retry_stall(request_id: int) -> None:
+        nonlocal gateway_watchdog_error_grace_task, gateway_watchdog_post_retry_task
+
+        if not gateway_lifecycle_watchdog_enabled:
+            return
+        if request_id <= 0 or gateway_watchdog_active_request_id != int(request_id):
+            return
+        if not gateway_watchdog_pending_error_text:
+            return
+
+        if gateway_watchdog_error_grace_task and not gateway_watchdog_error_grace_task.done():
+            gateway_watchdog_error_grace_task.cancel()
+        gateway_watchdog_error_grace_task = None
+
+        if gateway_watchdog_post_retry_task and not gateway_watchdog_post_retry_task.done():
+            gateway_watchdog_post_retry_task.cancel()
+
+        stall_ms = max(1000, int(config.gateway_post_retry_stall_ms))
+
+        async def _stall_timeout() -> None:
+            try:
+                await asyncio.sleep(stall_ms / 1000.0)
+            except asyncio.CancelledError:
+                return
+            suffix = "Retry restarted but no terminal lifecycle event was received."
+            prior = gateway_watchdog_pending_error_text.strip()
+            combined = f"{prior} {suffix}".strip() if prior else suffix
+            _signal_gateway_watchdog_abort(request_id, combined)
+
+        gateway_watchdog_post_retry_task = asyncio.create_task(_stall_timeout())
+        logger.info(
+            "🛡️ Armed post-retry stall timer [req#%d] (%dms)",
+            request_id,
+            stall_ms,
+        )
+
+    def _refresh_gateway_watchdog_post_retry(request_id: int) -> None:
+        if not gateway_lifecycle_watchdog_enabled:
+            return
+        if request_id <= 0 or gateway_watchdog_active_request_id != int(request_id):
+            return
+        if gateway_watchdog_post_retry_task is None or gateway_watchdog_post_retry_task.done():
+            return
+        _schedule_gateway_watchdog_post_retry_stall(request_id)
+
+    def _start_gateway_watchdog(request_id: int) -> asyncio.Future | None:
+        nonlocal gateway_watchdog_active_request_id, gateway_watchdog_pending_error_text
+        nonlocal gateway_watchdog_abort_future
+
+        if not gateway_lifecycle_watchdog_enabled or request_id <= 0:
+            return None
+
+        _clear_gateway_watchdog(reason="new_request")
+        gateway_watchdog_active_request_id = int(request_id)
+        gateway_watchdog_pending_error_text = ""
+        gateway_watchdog_abort_future = asyncio.get_running_loop().create_future()
+        logger.debug("🛡️ Started gateway watchdog [req#%d]", request_id)
+        return gateway_watchdog_abort_future
+
+    def _extract_lifecycle_error_text(details: Any) -> str:
+        if isinstance(details, str):
+            raw = details.strip()
+            if not raw:
+                return ""
+            try:
+                parsed = json.loads(raw)
+            except Exception:
+                return raw
+            if isinstance(parsed, dict):
+                details = parsed
+            else:
+                return raw
+
+        if isinstance(details, dict):
+            for key in ("error", "message", "detail", "reason"):
+                value = details.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+                if isinstance(value, dict):
+                    nested = _extract_lifecycle_error_text(value)
+                    if nested:
+                        return nested
+        return ""
 
     def _append_recorder_finished_chat(stop_result: Any) -> None:
         if not web_service:
@@ -3743,18 +4077,47 @@ async def run_orchestrator() -> None:
                 _open_gateway_collation_window(req_for_gateway)
                 response_text: str | None = None
                 response_error_text = ""
+                send_task: asyncio.Task | None = None
+                watchdog_future: asyncio.Future | None = None
                 try:
-                    response_text = await gateway.send_message(
-                        final_text,
-                        session_id=session_id,
-                        agent_id=agent_id,
-                        metadata={"emotion": emotion_tag} if emotion_tag else {},
+                    watchdog_future = _start_gateway_watchdog(req_for_gateway)
+                    send_task = asyncio.create_task(
+                        gateway.send_message(
+                            final_text,
+                            session_id=session_id,
+                            agent_id=agent_id,
+                            metadata={"emotion": emotion_tag} if emotion_tag else {},
+                        )
                     )
+                    if watchdog_future is not None:
+                        done, _ = await asyncio.wait(
+                            {send_task, watchdog_future},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if watchdog_future in done and send_task not in done:
+                            try:
+                                response_error_text = str(watchdog_future.result()).strip() or "gateway request stalled"
+                            except Exception:
+                                response_error_text = "gateway request stalled"
+                            send_task.cancel()
+                            try:
+                                await send_task
+                            except asyncio.CancelledError:
+                                pass
+                            except Exception as cancel_exc:
+                                logger.debug("Gateway send task failed after watchdog cancel: %s", cancel_exc)
+                        else:
+                            response_text = await send_task
+                    else:
+                        response_text = await send_task
+
                     gw_elapsed = int((time.monotonic() - gw_start) * 1000)
                     logger.info("← GATEWAY: Response received in %dms", gw_elapsed)
                 except Exception as exc:
                     response_error_text = str(exc).strip() or "gateway request failed"
                     logger.warning("Gateway send failed (%s); continuing", response_error_text)
+                finally:
+                    _clear_gateway_watchdog(req_for_gateway, reason="gateway_send_complete")
                 streamed_fallback_text = ""
                 if not response_text:
                     streamed_fallback_text = _latest_stream_text_for_request(req_for_gateway)
@@ -3783,7 +4146,7 @@ async def run_orchestrator() -> None:
                         summary_enabled
                         and (
                             response_error_text
-                            or response_word_count >= summary_trigger_words
+                            or response_word_count > summary_trigger_words
                         )
                     )
 
@@ -4944,6 +5307,27 @@ async def run_orchestrator() -> None:
                     if request_id <= 0:
                         continue
                     _touch_gateway_collation_window(request_id)
+
+                    if gateway_lifecycle_watchdog_enabled and gateway_watchdog_active_request_id == int(request_id):
+                        name = str(step.get("name") or "event").strip() or "event"
+                        phase = str(step.get("phase") or "update").strip() or "update"
+                        details = step.get("details")
+                        name_lower = name.lower()
+                        phase_lower = phase.lower()
+
+                        if name_lower == "lifecycle":
+                            if phase_lower == "error":
+                                lifecycle_error = _extract_lifecycle_error_text(details) or "gateway lifecycle error"
+                                _schedule_gateway_watchdog_error_grace(request_id, lifecycle_error)
+                            elif phase_lower == "start":
+                                _schedule_gateway_watchdog_post_retry_stall(request_id)
+                            elif phase_lower == "end":
+                                _clear_gateway_watchdog(request_id, reason="lifecycle_end")
+                            else:
+                                _refresh_gateway_watchdog_post_retry(request_id)
+                        else:
+                            _refresh_gateway_watchdog_post_retry(request_id)
+
                     if suppress_gateway_messages_for_new_session:
                         continue
 

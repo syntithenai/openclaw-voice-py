@@ -209,6 +209,9 @@ class VoiceConfig(BaseSettings):
     openclaw_gateway_url: str = Field("", validation_alias=AliasChoices("OPENCLAW_GATEWAY_URL"))
     gateway_timeout_ms: int = Field(30000, validation_alias=AliasChoices("VOICE_GATEWAY_TIMEOUT", "GATEWAY_TIMEOUT_MS"))
     gateway_agent_response_timeout_ms: int = Field(1800000, validation_alias=AliasChoices("GATEWAY_AGENT_RESPONSE_TIMEOUT_MS"))  # Long-running agent completion wait (default 30 min)
+    gateway_lifecycle_watchdog_enabled: bool = Field(True, validation_alias=AliasChoices("GATEWAY_LIFECYCLE_WATCHDOG_ENABLED"))
+    gateway_lifecycle_error_grace_ms: int = Field(15000, validation_alias=AliasChoices("GATEWAY_LIFECYCLE_ERROR_GRACE_MS"))
+    gateway_post_retry_stall_ms: int = Field(20000, validation_alias=AliasChoices("GATEWAY_POST_RETRY_STALL_MS"))
     gateway_session_prefix: str = Field("voice", validation_alias=AliasChoices("VOICE_SESSION_PREFIX"))
     gateway_debounce_ms: int = Field(2000, validation_alias=AliasChoices("GATEWAY_DEBOUNCE_MS"))
     gateway_tts_fast_start_words: int = Field(5, validation_alias=AliasChoices("GATEWAY_TTS_FAST_START_WORDS"))
@@ -275,8 +278,8 @@ class VoiceConfig(BaseSettings):
 
     # TTS long-response summary behavior (uses quick-answer endpoint for spoken compression)
     tts_long_response_summary_enabled: bool = Field(True)
-    tts_long_response_summary_word_trigger: int = Field(40)
-    tts_long_response_summary_target_words: int = Field(20)
+    tts_long_response_summary_word_trigger: int = Field(50)
+    tts_long_response_summary_target_words: int = Field(50)
     tts_long_response_summary_timeout_ms: int = Field(3500)
     gateway_tts_streaming_enabled: bool = Field(False, validation_alias=AliasChoices("GATEWAY_TTS_STREAMING_ENABLED"))
 
@@ -318,6 +321,9 @@ class VoiceConfig(BaseSettings):
     web_ui_hotword_active_ms: int = Field(2000)  # How long to keep hotword indicator active in UI after detection
     web_ui_chat_history_limit: int = Field(200)  # Max chat messages retained in web UI memory
     web_ui_chat_persist_path: str = Field("")  # Path to JSON file for durable chat thread storage; empty = ~/.openclaw/chat_state.json
+    web_ui_gateway_sessions_list_on_startup: bool = Field(True)  # Load gateway sessions into UI threads on startup
+    web_ui_gateway_sessions_limit: int = Field(200)  # Max gateway sessions to list for chat thread sidebar
+    web_ui_gateway_sessions_lazy_load: bool = Field(True)  # Lazy-load selected thread messages via chat.history
     web_ui_music_poll_ms: int = Field(1000)  # How often to poll native music state (ms)
     web_ui_timer_poll_ms: int = Field(500)  # How often to push timer state to UI (ms)
     web_ui_mic_starts_disabled: bool = Field(True)  # Mic button starts in disabled (red) state

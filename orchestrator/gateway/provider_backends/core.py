@@ -216,6 +216,14 @@ class OpenClawGateway(BaseGateway):
         self._last_reasoning_text: str = ""
         self._raw_dump_path = Path("/tmp/openclaw_gateway_stream.jsonl")
 
+    def set_session_id(self, session_id: str) -> None:
+        """Rotate the active gateway session suffix used by send_message()."""
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        self.session_prefix = sid
+        self._current_session_key = None
+
     def _dump_raw_frame(self, raw_message: str, *, parsed: Any = None, note: str = "") -> None:
         entry: dict[str, Any] = {
             "ts": time.time(),
@@ -944,6 +952,45 @@ class OpenClawGateway(BaseGateway):
         if not bool(res.get("ok")):
             err = (res.get("error") or {}).get("message") if isinstance(res.get("error"), dict) else "chat.inject failed"
             raise RuntimeError(f"OpenClaw chat.inject failed: {err}")
+
+    async def list_sessions(
+        self,
+        *,
+        agent_id: str,
+        limit: int = 100,
+        include_derived_titles: bool = True,
+        include_last_message: bool = True,
+    ) -> list[dict[str, Any]]:
+        """List gateway sessions for a specific agent id."""
+        await self._ensure_connected()
+        params: dict[str, Any] = {
+            "agentId": str(agent_id or self.agent_id),
+            "limit": max(1, int(limit)),
+            "includeDerivedTitles": bool(include_derived_titles),
+            "includeLastMessage": bool(include_last_message),
+        }
+        res = await self._send_request("sessions.list", params, timeout_s=self.timeout_s)
+        if not bool(res.get("ok")):
+            err = (res.get("error") or {}).get("message") if isinstance(res.get("error"), dict) else "sessions.list failed"
+            raise RuntimeError(f"OpenClaw sessions.list failed: {err}")
+        payload_obj = res.get("payload") if isinstance(res.get("payload"), dict) else {}
+        sessions = payload_obj.get("sessions") if isinstance(payload_obj.get("sessions"), list) else []
+        return [item for item in sessions if isinstance(item, dict)]
+
+    async def fetch_chat_history(self, *, session_key: str, limit: int = 200) -> list[dict[str, Any]]:
+        """Fetch transcript history for a single gateway session key."""
+        await self._ensure_connected()
+        params = {
+            "sessionKey": str(session_key or "").strip(),
+            "limit": max(1, int(limit)),
+        }
+        res = await self._send_request("chat.history", params, timeout_s=self.timeout_s)
+        if not bool(res.get("ok")):
+            err = (res.get("error") or {}).get("message") if isinstance(res.get("error"), dict) else "chat.history failed"
+            raise RuntimeError(f"OpenClaw chat.history failed: {err}")
+        payload_obj = res.get("payload") if isinstance(res.get("payload"), dict) else {}
+        messages = payload_obj.get("messages") if isinstance(payload_obj.get("messages"), list) else []
+        return [item for item in messages if isinstance(item, dict)]
 
     async def listen(self) -> AsyncIterator[str]:
         await self._ensure_connected()

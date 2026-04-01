@@ -119,9 +119,13 @@ function handleMsg(msg){
                     }else if(isTransientContext && typeof isAssistantStreamBubbleActive==='function' && isAssistantStreamBubbleActive()){
                         // Defer expensive grouped-context rerenders while stream bubble is active.
                     }else if(typeof scheduleChatMessagesRender==='function'){
-                        if(!patchedByRole) scheduleChatMessagesRender('active');
+                        // Also re-render when a final assistant message is patched in-place so the
+                        // context_group thinking spinner is updated (hasFinal→true clears waiting).
+                        const isFinalAssistant=!!nextMsg && nextMsg.role==='assistant' && !isAssistantStream;
+                        if(!patchedByRole || isFinalAssistant) scheduleChatMessagesRender('active');
                     }else{
-                        if(!patchedByRole) renderChatMessages('active');
+                        const isFinalAssistant=!!nextMsg && nextMsg.role==='assistant' && !isAssistantStream;
+                        if(!patchedByRole || isFinalAssistant) renderChatMessages('active');
                     }
                 }
             }
@@ -156,9 +160,11 @@ function handleMsg(msg){
                             }else if(isTransientContext && typeof isAssistantStreamBubbleActive==='function' && isAssistantStreamBubbleActive()){
                                 // Defer expensive grouped-context rerenders while stream bubble is active.
                             }else if(typeof scheduleChatMessagesRender==='function'){
-                                if(!patchedByRole) scheduleChatMessagesRender('active');
+                                const isFinalAssistant=updatedMsg.role==='assistant' && !isAssistantStream;
+                                if(!patchedByRole || isFinalAssistant) scheduleChatMessagesRender('active');
                             }else{
-                                if(!patchedByRole) renderChatMessages('active');
+                                const isFinalAssistant=updatedMsg.role==='assistant' && !isAssistantStream;
+                                if(!patchedByRole || isFinalAssistant) renderChatMessages('active');
                             }
                         }
                     }
