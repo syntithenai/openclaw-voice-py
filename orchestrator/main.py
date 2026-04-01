@@ -2044,6 +2044,11 @@ async def run_orchestrator() -> None:
             )
             from orchestrator.gateway.session_mapper import map_gateway_messages_to_voice_format
 
+            logger.warning(
+                "Web UI chat.history raw: %d items, first=%r",
+                len(raw_messages),
+                raw_messages[0] if raw_messages else None,
+            )
             mapped = map_gateway_messages_to_voice_format(raw_messages)
             logger.warning(
                 "Web UI chat_select loaded %d messages from gateway for %s (client=%s)",
@@ -2055,6 +2060,93 @@ async def run_orchestrator() -> None:
         except Exception as exc:
             logger.warning("Web UI chat_select load failed for %s: %s", tid, exc)
             return None
+
+    async def _ui_client_connect(client_id: str) -> None:
+        await _refresh_web_ui_chat_threads_from_gateway(f"client_connect:{client_id}")
+
+    async def _ui_chat_clear_all(thread_ids: list[str], client_id: str) -> None:
+        active_key = _session_key_for(session_id)
+        clearable_ids = [
+            str(thread_id or "").strip()
+            for thread_id in thread_ids
+            if str(thread_id or "").strip() and str(thread_id or "").strip() != active_key
+        ]
+        if not clearable_ids:
+            if web_service:
+                web_service.clear_chat_threads()
+            return
+
+        if not hasattr(gateway, "delete_session"):
+            logger.warning(
+                "Web UI chat_clear_all skipped upstream delete: gateway has no delete_session method (type=%s)",
+                type(gateway).__name__,
+            )
+            if web_service:
+                web_service.clear_chat_threads()
+            return
+
+        deleted = 0
+        for thread_id in clearable_ids:
+            try:
+                result = await gateway.delete_session(
+                    session_key=thread_id,
+                    delete_transcript=True,
+                )
+                if result:
+                    deleted += 1
+            except Exception as exc:
+                logger.warning(
+                    "Web UI chat_clear_all failed deleting session %s (client=%s): %s",
+                    thread_id,
+                    client_id,
+                    exc,
+                )
+
+        logger.warning(
+            "Web UI chat_clear_all deleted %d/%d session(s) upstream (client=%s)",
+            deleted,
+            len(clearable_ids),
+            client_id,
+        )
+        await _refresh_web_ui_chat_threads_from_gateway(f"chat_clear_all:{client_id}")
+
+    async def _ui_chat_delete(thread_id: str, client_id: str) -> None:
+        tid = str(thread_id or "").strip()
+        active_key = _session_key_for(session_id)
+        if not tid or tid == "active" or tid == active_key:
+            if web_service and tid:
+                web_service.delete_chat_thread(tid)
+            return
+
+        if not hasattr(gateway, "delete_session"):
+            logger.warning(
+                "Web UI chat_delete skipped upstream delete: gateway has no delete_session method (type=%s)",
+                type(gateway).__name__,
+            )
+            if web_service:
+                web_service.delete_chat_thread(tid)
+            return
+
+        try:
+            deleted = await gateway.delete_session(
+                session_key=tid,
+                delete_transcript=True,
+            )
+            logger.warning(
+                "Web UI chat_delete upstream delete %s for %s (client=%s)",
+                "succeeded" if deleted else "reported no-op",
+                tid,
+                client_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Web UI chat_delete failed deleting session %s (client=%s): %s",
+                tid,
+                client_id,
+                exc,
+            )
+
+        await _refresh_web_ui_chat_threads_from_gateway(f"chat_delete:{client_id}")
 
     if quick_answer_client:
         quick_answer_client.set_new_session_handler(
@@ -2708,6 +2800,9 @@ async def run_orchestrator() -> None:
                 on_chat_new=_ui_chat_new,
                 on_chat_text=_ui_chat_text,
                 on_chat_load_thread_messages=_ui_chat_load_thread_messages,
+                on_chat_delete=_ui_chat_delete,
+                on_chat_clear_all=_ui_chat_clear_all,
+                on_client_connect=_ui_client_connect,
                 on_tts_mute_set=_ui_tts_mute_set,
                 on_browser_audio_set=_ui_browser_audio_set,
                 on_continuous_mode_set=_ui_continuous_mode_set,

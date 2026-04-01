@@ -209,6 +209,9 @@ class EmbeddedVoiceWebService:
         self._on_chat_new: Callable[[str], Awaitable[None]] | None = None
         self._on_chat_text: Callable[[str, str], Awaitable[None]] | None = None
         self._on_chat_load_thread_messages: Callable[[str, str], Awaitable[list[dict[str, Any]] | None]] | None = None
+        self._on_chat_delete: Callable[[str, str], Awaitable[None]] | None = None
+        self._on_chat_clear_all: Callable[[list[str], str], Awaitable[None]] | None = None
+        self._on_client_connect: Callable[[str], Awaitable[None]] | None = None
         self._on_tts_mute_set: Callable[[bool, str], Awaitable[None]] | None = None
         self._on_browser_audio_set: Callable[[bool, str], Awaitable[None]] | None = None
         self._on_continuous_mode_set: Callable[[bool, str], Awaitable[None]] | None = None
@@ -772,6 +775,19 @@ class EmbeddedVoiceWebService:
             ]
         else:
             self._chat_threads = []
+        self._persist_chat_state()
+        asyncio.create_task(
+            self.broadcast(
+                {
+                    "type": "chat_threads_update",
+                    "active_chat_id": self._active_chat_id,
+                    "active_chat_thread_id": self._active_chat_thread_id,
+                    "chat_threads": list(self._chat_threads),
+                }
+            )
+        )
+        return True
+
     def set_active_chat_thread_id(self, thread_id: str) -> None:
         tid = str(thread_id or "").strip()
         self._active_chat_thread_id = tid or None
@@ -779,6 +795,16 @@ class EmbeddedVoiceWebService:
 
     def get_active_chat_thread_id(self) -> str | None:
         return self._active_chat_thread_id
+
+    def get_clearable_chat_thread_ids(self) -> list[str]:
+        active_tid = str(self._active_chat_thread_id or "").strip()
+        out: list[str] = []
+        for thread in self._chat_threads:
+            tid = str(thread.get("id", "")).strip()
+            if not tid or tid == active_tid:
+                continue
+            out.append(tid)
+        return out
 
     def replace_chat_threads(self, threads: list[dict[str, Any]], active_thread_id: str | None = None) -> None:
         normalized = [dict(t) for t in threads if isinstance(t, dict)]
@@ -812,7 +838,6 @@ class EmbeddedVoiceWebService:
             return False
         if messages_override is not None:
             selected["messages"] = list(messages_override)
-            selected["updated_ts"] = time.time()
         messages = selected.get("messages")
         if isinstance(messages, list):
             self._chat_messages = list(messages[-self.chat_history_limit:])
@@ -1224,6 +1249,9 @@ class EmbeddedVoiceWebService:
         on_chat_new: Callable[[str], Awaitable[None]] | None = None,
         on_chat_text: Callable[[str, str], Awaitable[None]] | None = None,
         on_chat_load_thread_messages: Callable[[str, str], Awaitable[list[dict[str, Any]] | None]] | None = None,
+        on_chat_delete: Callable[[str, str], Awaitable[None]] | None = None,
+        on_chat_clear_all: Callable[[list[str], str], Awaitable[None]] | None = None,
+        on_client_connect: Callable[[str], Awaitable[None]] | None = None,
         on_tts_mute_set: Callable[[bool, str], Awaitable[None]] | None = None,
         on_browser_audio_set: Callable[[bool, str], Awaitable[None]] | None = None,
         on_continuous_mode_set: Callable[[bool, str], Awaitable[None]] | None = None,
@@ -1288,6 +1316,12 @@ class EmbeddedVoiceWebService:
             self._on_chat_text = on_chat_text
         if on_chat_load_thread_messages is not None:
             self._on_chat_load_thread_messages = on_chat_load_thread_messages
+        if on_chat_delete is not None:
+            self._on_chat_delete = on_chat_delete
+        if on_chat_clear_all is not None:
+            self._on_chat_clear_all = on_chat_clear_all
+        if on_client_connect is not None:
+            self._on_client_connect = on_client_connect
         if on_tts_mute_set is not None:
             self._on_tts_mute_set = on_tts_mute_set
         if on_browser_audio_set is not None:
@@ -1342,6 +1376,11 @@ class EmbeddedVoiceWebService:
                 "ws_port": self.ws_port,
                 "ui_port": self.ui_port,
             }))
+            if self._on_client_connect is not None:
+                try:
+                    await self._on_client_connect(client_id)
+                except Exception as exc:
+                    logger.warning("Web UI client connect bootstrap failed (%s): %s", client_id, exc)
             # Fetch fresh music state if cache is empty (ensures page load shows current playback state)
             if self._on_get_music_state and (not self._music_state or not self._music_queue):
                 try:
@@ -2188,7 +2227,13 @@ class EmbeddedVoiceWebService:
         if msg_type == "chat_delete":
             thread_id = str(payload.get("thread_id", "")).strip()
             if thread_id:
-                self.delete_chat_thread(thread_id)
+                if self._on_chat_delete is not None:
+                    try:
+                        await self._on_chat_delete(thread_id, client_id)
+                    except Exception as exc:
+                        logger.warning("chat_delete handler error: %s", exc)
+                else:
+                    self.delete_chat_thread(thread_id)
             return
 
         if msg_type == "chat_select":
@@ -2205,7 +2250,13 @@ class EmbeddedVoiceWebService:
             return
 
         if msg_type == "chat_clear_all":
-            self.clear_chat_threads()
+            if self._on_chat_clear_all is not None:
+                try:
+                    await self._on_chat_clear_all(self.get_clearable_chat_thread_ids(), client_id)
+                except Exception as exc:
+                    logger.warning("chat_clear_all handler error: %s", exc)
+            else:
+                self.clear_chat_threads()
             return
 
         if msg_type == "chat_reload" and self._on_chat_text:

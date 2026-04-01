@@ -977,6 +977,20 @@ class OpenClawGateway(BaseGateway):
         sessions = payload_obj.get("sessions") if isinstance(payload_obj.get("sessions"), list) else []
         return [item for item in sessions if isinstance(item, dict)]
 
+    async def delete_session(self, *, session_key: str, delete_transcript: bool = True) -> bool:
+        """Delete a single gateway session by key."""
+        await self._ensure_connected()
+        params = {
+            "key": str(session_key or "").strip(),
+            "deleteTranscript": bool(delete_transcript),
+        }
+        res = await self._send_request("sessions.delete", params, timeout_s=self.timeout_s)
+        if not bool(res.get("ok")):
+            err = (res.get("error") or {}).get("message") if isinstance(res.get("error"), dict) else "sessions.delete failed"
+            raise RuntimeError(f"OpenClaw sessions.delete failed: {err}")
+        payload_obj = res.get("payload") if isinstance(res.get("payload"), dict) else {}
+        return bool(payload_obj.get("deleted", False))
+
     async def fetch_chat_history(self, *, session_key: str, limit: int = 200) -> list[dict[str, Any]]:
         """Fetch transcript history for a single gateway session key."""
         await self._ensure_connected()
