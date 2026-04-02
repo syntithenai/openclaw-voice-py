@@ -1,3 +1,36 @@
+function upsertTaskById(list, byId, task){
+    if(!task || typeof task!=='object') return;
+    const id=String(task.task_id||task.run_id||task.id||'').trim();
+    if(!id) return;
+    const next=Object.assign({}, byId[id]||{}, task, {task_id:id});
+    byId[id]=next;
+    const idx=list.findIndex((entry)=>String((entry&&entry.task_id)||'')===id);
+    if(idx>=0) list[idx]=next;
+    else list.push(next);
+}
+
+function appendSandboxTaskLog(msg){
+    const taskId=String((msg&&msg.task_id)||'').trim();
+    if(!taskId) return;
+    if(!S.sandboxTaskLogEntriesById[taskId]) S.sandboxTaskLogEntriesById[taskId]=[];
+    const entry={
+        seq:Number(msg.seq||0),
+        stream:String(msg.stream||'stdout'),
+        lines:Array.isArray(msg.lines)?msg.lines:[String(msg.lines||'')],
+    };
+    S.sandboxTaskLogEntriesById[taskId].push(entry);
+    if(S.sandboxTaskLogEntriesById[taskId].length>400) S.sandboxTaskLogEntriesById[taskId]=S.sandboxTaskLogEntriesById[taskId].slice(-400);
+}
+
+function appendSubagentThinking(msg){
+    const runId=String((msg&&msg.run_id)||'').trim();
+    if(!runId) return;
+    if(!S.subagentThinkingEntriesById[runId]) S.subagentThinkingEntriesById[runId]=[];
+    const entry={seq:Number(msg.seq||0), text_delta:String(msg.text_delta||'')};
+    S.subagentThinkingEntriesById[runId].push(entry);
+    if(S.subagentThinkingEntriesById[runId].length>400) S.subagentThinkingEntriesById[runId]=S.subagentThinkingEntriesById[runId].slice(-400);
+}
+
 function handleMsg(msg){
   // Debug logging for music actions
   if(msg.type && msg.type.startsWith('music_')) console.log(`📥 Received message type="${msg.type}"`, {queue_len: Array.isArray(msg.music_queue) ? msg.music_queue.length : 'N/A', rev: msg.music_rev, action_ack: msg.action_ack});
@@ -50,6 +83,16 @@ function handleMsg(msg){
     if(msg.recordings_rev!==undefined) S.lastRecordingsRev=Math.max(S.lastRecordingsRev, Number(msg.recordings_rev)||0);
     if(Array.isArray(msg.timers)) applyTimers(msg.timers);
     if(msg.timers_rev!==undefined) S.lastTimersRev=Math.max(S.lastTimersRev, Number(msg.timers_rev)||0);
+    if(Array.isArray(msg.sandbox_tasks)){
+        S.sandboxTasks=[];
+        S.sandboxTaskById={};
+        msg.sandbox_tasks.forEach((task)=>upsertTaskById(S.sandboxTasks, S.sandboxTaskById, task));
+    }
+    if(Array.isArray(msg.subagent_tasks)){
+        S.subagentTasks=[];
+        S.subagentTaskById={};
+        msg.subagent_tasks.forEach((task)=>upsertTaskById(S.subagentTasks, S.subagentTaskById, task));
+    }
             applyServerChatState(msg.chat, msg.chat_threads, msg.active_chat_id, msg.active_chat_thread_id);
             if(S.page==='music' && (!Array.isArray(S.musicPlaylists) || S.musicPlaylists.length===0)){
                 sendAction({type:'music_list_playlists'});
@@ -128,6 +171,46 @@ function handleMsg(msg){
                         if(!patchedByRole || isFinalAssistant) renderChatMessages('active');
                     }
                 }
+            }
+            break;
+        case 'sandbox_exec_update':
+            if(msg.task){
+                upsertTaskById(S.sandboxTasks, S.sandboxTaskById, msg.task);
+                renderTimerBar();
+            }
+            break;
+        case 'sandbox_exec_log_append':
+            appendSandboxTaskLog(msg);
+            if(S.sandboxTaskPanelOpen && String(S.sandboxTaskPanelId||'')===String(msg.task_id||'')) renderTimerBar();
+            break;
+        case 'sandbox_task_logs':
+            if(msg.task_id){
+                S.sandboxTaskLogEntriesById[String(msg.task_id)] = Array.isArray(msg.entries)?msg.entries:[];
+                if(S.sandboxTaskPanelOpen && String(S.sandboxTaskPanelId||'')===String(msg.task_id||'')) renderTimerBar();
+            }
+            break;
+        case 'subagent_task_update':
+            if(msg.task){
+                upsertTaskById(S.subagentTasks, S.subagentTaskById, msg.task);
+                renderTimerBar();
+            }
+            break;
+        case 'subagent_thinking_append':
+            appendSubagentThinking(msg);
+            if(S.subagentTaskPanelOpen && String(S.subagentTaskPanelId||'')===String(msg.run_id||'')) renderTimerBar();
+            break;
+        case 'subagent_task_thinking':
+            if(msg.run_id){
+                S.subagentThinkingEntriesById[String(msg.run_id)] = Array.isArray(msg.entries)?msg.entries:[];
+                if(S.subagentTaskPanelOpen && String(S.subagentTaskPanelId||'')===String(msg.run_id||'')) renderTimerBar();
+            }
+            break;
+        case 'subagent_task_terminal':
+            if(msg.run_id){
+                const runId=String(msg.run_id);
+                const task=S.subagentTaskById[runId]||{run_id:runId,task_id:runId};
+                upsertTaskById(S.subagentTasks, S.subagentTaskById, Object.assign({}, task, {status:String(msg.status||'completed'), summary:String(msg.summary||''), error_summary:String(msg.error||'')}));
+                renderTimerBar();
             }
             break;
 

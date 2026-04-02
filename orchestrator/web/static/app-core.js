@@ -69,6 +69,9 @@ const S = {
         recordingsDeletePending:false, recorderStartPending:false, recorderStopPending:false,
         recorderActive:false,
         timers:[], page:'home',
+    sandboxTasks:[], sandboxTaskById:{}, sandboxTaskPanelOpen:false, sandboxTaskPanelId:'', sandboxTaskLogEntriesById:{},
+    subagentTasks:[], subagentTaskById:{}, subagentTaskPanelOpen:false, subagentTaskPanelId:'', subagentThinkingEntriesById:{},
+    taskStripFilter:'all',
     audioCtx:null, mediaStream:null, processor:null, lastLevel:0,
     feedbackAudioCtx:null,
     captureWorkletModuleReady:false,
@@ -796,49 +799,21 @@ function isRawGatewayChatMessage(message){
 
 function mergeCachedRawGatewayMessages(serverMessages, cachedMessages){
     const nextMessages=(Array.isArray(serverMessages)?serverMessages:[]).map(normalizeChatMessage).filter(Boolean);
-    
-    // Collect server message IDs to avoid duplicates
-    const seenIds=new Set(nextMessages.map((message)=>String(message.id||'')).filter(Boolean));
-    
-    const merged=[...nextMessages];
-
-    // Restore cached raw_gateway messages unconditionally (they're ephemeral debug-only data).
-    // Only check: don't duplicate existing server messages by ID.
-    // On reconnect, request_ids may have changed, so we restore all cached debug frames.
-    (Array.isArray(cachedMessages)?cachedMessages:[])
-        .map(normalizeChatMessage)
-        .filter(Boolean)
-        .filter(isRawGatewayChatMessage)
-        .forEach((message)=>{
-            const msgId=String(message.id||'').trim();
-            if(msgId && seenIds.has(msgId)) return; // Skip if message ID already exists
-            
-            merged.push(message);
-            if(msgId) seenIds.add(msgId);
-        });
-
-    return merged.sort((a,b)=>Number(a.ts||0)-Number(b.ts||0));
+    return nextMessages.sort((a,b)=>Number(a.ts||0)-Number(b.ts||0));
 }
 
 function mergeCachedRawGatewayThreads(serverThreads, cachedThreads){
-    const cachedById=new Map(
-        (Array.isArray(cachedThreads)?cachedThreads:[])
-            .map(normalizeChatThread)
-            .filter(Boolean)
-            .map((thread)=>[thread.id, thread])
-    );
-
     return (Array.isArray(serverThreads)?serverThreads:[])
         .map(normalizeChatThread)
         .filter(Boolean)
-        .map((thread)=>{
-            const cachedThread=cachedById.get(thread.id);
-            if(!cachedThread) return thread;
-            return Object.assign({}, thread, {
-                messages: mergeCachedRawGatewayMessages(thread.messages, cachedThread.messages),
-            });
-        })
         .sort((a,b)=>Number(b.updated_ts||0)-Number(a.updated_ts||0));
+}
+
+function stripRawGatewayForCache(messages){
+    return (Array.isArray(messages)?messages:[])
+        .map(normalizeChatMessage)
+        .filter(Boolean)
+        .filter((message)=>!isRawGatewayChatMessage(message));
 }
 
 function persistChatCache(){
@@ -848,8 +823,11 @@ function persistChatCache(){
             saved_ts: Date.now()/1000,
             activeChatId: String(S.activeChatId||'active'),
             selectedChatId: String(S.selectedChatId||'active'),
-            chat: (Array.isArray(S.chat)?S.chat:[]).map(normalizeChatMessage).filter(Boolean),
-            chatThreads: (Array.isArray(S.chatThreads)?S.chatThreads:[]).map(normalizeChatThread).filter(Boolean),
+            chat: stripRawGatewayForCache(S.chat),
+            chatThreads: (Array.isArray(S.chatThreads)?S.chatThreads:[])
+                .map(normalizeChatThread)
+                .filter(Boolean)
+                .map((thread)=>Object.assign({}, thread, {messages: stripRawGatewayForCache(thread.messages)})),
         };
         localStorage.setItem(getChatCacheKey(), JSON.stringify(payload));
     } catch(_) {}

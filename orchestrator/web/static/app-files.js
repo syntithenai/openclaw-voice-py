@@ -12,6 +12,27 @@
       .replace(/'/g, '&#39;');
   }
 
+  function fmRenderMarkdownHtml(raw) {
+    const txt = String(raw || '');
+    if (!txt) return '';
+    try {
+      const markedApi = (typeof marked !== 'undefined' && marked && typeof marked.parse === 'function')
+        ? marked
+        : ((typeof window !== 'undefined' && window.marked && typeof window.marked.parse === 'function') ? window.marked : null);
+      let html = fmEsc(txt);
+      if (markedApi) {
+        markedApi.setOptions({ gfm: true, breaks: true });
+        html = String(markedApi.parse(txt) || '');
+      }
+      if (typeof DOMPurify !== 'undefined' && DOMPurify && typeof DOMPurify.sanitize === 'function') {
+        return DOMPurify.sanitize(html);
+      }
+      return html;
+    } catch (_) {
+      return fmEsc(txt);
+    }
+  }
+
   function fmMain() {
     return document.getElementById('main');
   }
@@ -493,6 +514,9 @@
         forceSync: true,
         status: false,
         initialValue: String(file.content || ''),
+        previewRender: function(plainText) {
+          return fmRenderMarkdownHtml(plainText);
+        },
         toolbar: [
           'bold', 'italic', 'heading', '|',
           'quote', 'unordered-list', 'ordered-list', '|',

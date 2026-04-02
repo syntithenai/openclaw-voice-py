@@ -158,6 +158,12 @@ class EmbeddedVoiceWebService:
         self._chat_thread_limit = 100
         _default_persist = Path.home() / ".config" / "openclaw" / "chat_state.json"
         self._chat_persist_path = Path(chat_persist_path) if chat_persist_path else _default_persist
+        debug_root_base = Path(self.workspace_files_root) if self.workspace_files_root else self._chat_persist_path.parent
+        self._chat_debug_frames_dir = debug_root_base / ".openclaw" / "ui-debug-frames"
+        try:
+            self._chat_debug_frames_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            logger.debug("Could not initialize chat debug frames directory", exc_info=True)
         self._load_chat_state()
         self._music_state: dict[str, Any] = {
             "state": "stop", "title": "", "artist": "", "album": "",
@@ -178,6 +184,11 @@ class EmbeddedVoiceWebService:
             "continuous_mode": False,
         }
         self._ui_control_rev: int = 0
+        self._sandbox_tasks: dict[str, dict[str, Any]] = {}
+        self._sandbox_task_logs: dict[str, deque[dict[str, Any]]] = {}
+        self._subagent_tasks: dict[str, dict[str, Any]] = {}
+        self._subagent_thinking_logs: dict[str, deque[dict[str, Any]]] = {}
+        self._task_log_limit = 400
 
         self._on_mic_toggle: Callable[[str], Awaitable[None]] | None = None
         self._on_music_toggle: Callable[[str], Awaitable[None]] | None = None
@@ -651,6 +662,94 @@ class EmbeddedVoiceWebService:
         except Exception:
             logger.debug("Could not persist chat state to disk", exc_info=True)
 
+    def _debug_frames_file_for_thread(self, thread_id: str) -> Path | None:
+        tid = str(thread_id or "").strip()
+        if not tid:
+            return None
+        # Keep one file per chat thread using URL-encoding for a filesystem-safe name.
+        safe = _url_parse.quote(tid, safe="")
+        return self._chat_debug_frames_dir / f"{safe}.jsonl"
+
+    def _append_debug_frame_for_thread(self, thread_id: str, message: dict[str, Any]) -> None:
+        path = self._debug_frames_file_for_thread(thread_id)
+        if path is None:
+            return
+        payload = {
+            "thread_id": str(thread_id),
+            "saved_ts": time.time(),
+            "message": dict(message),
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            logger.debug("Could not append chat debug frame", exc_info=True)
+
+    def _load_debug_frames_for_thread(self, thread_id: str) -> list[dict[str, Any]]:
+        path = self._debug_frames_file_for_thread(thread_id)
+        if path is None or not path.exists():
+            return []
+
+        out: list[dict[str, Any]] = []
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    raw = line.strip()
+                    if not raw:
+                        continue
+                    try:
+                        item = json.loads(raw)
+                    except Exception:
+                        continue
+                    message_obj = item.get("message") if isinstance(item, dict) else None
+                    if not isinstance(message_obj, dict):
+                        continue
+                    if str(message_obj.get("role", "")).strip() != "raw_gateway":
+                        continue
+                    out.append(dict(message_obj))
+        except Exception:
+            logger.debug("Could not read chat debug frames", exc_info=True)
+            return []
+
+        # Keep only recent frames to bound payload size on reconnect.
+        return out[-600:]
+
+    def _clear_debug_frames_for_thread(self, thread_id: str) -> None:
+        path = self._debug_frames_file_for_thread(thread_id)
+        if path is None:
+            return
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            logger.debug("Could not delete chat debug frames file", exc_info=True)
+
+    def _merge_messages_with_debug_frames(
+        self,
+        thread_id: str,
+        messages: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        base = list(messages or [])
+        debug = self._load_debug_frames_for_thread(thread_id)
+        if not debug:
+            return base
+
+        seen_ids = {str(m.get("id", "")).strip() for m in base if isinstance(m, dict)}
+        merged = list(base)
+        for dm in debug:
+            if not isinstance(dm, dict):
+                continue
+            mid = str(dm.get("id", "")).strip()
+            if mid and mid in seen_ids:
+                continue
+            merged.append(dm)
+            if mid:
+                seen_ids.add(mid)
+
+        merged.sort(key=lambda m: float(m.get("ts") or 0.0))
+        return merged
+
     def update_chat_history(self, messages: list[dict[str, Any]]) -> None:
         self._chat_messages = list(messages[-self.chat_history_limit:])
         self._upsert_active_chat_thread()
@@ -750,6 +849,7 @@ class EmbeddedVoiceWebService:
         self._chat_threads = [t for t in self._chat_threads if str(t.get("id", "")) != tid]
         if len(self._chat_threads) == before:
             return False
+        self._clear_debug_frames_for_thread(tid)
         if self._active_chat_thread_id == tid:
             self._active_chat_thread_id = None
         self._persist_chat_state()
@@ -769,12 +869,19 @@ class EmbeddedVoiceWebService:
         if not self._chat_threads:
             return False
         active_tid = str(self._active_chat_thread_id or "").strip()
+        removed_ids = [
+            str(t.get("id", "")).strip()
+            for t in self._chat_threads
+            if str(t.get("id", "")).strip() and str(t.get("id", "")).strip() != active_tid
+        ]
         if active_tid:
             self._chat_threads = [
                 t for t in self._chat_threads if str(t.get("id", "")).strip() == active_tid
             ]
         else:
             self._chat_threads = []
+        for tid in removed_ids:
+            self._clear_debug_frames_for_thread(tid)
         self._persist_chat_state()
         asyncio.create_task(
             self.broadcast(
@@ -808,6 +915,20 @@ class EmbeddedVoiceWebService:
 
     def replace_chat_threads(self, threads: list[dict[str, Any]], active_thread_id: str | None = None) -> None:
         normalized = [dict(t) for t in threads if isinstance(t, dict)]
+        # Preserve previously-loaded messages in threads so a list refresh doesn't wipe the UI.
+        existing_by_id = {str(t.get("id", "")).strip(): t for t in self._chat_threads if isinstance(t, dict)}
+        active_tid = str(self._active_chat_thread_id or "").strip()
+        for t in normalized:
+            tid = str(t.get("id", "")).strip()
+            if not tid:
+                continue
+            existing = existing_by_id.get(tid)
+            if existing and isinstance(existing.get("messages"), list) and existing["messages"]:
+                t["messages"] = existing["messages"]
+            elif tid == active_tid and self._chat_messages:
+                t["messages"] = list(self._chat_messages)
+            if isinstance(t.get("messages"), list):
+                t["messages"] = self._merge_messages_with_debug_frames(tid, t.get("messages"))
         self._chat_threads = normalized[: self._chat_thread_limit]
         requested_tid = str(active_thread_id or "").strip()
         if requested_tid and any(str(t.get("id", "")).strip() == requested_tid for t in self._chat_threads):
@@ -838,6 +959,8 @@ class EmbeddedVoiceWebService:
             return False
         if messages_override is not None:
             selected["messages"] = list(messages_override)
+        if isinstance(selected.get("messages"), list):
+            selected["messages"] = self._merge_messages_with_debug_frames(tid, selected.get("messages"))
         messages = selected.get("messages")
         if isinstance(messages, list):
             self._chat_messages = list(messages[-self.chat_history_limit:])
@@ -913,9 +1036,10 @@ class EmbeddedVoiceWebService:
         msg = dict(message)
         msg.setdefault("id", self._chat_seq)
         msg.setdefault("ts", time.time())
-        # raw_gateway messages are ephemeral debug frames - broadcast live but do not
-        # store in the persisted history, so they cannot evict actual conversation messages.
         if msg.get("role") == "raw_gateway":
+            active_tid = str(self._active_chat_thread_id or "").strip()
+            if active_tid:
+                self._append_debug_frame_for_thread(active_tid, msg)
             asyncio.create_task(
                 self.broadcast(
                     {
@@ -1107,6 +1231,170 @@ class EmbeddedVoiceWebService:
                     "type": "recordings_state",
                     "recordings_rev": self._recordings_rev,
                     "recordings": list(self._recordings),
+                }
+            )
+        )
+
+    def _upsert_task_record(
+        self,
+        task_map: dict[str, dict[str, Any]],
+        task_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        current = dict(task_map.get(task_id) or {})
+        current.update(payload)
+        current["task_id"] = task_id
+        current.setdefault("started_ts", time.time())
+        current["updated_ts"] = time.time()
+        task_map[task_id] = current
+        return dict(current)
+
+    def update_sandbox_exec_task(self, task: dict[str, Any]) -> None:
+        task_id = str(task.get("task_id") or task.get("exec_id") or task.get("id") or "").strip()
+        if not task_id:
+            task_id = f"sandbox-{uuid.uuid4().hex[:12]}"
+        payload = dict(task)
+        payload["task_type"] = "sandbox"
+        payload["task_id"] = task_id
+        status = str(payload.get("status") or "running").strip().lower()
+        payload["status"] = status
+        if status in {"completed", "failed", "cancelled"} and payload.get("ended_ts") is None:
+            payload["ended_ts"] = time.time()
+        merged = self._upsert_task_record(self._sandbox_tasks, task_id, payload)
+        asyncio.create_task(
+            self.broadcast(
+                {
+                    "type": "sandbox_exec_update",
+                    "task": merged,
+                }
+            )
+        )
+
+    def append_sandbox_exec_log(
+        self,
+        task_id: str,
+        lines: list[str] | tuple[str, ...] | str,
+        *,
+        exec_id: str = "",
+        stream: str = "stdout",
+        seq: int | None = None,
+    ) -> None:
+        tid = str(task_id or "").strip()
+        if not tid:
+            return
+        if isinstance(lines, str):
+            payload_lines = [lines]
+        else:
+            payload_lines = [str(line) for line in (lines or []) if str(line)]
+        if not payload_lines:
+            return
+        bucket = self._sandbox_task_logs.get(tid)
+        if bucket is None:
+            bucket = deque(maxlen=self._task_log_limit)
+            self._sandbox_task_logs[tid] = bucket
+        if seq is None:
+            seq = (bucket[-1].get("seq") if bucket else 0) + 1
+        entry = {
+            "seq": int(seq),
+            "ts": time.time(),
+            "exec_id": str(exec_id or ""),
+            "stream": str(stream or "stdout"),
+            "lines": payload_lines,
+        }
+        bucket.append(entry)
+        asyncio.create_task(
+            self.broadcast(
+                {
+                    "type": "sandbox_exec_log_append",
+                    "task_id": tid,
+                    "exec_id": str(exec_id or ""),
+                    "seq": int(seq),
+                    "stream": str(stream or "stdout"),
+                    "lines": payload_lines,
+                }
+            )
+        )
+
+    def update_subagent_task(self, task: dict[str, Any]) -> None:
+        run_id = str(task.get("run_id") or task.get("task_id") or task.get("id") or "").strip()
+        if not run_id:
+            run_id = f"subagent-{uuid.uuid4().hex[:12]}"
+        payload = dict(task)
+        payload["task_type"] = "subagent"
+        payload["run_id"] = run_id
+        payload["task_id"] = run_id
+        status = str(payload.get("status") or "running").strip().lower()
+        payload["status"] = status
+        if status in {"completed", "failed", "cancelled"} and payload.get("ended_ts") is None:
+            payload["ended_ts"] = time.time()
+        merged = self._upsert_task_record(self._subagent_tasks, run_id, payload)
+        asyncio.create_task(
+            self.broadcast(
+                {
+                    "type": "subagent_task_update",
+                    "task": merged,
+                }
+            )
+        )
+
+    def append_subagent_thinking(
+        self,
+        run_id: str,
+        text_delta: str,
+        *,
+        seq: int | None = None,
+    ) -> None:
+        rid = str(run_id or "").strip()
+        if not rid:
+            return
+        text = str(text_delta or "")
+        if not text:
+            return
+        bucket = self._subagent_thinking_logs.get(rid)
+        if bucket is None:
+            bucket = deque(maxlen=self._task_log_limit)
+            self._subagent_thinking_logs[rid] = bucket
+        if seq is None:
+            seq = (bucket[-1].get("seq") if bucket else 0) + 1
+        entry = {
+            "seq": int(seq),
+            "ts": time.time(),
+            "text_delta": text,
+        }
+        bucket.append(entry)
+        asyncio.create_task(
+            self.broadcast(
+                {
+                    "type": "subagent_thinking_append",
+                    "run_id": rid,
+                    "seq": int(seq),
+                    "text_delta": text,
+                }
+            )
+        )
+
+    def mark_subagent_terminal(self, run_id: str, status: str, summary: str = "", error: str = "") -> None:
+        rid = str(run_id or "").strip()
+        if not rid:
+            return
+        terminal_status = str(status or "completed").strip().lower()
+        self.update_subagent_task(
+            {
+                "run_id": rid,
+                "status": terminal_status,
+                "summary": str(summary or ""),
+                "error_summary": str(error or ""),
+                "ended_ts": time.time(),
+            }
+        )
+        asyncio.create_task(
+            self.broadcast(
+                {
+                    "type": "subagent_task_terminal",
+                    "run_id": rid,
+                    "status": terminal_status,
+                    "summary": str(summary or ""),
+                    "error": str(error or ""),
                 }
             )
         )
@@ -2303,6 +2591,34 @@ class EmbeddedVoiceWebService:
                     pass
             return
 
+        if msg_type == "sandbox_task_logs_get":
+            task_id = str(payload.get("task_id", "")).strip()
+            if not task_id:
+                return
+            entries = list(self._sandbox_task_logs.get(task_id) or [])
+            await _send_ws_json(
+                {
+                    "type": "sandbox_task_logs",
+                    "task_id": task_id,
+                    "entries": entries,
+                }
+            )
+            return
+
+        if msg_type == "subagent_task_thinking_get":
+            run_id = str(payload.get("run_id", "")).strip()
+            if not run_id:
+                return
+            entries = list(self._subagent_thinking_logs.get(run_id) or [])
+            await _send_ws_json(
+                {
+                    "type": "subagent_task_thinking",
+                    "run_id": run_id,
+                    "entries": entries,
+                }
+            )
+            return
+
         logger.debug("Web UI: unhandled action '%s' from %s", msg_type, client_id)
 
     def _handle_pcm_chunk(self, pcm_bytes: bytes, websocket: Any | None = None) -> None:
@@ -2393,6 +2709,10 @@ class EmbeddedVoiceWebService:
         orch = dict(self._orchestrator_status)
         orch["hotword_active"] = hotword_active
         orch["status_rev"] = self._status_rev
+        chat_snapshot = list(self._chat_messages[-self.chat_history_limit:])
+        active_tid = str(self._active_chat_thread_id or "").strip()
+        if active_tid:
+            chat_snapshot = self._merge_messages_with_debug_frames(active_tid, chat_snapshot)
         return {
             "type": "state_snapshot",
             "orchestrator": orch,
@@ -2406,7 +2726,9 @@ class EmbeddedVoiceWebService:
             "recordings_rev": self._recordings_rev,
             "timers": list(self._timers_state),
             "timers_rev": self._timers_rev,
-            "chat": list(self._chat_messages[-self.chat_history_limit:]),
+            "sandbox_tasks": list(self._sandbox_tasks.values()),
+            "subagent_tasks": list(self._subagent_tasks.values()),
+            "chat": chat_snapshot,
             "chat_threads": list(self._chat_threads),
             "active_chat_id": self._active_chat_id,
             "active_chat_thread_id": self._active_chat_thread_id,

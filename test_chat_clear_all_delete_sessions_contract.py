@@ -26,6 +26,7 @@ def test_main_clear_all_deletes_upstream_sessions_and_refreshes_sidebar() -> Non
 
     assert "async def _ui_chat_delete(thread_id: str, client_id: str) -> None:" in source
     assert "async def _ui_chat_clear_all(thread_ids: list[str], client_id: str) -> None:" in source
+    assert 'await _start_new_session(source="web ui chat_delete", client_id=client_id)' in source
     assert "await gateway.delete_session(" in source
     assert 'await _refresh_web_ui_chat_threads_from_gateway(f"chat_delete:{client_id}")' in source
     assert 'await _refresh_web_ui_chat_threads_from_gateway(f"chat_clear_all:{client_id}")' in source

@@ -100,6 +100,99 @@
   border-radius: 10px;
 }
 
+.EasyMDEContainer {
+  border: 1px solid rgb(55 65 81);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.EasyMDEContainer .CodeMirror,
+.EasyMDEContainer .editor-preview,
+.EasyMDEContainer .editor-preview-side {
+  background: rgb(17 24 39);
+  color: rgb(229 231 235);
+}
+
+.EasyMDEContainer .editor-preview,
+.EasyMDEContainer .editor-preview-side {
+  padding: 12px;
+}
+
+.EasyMDEContainer .editor-preview h1,
+.EasyMDEContainer .editor-preview-side h1,
+.EasyMDEContainer .editor-preview h2,
+.EasyMDEContainer .editor-preview-side h2,
+.EasyMDEContainer .editor-preview h3,
+.EasyMDEContainer .editor-preview-side h3,
+.EasyMDEContainer .editor-preview h4,
+.EasyMDEContainer .editor-preview-side h4,
+.EasyMDEContainer .editor-preview h5,
+.EasyMDEContainer .editor-preview-side h5,
+.EasyMDEContainer .editor-preview h6,
+.EasyMDEContainer .editor-preview-side h6 {
+  font-weight: 700;
+  margin: 0.5em 0 0.35em;
+}
+
+.EasyMDEContainer .editor-preview h1,
+.EasyMDEContainer .editor-preview-side h1 {
+  font-size: 1.4em;
+}
+
+.EasyMDEContainer .editor-preview h2,
+.EasyMDEContainer .editor-preview-side h2 {
+  font-size: 1.25em;
+}
+
+.EasyMDEContainer .editor-preview p,
+.EasyMDEContainer .editor-preview-side p {
+  margin: 0.4em 0;
+}
+
+.EasyMDEContainer .editor-preview ul,
+.EasyMDEContainer .editor-preview-side ul {
+  list-style: disc;
+  padding-left: 1.4em;
+  margin: 0.35em 0;
+}
+
+.EasyMDEContainer .editor-preview ol,
+.EasyMDEContainer .editor-preview-side ol {
+  list-style: decimal;
+  padding-left: 1.4em;
+  margin: 0.35em 0;
+}
+
+.EasyMDEContainer .editor-preview li,
+.EasyMDEContainer .editor-preview-side li {
+  margin: 0.2em 0;
+}
+
+.EasyMDEContainer .editor-preview blockquote,
+.EasyMDEContainer .editor-preview-side blockquote {
+  border-left: 3px solid rgb(75 85 99);
+  padding-left: 10px;
+  margin: 0.5em 0;
+  color: rgb(209 213 219);
+}
+
+.EasyMDEContainer .editor-preview code,
+.EasyMDEContainer .editor-preview-side code {
+  background: rgba(31, 41, 55, 0.95);
+  border: 1px solid rgb(55 65 81);
+  border-radius: 5px;
+  padding: 0.1em 0.3em;
+}
+
+.EasyMDEContainer .editor-preview pre,
+.EasyMDEContainer .editor-preview-side pre {
+  background: rgba(31, 41, 55, 0.95);
+  border: 1px solid rgb(55 65 81);
+  border-radius: 8px;
+  padding: 10px;
+  overflow: auto;
+}
+
 .fm-modal-backdrop {
   position: fixed;
   inset: 0;

@@ -22,10 +22,33 @@ document.querySelectorAll('[data-nav]').forEach(el=>el.addEventListener('click',
 }));
 
 function normalizeFilesPath(value){
-    const raw = String(value||'').trim();
+    const raw = String(value||'').trim().replace(/\\/g, '/');
     if(!raw) return '';
-    if(raw.startsWith('/')) return raw;
-    return '/' + raw.replace(/^\/+/, '');
+
+    const stripWorkspacePrefix = (path)=>{
+        const markers=[
+            '/workspace-voice/',
+            '/openclaw-voice/',
+            '/openclaw/',
+        ];
+        for(const marker of markers){
+            const idx=path.toLowerCase().lastIndexOf(marker.toLowerCase());
+            if(idx>=0){
+                const suffix=path.slice(idx + marker.length).replace(/^\/+/, '');
+                if(suffix) return '/'+suffix;
+            }
+        }
+
+        // Generic container/workspace roots (e.g. /home/node/.openclaw/workspace-*/...)
+        const generic=path.match(/\/workspace-[^/]+\/(.+)$/i);
+        if(generic && generic[1]) return '/'+String(generic[1]).replace(/^\/+/, '');
+
+        return path;
+    };
+
+    const normalizedRaw=stripWorkspacePrefix(raw);
+    if(normalizedRaw.startsWith('/')) return normalizedRaw;
+    return '/' + normalizedRaw.replace(/^\/+/, '');
 }
 
 function buildFilesRouteHref(filePath){
@@ -285,9 +308,6 @@ document.addEventListener('click', e => {
         clearChatReloadTarget();
         clearChatReloadInFlight();
         S.selectedChatId = tid;
-        if(String(tid).trim() && String(tid).trim()!=='active'){
-            sendAction({type:'chat_select', thread_id: String(tid).trim()});
-        }
         if(isMobileChatViewport()) S.chatSidebarOpen=false;
         persistChatCache();
         renderPage();
@@ -303,6 +323,56 @@ document.addEventListener('click', e => {
     const scrollUpBtn = target.closest('[data-action="page-scroll-up"]');
     if (scrollUpBtn) {
         scrollCurrentViewUp();
+        return;
+    }
+
+    const taskFilterBtn = target.closest('[data-action="task-strip-filter"]');
+    if (taskFilterBtn) {
+        const nextFilter=String(taskFilterBtn.dataset.filter||'all').trim();
+        if(nextFilter==='all' || nextFilter==='sandbox' || nextFilter==='subagent'){
+            S.taskStripFilter=nextFilter;
+            renderTimerBar();
+        }
+        return;
+    }
+
+    const sandboxTaskOpenBtn = target.closest('[data-action="sandbox-task-open"]');
+    if (sandboxTaskOpenBtn) {
+        const taskId=String(sandboxTaskOpenBtn.dataset.taskId||'').trim();
+        if(taskId){
+            S.sandboxTaskPanelOpen=true;
+            S.sandboxTaskPanelId=taskId;
+            sendAction({type:'sandbox_task_logs_get', task_id: taskId});
+            renderTimerBar();
+        }
+        return;
+    }
+
+    const sandboxTaskPanelCloseBtn = target.closest('[data-action="sandbox-task-panel-close"]');
+    if (sandboxTaskPanelCloseBtn) {
+        S.sandboxTaskPanelOpen=false;
+        S.sandboxTaskPanelId='';
+        renderTimerBar();
+        return;
+    }
+
+    const subagentTaskOpenBtn = target.closest('[data-action="subagent-task-open"]');
+    if (subagentTaskOpenBtn) {
+        const runId=String(subagentTaskOpenBtn.dataset.taskId||'').trim();
+        if(runId){
+            S.subagentTaskPanelOpen=true;
+            S.subagentTaskPanelId=runId;
+            sendAction({type:'subagent_task_thinking_get', run_id: runId});
+            renderTimerBar();
+        }
+        return;
+    }
+
+    const subagentTaskPanelCloseBtn = target.closest('[data-action="subagent-task-panel-close"]');
+    if (subagentTaskPanelCloseBtn) {
+        S.subagentTaskPanelOpen=false;
+        S.subagentTaskPanelId='';
+        renderTimerBar();
         return;
     }
 
@@ -1046,45 +1116,128 @@ function applyMusicHeader(){
     applyTopMusicProgress();
 }
 
+function formatTaskAge(ts){
+    const started=Number(ts||0);
+    if(!Number.isFinite(started)||started<=0) return '--:--';
+    const elapsed=Math.max(0, Math.round((Date.now()/1000)-started));
+    const mm=String(Math.floor(elapsed/60)).padStart(2,'0');
+    const ss=String(elapsed%60).padStart(2,'0');
+    return mm+':'+ss;
+}
+
+function mergeTaskStripItems(){
+    const out=[];
+    const sandbox=Array.isArray(S.sandboxTasks)?S.sandboxTasks:[];
+    const subagents=Array.isArray(S.subagentTasks)?S.subagentTasks:[];
+    const filter=String(S.taskStripFilter||'all');
+    if(filter==='all' || filter==='sandbox') sandbox.forEach((t)=>out.push({origin:'sandbox',task:t}));
+    if(filter==='all' || filter==='subagent') subagents.forEach((t)=>out.push({origin:'subagent',task:t}));
+    out.sort((a,b)=>{
+        const ta=Number((a.task&&a.task.updated_ts)||0);
+        const tb=Number((b.task&&b.task.updated_ts)||0);
+        return tb-ta;
+    });
+    return out.slice(0, 10);
+}
+
+function renderTaskDetailPanel(){
+    const sandboxOpen=!!S.sandboxTaskPanelOpen;
+    const subagentOpen=!!S.subagentTaskPanelOpen;
+    if(!sandboxOpen && !subagentOpen) return '';
+    if(sandboxOpen){
+        const taskId=String(S.sandboxTaskPanelId||'').trim();
+        const task=(S.sandboxTaskById&&S.sandboxTaskById[taskId])||null;
+        if(!task) return '';
+        const entries=(S.sandboxTaskLogEntriesById&&S.sandboxTaskLogEntriesById[taskId])||[];
+        const logText=entries.map((entry)=>{
+            const seq=String((entry&&entry.seq)||'');
+            const stream=String((entry&&entry.stream)||'stdout');
+            const lines=Array.isArray(entry&&entry.lines)?entry.lines:[String((entry&&entry.lines)||'')];
+            return '['+seq+'] ['+stream+'] '+lines.join('\n');
+        }).join('\n');
+        return '<div class="w-full mt-2 rounded border border-gray-700 bg-gray-900/60 px-2 py-2 text-xs">'
+            +'<div class="flex items-center justify-between gap-2 mb-1">'
+                +'<div class="font-medium">Sandbox Task</div>'
+                +'<button data-action="sandbox-task-panel-close" class="px-2 py-0.5 rounded bg-gray-700 hover:bg-gray-600">Close</button>'
+            +'</div>'
+            +'<div class="text-gray-300 mb-1">container=' + esc(String(task.container_name||task.container_id||'unknown')) + ' exec=' + esc(String(task.exec_id||'')) + ' status=' + esc(String(task.status||'')) + '</div>'
+            +'<pre class="max-h-48 overflow-auto whitespace-pre-wrap text-[11px] bg-black/40 border border-gray-800 rounded p-2">'+esc(logText||'No logs yet')+'</pre>'
+        +'</div>';
+    }
+    const runId=String(S.subagentTaskPanelId||'').trim();
+    const task=(S.subagentTaskById&&S.subagentTaskById[runId])||null;
+    if(!task) return '';
+    const entries=(S.subagentThinkingEntriesById&&S.subagentThinkingEntriesById[runId])||[];
+    const thinking=entries.map((entry)=>String((entry&&entry.text_delta)||'')).join('');
+    return '<div class="w-full mt-2 rounded border border-blue-700/60 bg-blue-950/20 px-2 py-2 text-xs">'
+        +'<div class="flex items-center justify-between gap-2 mb-1">'
+            +'<div class="font-medium">Subagent</div>'
+            +'<button data-action="subagent-task-panel-close" class="px-2 py-0.5 rounded bg-gray-700 hover:bg-gray-600">Close</button>'
+        +'</div>'
+        +'<div class="text-blue-200 mb-1">run=' + esc(runId) + ' status=' + esc(String(task.status||'')) + ' step=' + esc(String(task.step||'')) + '</div>'
+        +'<pre class="max-h-48 overflow-auto whitespace-pre-wrap text-[11px] bg-black/40 border border-gray-800 rounded p-2">'+esc(thinking||'No thinking yet')+'</pre>'
+    +'</div>';
+}
+
 function renderTimerBar(){
   const bar=document.getElementById('timerBar');
     const visibleTimers=S.timers.filter(t=>{
         const kind=String(t.kind||'timer').toLowerCase();
         const rem=Number(t.remaining_seconds);
         if(!Number.isFinite(rem)) return false;
-                if(kind==='timer' && rem<=0) return false;
+        if(kind==='timer' && rem<=0) return false;
         return true;
     });
-    if(!visibleTimers.length){ bar.classList.add('hidden'); bar.innerHTML=''; return; }
+    const taskItems=mergeTaskStripItems();
+    if(!visibleTimers.length && !taskItems.length){ bar.classList.add('hidden'); bar.innerHTML=''; return; }
   bar.classList.remove('hidden');
-    bar.innerHTML=visibleTimers.map(t=>{
-    const rem=Math.max(0,Math.round(t.remaining_seconds));
-    const mm=String(Math.floor(rem/60)).padStart(2,'0'),ss=String(rem%60).padStart(2,'0');
+    const timerHtml=visibleTimers.map(t=>{
+        const rem=Math.max(0,Math.round(t.remaining_seconds));
+        const mm=String(Math.floor(rem/60)).padStart(2,'0'),ss=String(rem%60).padStart(2,'0');
         const kind=String(t.kind||'timer').toLowerCase();
         const isAlarm=kind==='alarm';
         const isOptimistic=!!t._optimistic;
         const actionAttr=isAlarm?'alarm-cancel':'timer-cancel';
         const idAttr=isAlarm?' data-alarm-id="'+esc(t.id)+'"':' data-timer-id="'+esc(t.id)+'"';
-                const pendingKey=(isAlarm?'alarm_cancel:':'timer_cancel:')+String(t.id||'');
-                const isPending=!!(S.pendingTimerActions&&S.pendingTimerActions[pendingKey]);
-                const timerErr=(S.timerActionErrors&&S.timerActionErrors[pendingKey])?S.timerActionErrors[pendingKey].msg:'';
+        const pendingKey=(isAlarm?'alarm_cancel:':'timer_cancel:')+String(t.id||'');
+        const isPending=!!(S.pendingTimerActions&&S.pendingTimerActions[pendingKey]);
+        const timerErr=(S.timerActionErrors&&S.timerActionErrors[pendingKey])?S.timerActionErrors[pendingKey].msg:'';
         const icon=isAlarm?'⏰':'⏱';
         const isRingingAlarm=isAlarm && !!t.ringing;
         const baseCls=isAlarm
             ?('flex items-center gap-1 px-3 py-1 rounded-full text-xs transition-colors '+(isRingingAlarm?'bg-red-600 hover:bg-red-500 animate-pulse':'bg-red-800 hover:bg-red-700'))
             :'flex items-center gap-1 px-3 py-1 rounded-full bg-amber-700 hover:bg-amber-600 text-xs transition-colors';
         const label=isAlarm?(t.label||'Alarm'):(t.label||'Timer');
-            const disabledAttr=(isPending||isOptimistic)?' disabled style="opacity:.55;cursor:not-allowed"':'';
-            const pendingTxt=(isPending||isOptimistic)?' …':'';
-                const errTxt=timerErr?' ⚠':'';
-                                const titleTxt=isOptimistic?'Click to cancel pending '+(isAlarm?'alarm':'timer'):(timerErr||'Click to cancel');
-                                const actionChunk=isOptimistic
-                                        ?(' data-action="optimistic-timer-cancel" data-optimistic-id="'+esc(t.id)+'"')
-                                        :(' data-action="'+actionAttr+'"'+idAttr);
-                                const effectiveDisabledAttr=(isPending && !isOptimistic)?' disabled style="opacity:.55;cursor:not-allowed"':'';
-                                                                const ringingTxt=isRingingAlarm?' 🔔':'';
-                                                                return '<button type="button" class="'+baseCls+'"'+actionChunk+effectiveDisabledAttr+' title="'+esc(titleTxt)+'">'+icon+' '+esc(label)+ringingTxt+' '+mm+':'+ss+pendingTxt+errTxt+'</button>';
-  }).join('');
+        const pendingTxt=(isPending||isOptimistic)?' …':'';
+        const errTxt=timerErr?' ⚠':'';
+        const titleTxt=isOptimistic?'Click to cancel pending '+(isAlarm?'alarm':'timer'):(timerErr||'Click to cancel');
+        const actionChunk=isOptimistic
+            ?(' data-action="optimistic-timer-cancel" data-optimistic-id="'+esc(t.id)+'"')
+            :(' data-action="'+actionAttr+'"'+idAttr);
+        const effectiveDisabledAttr=(isPending && !isOptimistic)?' disabled style="opacity:.55;cursor:not-allowed"':'';
+        const ringingTxt=isRingingAlarm?' 🔔':'';
+        return '<button type="button" class="'+baseCls+'"'+actionChunk+effectiveDisabledAttr+' title="'+esc(titleTxt)+'">'+icon+' '+esc(label)+ringingTxt+' '+mm+':'+ss+pendingTxt+errTxt+'</button>';
+    }).join('');
+    const taskHtml=taskItems.map((item)=>{
+        const task=item.task||{};
+        const origin=item.origin;
+        const tid=String(task.task_id||task.run_id||'');
+        const status=String(task.status||'running').toLowerCase();
+        const tone=status==='failed'?'bg-red-800 hover:bg-red-700':(status==='completed'?'bg-emerald-800 hover:bg-emerald-700':'bg-sky-800 hover:bg-sky-700');
+        const icon=origin==='subagent'?'🤖':'🐳';
+        const label=origin==='subagent'?String(task.label||task.run_id||'subagent'):String(task.label||task.command||task.exec_id||'exec');
+        const age=formatTaskAge(task.started_ts);
+        const action=origin==='subagent'?'subagent-task-open':'sandbox-task-open';
+        return '<button type="button" class="flex items-center gap-1 px-2 py-1 rounded-full text-xs '+tone+'" data-action="'+action+'" data-task-id="'+esc(tid)+'" title="Open task details">'+icon+' '+esc(label)+' ['+esc(status)+'] '+age+'</button>';
+    }).join('');
+    const filter=String(S.taskStripFilter||'all');
+    const filterHtml=''
+        +'<div class="ml-auto flex items-center gap-1">'
+            +'<button type="button" data-action="task-strip-filter" data-filter="all" class="px-2 py-0.5 rounded text-xs '+(filter==='all'?'bg-gray-700':'bg-gray-800 hover:bg-gray-700')+'">All</button>'
+            +'<button type="button" data-action="task-strip-filter" data-filter="sandbox" class="px-2 py-0.5 rounded text-xs '+(filter==='sandbox'?'bg-gray-700':'bg-gray-800 hover:bg-gray-700')+'">Sandbox</button>'
+            +'<button type="button" data-action="task-strip-filter" data-filter="subagent" class="px-2 py-0.5 rounded text-xs '+(filter==='subagent'?'bg-gray-700':'bg-gray-800 hover:bg-gray-700')+'">Subagent</button>'
+        +'</div>';
+    bar.innerHTML=timerHtml+taskHtml+filterHtml+renderTaskDetailPanel();
 }
 
 function renderPage(){
@@ -1283,7 +1436,7 @@ const ASSISTANT_STREAM_PATCH_MIN_INTERVAL_MS=120;
 let assistantStreamPatchTimerId=0;
 let assistantStreamPatchSelectedId='active';
 let assistantStreamPatchLastRunTs=0;
-let assistantStreamPatchPendingMessage=null;
+const assistantStreamPatchPendingByRequestId=new Map();
 
 const CHAT_RENDER_MIN_INTERVAL_MS=140;
 let chatRenderTimerId=0;
@@ -1382,10 +1535,11 @@ function cssEsc(value){
 function scheduleAssistantStreamBubbleUpdate(selectedId, streamMessage){
     assistantStreamPatchSelectedId=selectedId||'active';
     if(streamMessage && typeof streamMessage==='object'){
-        assistantStreamPatchPendingMessage={
-            request_id:(streamMessage.request_id!==undefined&&streamMessage.request_id!==null)?String(streamMessage.request_id):'',
+        const requestId=(streamMessage.request_id!==undefined&&streamMessage.request_id!==null)?String(streamMessage.request_id):'';
+        assistantStreamPatchPendingByRequestId.set(requestId, {
+            request_id:requestId,
             text:String(streamMessage.text||''),
-        };
+        });
     }
     if(assistantStreamPatchTimerId) return;
     const now=Date.now();
@@ -1393,10 +1547,13 @@ function scheduleAssistantStreamBubbleUpdate(selectedId, streamMessage){
     assistantStreamPatchTimerId=setTimeout(()=>{
         assistantStreamPatchTimerId=0;
         assistantStreamPatchLastRunTs=Date.now();
-        const pendingMessage=assistantStreamPatchPendingMessage;
-        assistantStreamPatchPendingMessage=null;
-        const patched=updateAssistantStreamBubbleInPlace(assistantStreamPatchSelectedId, pendingMessage);
-        if(!patched) renderChatMessages(assistantStreamPatchSelectedId);
+        const pendingMessages=Array.from(assistantStreamPatchPendingByRequestId.values());
+        assistantStreamPatchPendingByRequestId.clear();
+        let patchedAny=false;
+        for(const pendingMessage of pendingMessages){
+            if(updateAssistantStreamBubbleInPlace(assistantStreamPatchSelectedId, pendingMessage)) patchedAny=true;
+        }
+        if(!patchedAny) renderChatMessages(assistantStreamPatchSelectedId);
     }, delay);
 }
 
@@ -1412,8 +1569,8 @@ function updateAssistantStreamBubbleInPlace(selectedId, streamMessage){
             let bubble=null;
             if(requestedId){
                 bubble=streamNodes.find((node)=>String(node.getAttribute('data-stream-request-id')||'')===requestedId) || null;
-            }
-            if(!bubble){
+                if(!bubble) return false;
+            }else if(!bubble){
                 bubble=streamNodes[streamNodes.length-1];
             }
             if(bubble){
@@ -1706,7 +1863,9 @@ function collateChatMessages(msgs){
                 if(!linkedPaths.includes(p)) linkedPaths.push(p);
             }
         }
-        for(const p of intersectPathsByReference(writeReferencedFiles, linkedPaths)){
+        const matchedWriteFiles=intersectPathsByReference(writeReferencedFiles, linkedPaths);
+        const fallbackWriteFiles=matchedWriteFiles.length ? matchedWriteFiles : writeReferencedFiles;
+        for(const p of fallbackWriteFiles){
             if(!referencedFiles.includes(p)) referencedFiles.push(p);
         }
         const extra={referenced_files:referencedFiles, written_files:referencedFiles};
@@ -2171,8 +2330,12 @@ function makeResponseCopyButton(getText){
 function makeUserMessageCopyButton(text){
     const btn=document.createElement('button');
     btn.type='button';
-    btn.className='px-2 py-1 rounded text-[11px] bg-gray-700 hover:bg-gray-600 text-gray-100 border border-gray-500 transition-colors';
-    btn.textContent='Copy';
+    btn.className='absolute inline-flex items-center justify-center w-6 h-6 rounded text-[11px] bg-gray-700 hover:bg-gray-600 text-gray-100 border border-gray-500 transition-colors';
+    btn.style.top='8px';
+    btn.style.right='8px';
+    btn.style.left='auto';
+    btn.style.zIndex='2';
+    btn.textContent='⧉';
     btn.title='Copy this message to clipboard';
     btn.setAttribute('data-action','copy-user-message');
     btn.addEventListener('click', async(e) => {
@@ -2180,7 +2343,7 @@ function makeUserMessageCopyButton(text){
         try {
             await navigator.clipboard.writeText(text);
             const originalText=btn.textContent;
-            btn.textContent='Copied!';
+            btn.textContent='✓';
             btn.disabled=true;
             setTimeout(() => {
                 btn.textContent=originalText;
@@ -2188,26 +2351,10 @@ function makeUserMessageCopyButton(text){
             }, 2000);
         } catch(err) {
             console.error('Failed to copy:', err);
-            btn.textContent='Error';
-            setTimeout(() => { btn.textContent='Copy'; }, 1500);
+            btn.textContent='!';
+            setTimeout(() => { btn.textContent='⧉'; }, 1500);
         }
     });
-    return btn;
-}
-
-function makeResponseReloadButton(messageId, threadId){
-    const btn=document.createElement('button');
-    btn.type='button';
-    btn.className='px-2 py-1 rounded text-[11px] bg-blue-800 hover:bg-blue-700 text-blue-100 border border-blue-600 transition-colors';
-    if(S.pendingChatSends.size>0){
-        btn.disabled=true;
-        btn.classList.add('opacity-60','cursor-not-allowed');
-    }
-    btn.textContent=S.pendingChatSends.size>0 ? 'Reloading...' : 'Reload';
-    btn.title='Clear later messages and rerun this prompt';
-    btn.setAttribute('data-action','chat-reload-response');
-    btn.setAttribute('data-message-id', String(messageId||''));
-    btn.setAttribute('data-thread-id', String(threadId||'active'));
     return btn;
 }
 
@@ -2254,6 +2401,29 @@ function mkBubble(m){
         if(msgId) d.setAttribute('data-msg-id', msgId);
         const reqId=(m&&m.request_id!==undefined&&m&&m.request_id!==null)?String(m.request_id):'';
         if(reqId) d.setAttribute('data-request-id', reqId);
+
+    const renderReferencedFileChips=(container)=>{
+        const referencedFiles=(Array.isArray(m.referenced_files)?m.referenced_files:m.written_files)?.filter(fp=>String(fp||'').trim()) || [];
+        if(!referencedFiles.length) return;
+        const filesDiv=document.createElement('div');
+        filesDiv.className='mt-2 flex flex-wrap gap-1';
+        for(const fp of referencedFiles){
+            const normalizedFp = normalizeFilesPath(fp);
+            if(!normalizedFp) continue;
+            const href = buildFilesRouteHref(normalizedFp);
+            if(!href) continue;
+            const fname=normalizedFp.split('/').filter(Boolean).pop()||normalizedFp;
+            const link=document.createElement('a');
+            link.className='inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs bg-gray-800 border border-gray-600 hover:bg-gray-700 text-blue-300 hover:text-blue-200 transition-colors';
+            link.setAttribute('data-action','open-in-files');
+            link.setAttribute('data-file-path',normalizedFp);
+            link.href=href;
+            link.title=normalizedFp;
+            link.textContent='\uD83D\uDCC4 '+fname;
+            filesDiv.appendChild(link);
+        }
+        if(filesDiv.children.length>0) container.appendChild(filesDiv);
+    };
 
     if(role==='gateway_debug_group'){
         const wrap=document.createElement('div');
@@ -2330,6 +2500,7 @@ function mkBubble(m){
         }
 
         wrap.appendChild(details);
+        renderReferencedFileChips(wrap);
         d.appendChild(wrap);
         return d;
     }
@@ -2643,8 +2814,15 @@ function mkBubble(m){
             );
             const hasToolError=failedGroups.length>0;
             const hasLifecycleError=hasLifecycleHardError;
-            // Keep waiting active until a real completion signal arrives.
-            const waiting=(hasLifecycleStart && !hasLifecycleError && !m.hasFinal && (lastLifecyclePhase ? lastLifecyclePhase==='start' : !hasLifecycleEnd));
+            // Treat lifecycle end/result and terminal tool phases as completion,
+            // even when no final assistant message is emitted.
+            const hasCompletionSignal = !!(
+                hasLifecycleEnd
+                || lastLifecyclePhase === 'end'
+                || lastLifecyclePhase === 'result'
+                || allToolsTerminal
+            );
+            const waiting=(hasLifecycleStart && !hasLifecycleError && !hasToolError && !m.hasFinal && !hasCompletionSignal);
             const waitingRow=waiting
                 ? '<div class="px-2 py-1 border-b border-gray-800/60 text-[11px] text-yellow-300 flex items-center gap-2">'
                     +'<span class="inline-block w-3 h-3 border-2 border-yellow-300/80 border-t-transparent rounded-full animate-spin"></span>'
@@ -2824,20 +3002,11 @@ function mkBubble(m){
 
   const b=document.createElement('div');
     const isQuickAnswer=(m&&m.source)==='quick_answer';
-    const reloadThreadId=getChatReloadSelectedThreadId();
-    const isReloadSource=role==='user' && !!msgId && S.chatReloadTargetId===msgId && S.chatReloadTargetThreadId===reloadThreadId;
     b.className='max-w-xs sm:max-w-sm lg:max-w-md px-4 py-2 rounded-2xl text-sm leading-relaxed '+
         (role==='user'?'bg-blue-700 text-white rounded-br-md':
          role==='system'?'bg-gray-700 text-gray-300 italic text-xs':
      (isQuickAnswer?'bg-gray-600 border-2':'bg-gray-700')+' text-gray-100 rounded-bl-md');
     if(isQuickAnswer) b.style.borderColor='#15803d';
-    if(role==='user'){
-        b.setAttribute('data-action','chat-select-reload');
-        b.setAttribute('data-message-id', msgId);
-        b.classList.add('cursor-pointer','transition-colors');
-        b.title='Select this prompt to reload its response';
-        if(isReloadSource) b.classList.add('ring-2','ring-blue-300','ring-offset-2','ring-offset-gray-900');
-    }
     if(role==='assistant'){
         if(!isQuickAnswer) b.classList.add('relative','pr-12');
         const reqKey=String((m&&m.request_id)!==undefined && (m&&m.request_id)!==null ? m.request_id : 'na');
@@ -2864,44 +3033,18 @@ function mkBubble(m){
         } else {
             b.appendChild(summaryBody);
         }
-
-const referencedFiles=(Array.isArray(m.referenced_files)?m.referenced_files:m.written_files)?.filter(fp=>String(fp||'').trim()) || [];
-        if(referencedFiles.length){
-            const filesDiv=document.createElement('div');
-            filesDiv.className='mt-2 flex flex-wrap gap-1';
-            for(const fp of referencedFiles){
-                const normalizedFp = normalizeFilesPath(fp);
-                if(!normalizedFp) continue;
-                // Check if file exists before showing chip
-                const href = buildFilesRouteHref(normalizedFp);
-                if(!href) continue;  // Skip if path normalization failed
-                const fname=normalizedFp.split('/').filter(Boolean).pop()||normalizedFp;
-                const link=document.createElement('a');
-                link.className='inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs bg-gray-800 border border-gray-600 hover:bg-gray-700 text-blue-300 hover:text-blue-200 transition-colors';
-                link.setAttribute('data-action','open-in-files');
-                link.setAttribute('data-file-path',normalizedFp);
-                link.href=href;
-                link.title=normalizedFp;
-                link.textContent='\uD83D\uDCC4 '+fname;
-                filesDiv.appendChild(link);
-            }
-            if(filesDiv.children.length>0) b.appendChild(filesDiv);
-        }
+        renderReferencedFileChips(b);
 
         if(!isQuickAnswer){
             b.appendChild(makeResponseCopyButton(()=>String((m&&m.text)||'')));
         }
     }else if(role==='user'){
+        b.classList.add('relative');
         const textWrap=document.createElement('div');
+        textWrap.className='pr-8';
         textWrap.textContent=m.text||'';
         b.appendChild(textWrap);
-        if(isReloadSource){
-            const actions=document.createElement('div');
-            actions.className='mt-2 flex justify-end gap-2';
-            actions.appendChild(makeUserMessageCopyButton(m.text||''));
-            actions.appendChild(makeResponseReloadButton(msgId, reloadThreadId));
-            b.appendChild(actions);
-        }
+        b.appendChild(makeUserMessageCopyButton(m.text||''));
     }else{
         b.textContent=m.text||'';
     }
