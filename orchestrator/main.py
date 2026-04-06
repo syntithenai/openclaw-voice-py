@@ -2497,7 +2497,16 @@ async def run_orchestrator() -> None:
             async def _ui_alarm_cancel(alarm_id: str, client_id: str) -> None:
                 if alarm_manager:
                     try:
-                        await alarm_manager.cancel_alarm(alarm_id)
+                        alarm = alarm_manager.alarms.get(alarm_id)
+                        if alarm and alarm.ringing:
+                            alarm_playback_stop_event.set()
+                            try:
+                                await alarm_manager.stop_alarm(alarm_id)
+                                await asyncio.sleep(0.12)
+                            finally:
+                                alarm_playback_stop_event.clear()
+                        else:
+                            await alarm_manager.cancel_alarm(alarm_id)
                         _push_schedule_state_now("alarm_cancel")
                     except Exception as exc:
                         logger.warning("Web UI alarm_cancel id=%s: %s", alarm_id, exc)
@@ -2644,9 +2653,33 @@ async def run_orchestrator() -> None:
                         return True
                     return v.startswith("a new session") or v in {"new session", "untitled"}
 
-                derived_title = str(session_obj.get("derivedTitle") or "").strip()
-                base_title = str(session_obj.get("title") or "").strip()
-                fallback_name = str(session_obj.get("name") or "").strip()
+                def _strip_injected_new_session_prefix(value: str) -> str:
+                    txt = str(value or "").strip()
+                    if not txt:
+                        return ""
+                    # Ignore synthetic opener text so titles reflect the first real user prompt.
+                    return re.sub(
+                        r"^\s*welcome\s+to\s+(?:a\s+)?new\s+session\b[\s,;:.!\-]*",
+                        "",
+                        txt,
+                        flags=re.IGNORECASE,
+                    ).strip()
+
+                derived_title = _strip_injected_new_session_prefix(
+                    str(session_obj.get("derivedTitle") or "").strip()
+                )
+                base_title = _strip_injected_new_session_prefix(
+                    str(session_obj.get("title") or "").strip()
+                )
+                fallback_name = _strip_injected_new_session_prefix(
+                    str(session_obj.get("name") or "").strip()
+                )
+                preview_hint = _strip_injected_new_session_prefix(str(
+                    session_obj.get("summary")
+                    or session_obj.get("preview")
+                    or session_obj.get("lastMessage")
+                    or ""
+                ).strip())
 
                 if derived_title:
                     title = derived_title
@@ -2654,6 +2687,8 @@ async def run_orchestrator() -> None:
                     title = base_title
                 elif fallback_name and not _is_placeholder_title(fallback_name):
                     title = fallback_name
+                elif preview_hint:
+                    title = preview_hint[:72]
                 else:
                     title = "New Chat"
 
@@ -2691,12 +2726,12 @@ async def run_orchestrator() -> None:
                     "filename": f"{thread_id}.chat",
                 }
 
-                summary = str(
+                summary = _strip_injected_new_session_prefix(str(
                     session_obj.get("summary")
                     or session_obj.get("preview")
                     or session_obj.get("lastMessage")
                     or ""
-                ).strip()
+                ).strip())
                 if summary:
                     out["summary"] = summary[:240]
                 return out

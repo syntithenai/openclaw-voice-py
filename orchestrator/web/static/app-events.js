@@ -1531,9 +1531,47 @@ function renderSandboxLogTail(entries){
 
 function getTasksForRequest(reqKey){
     const requestId=String(reqKey||'').trim();
-    if(!requestId) return {sandbox:[], subagent:[]};
+    if(!requestId || requestId==='na') return {sandbox:[], subagent:[]};
+
+    const isMainHandlerPhaseName=(value)=>{
+        const v=String(value||'').trim().toLowerCase();
+        return v==='lifecycle' || v==='reasoning' || v==='compaction' || v==='event';
+    };
+
+    const isDisplayableSandboxTask=(task)=>{
+        if(!task || typeof task!=='object') return false;
+        const metadataQuality=String((task&&task.metadata_quality)||'').trim().toLowerCase();
+        const execHost=String((task&&task.exec_host)||'').trim().toLowerCase();
+        const containerName=String((task&&task.container_name)||'').trim();
+        const containerId=String((task&&task.container_id)||'').trim();
+        const command=String((task&&task.command)||'').trim();
+        const label=String((task&&task.label)||'').trim();
+        const hasRealRuntimeMeta=!!(containerName || containerId || execHost==='docker' || execHost==='sandbox');
+        if(hasRealRuntimeMeta) return true;
+        if(metadataQuality==='synthetic') return false;
+        return !(isMainHandlerPhaseName(command) || isMainHandlerPhaseName(label));
+    };
+
+    const isDisplayableSubagentTask=(task)=>{
+        if(!task || typeof task!=='object') return false;
+        const runId=String((task&&task.run_id)||task&&task.task_id||'').trim();
+        const label=String((task&&task.label)||'').trim().toLowerCase();
+        const step=String((task&&task.step)||'').trim().toLowerCase();
+        const command=String((task&&task.command)||'').trim();
+        const execHost=String((task&&task.exec_host)||'').trim().toLowerCase();
+        const containerName=String((task&&task.container_name)||'').trim();
+        const containerId=String((task&&task.container_id)||'').trim();
+        const hasRuntimeOrCommand=!!(command || containerName || containerId || execHost==='docker' || execHost==='sandbox');
+        const isSyntheticRequestRun=/^req-\d+$/.test(runId) && (label==='' || /^request\s+\d+$/.test(label));
+        const isMainPhaseStep=step.startsWith('lifecycle:') || step.startsWith('reasoning:') || step.startsWith('compaction:');
+        if(!hasRuntimeOrCommand && isSyntheticRequestRun) return false;
+        if(isSyntheticRequestRun && isMainPhaseStep) return false;
+        return true;
+    };
+
     const sandbox=(Array.isArray(S.sandboxTasks)?S.sandboxTasks:[])
         .filter((t)=>String((t&&t.request_id)||'').trim()===requestId)
+        .filter(isDisplayableSandboxTask)
         .slice()
         .sort((a,b)=>Number((b&&b.updated_ts)||0)-Number((a&&a.updated_ts)||0));
     const subagent=(Array.isArray(S.subagentTasks)?S.subagentTasks:[])
@@ -1543,6 +1581,7 @@ function getTasksForRequest(reqKey){
             const rid=parseRequestIdFromRunId((t&&t.run_id)||'');
             return rid===requestId;
         })
+        .filter(isDisplayableSubagentTask)
         .slice()
         .sort((a,b)=>Number((b&&b.updated_ts)||0)-Number((a&&a.updated_ts)||0));
     return {sandbox, subagent};
@@ -1570,15 +1609,21 @@ function renderRequestTasksBlock(reqKey){
             .join('\n');
         const entries=(S.sandboxTaskLogEntriesById&&S.sandboxTaskLogEntriesById[taskId])||[];
         const stderrCount=(Array.isArray(entries)?entries:[]).reduce((acc, entry)=>acc+(String((entry&&entry.stream)||'').toLowerCase()==='stderr'?1:0), 0);
-        const label=String((task&&task.command)||task&&task.label||task&&task.exec_id||'exec');
+        const commandLine=String((task&&task.command)||task&&task.label||task&&task.exec_id||'exec').trim();
+        const execHost=String((task&&task.exec_host)||'').trim().toLowerCase();
+        const containerName=String((task&&task.container_name)||'').trim();
+        const containerId=String((task&&task.container_id)||'').trim();
+        const runtimeLabel=(containerName||containerId||execHost==='docker'||execHost==='sandbox') ? 'Docker container' : 'Local process';
+        const runtimeDetail=containerName||containerId||(execHost||'unknown');
         const detailKey='req:'+String(reqKey)+':task:sandbox:'+taskId;
         const openAttr=isTerminalTaskStatus(status)?'':' open';
         return '<details data-detail-key="'+esc(detailKey)+'" class="rounded border '+tone+'"'+openAttr+'>'
-            +'<summary class="px-2 py-1 cursor-pointer text-xs flex items-center gap-2"><span class="inline-block px-1.5 py-0.5 rounded bg-amber-800/80 text-amber-100 text-[10px]">Exec</span><span class="truncate">'+esc(label)+'</span><span class="text-[10px] opacity-80">'+esc(status)+' '+esc(formatTaskAge(task&&task.started_ts))+'</span></summary>'
-            +'<div class="px-2 pb-2 text-[11px] text-gray-200">'
-                +'<div class="mb-1">container='+esc(String((task&&task.container_name)||task&&task.container_id||'unknown'))+' exec='+esc(String((task&&task.exec_id)||''))+'</div>'
+            +'<summary class="px-2 py-1 cursor-pointer text-xs flex items-center gap-2"><span class="inline-block px-1.5 py-0.5 rounded bg-amber-800/80 text-amber-100 text-[10px]">Exec</span><span class="truncate">'+esc(runtimeLabel)+' · '+esc(commandLine||'exec')+'</span><span class="text-[10px] opacity-80">'+esc(status)+' '+esc(formatTaskAge(task&&task.started_ts))+'</span></summary>'
+            +'<div class="px-2 pb-2 text-[11px] text-gray-200 space-y-1">'
+                +'<div class="text-[10px] text-gray-300">runtime: <span class="text-gray-100">'+esc(runtimeLabel)+'</span> · target: <span class="text-gray-100">'+esc(runtimeDetail||'unknown')+'</span> · exec_id: <span class="text-gray-100">'+esc(String((task&&task.exec_id)||''))+'</span></div>'
+                +'<div class="rounded border border-gray-800/80 bg-black/35 px-2 py-1"><div class="text-[10px] text-gray-400 uppercase tracking-wide mb-0.5">Command</div><pre class="whitespace-pre-wrap break-words text-[11px] text-gray-100">'+esc(commandLine||'(no command)')+'</pre></div>'
                 +'<div class="mb-1 text-[10px] text-gray-400">log chunks='+String((Array.isArray(entries)?entries:[]).length)+(stderrCount?(' | stderr='+String(stderrCount)):'')+'</div>'
-                +'<div class="bg-black/40 border border-gray-800 rounded p-2">'+renderSandboxLogTail(entries)+'</div>'
+                +'<div class="rounded border border-gray-800 bg-black/40 p-2"><div class="text-[10px] text-gray-400 uppercase tracking-wide mb-1">Live output</div>'+renderSandboxLogTail(entries)+'</div>'
                 +(logs?'<details class="mt-1 rounded border border-gray-800/80 bg-black/30"><summary class="px-1.5 py-1 cursor-pointer text-[10px] text-gray-400">raw combined log</summary><pre class="px-1.5 pb-1.5 max-h-32 overflow-auto whitespace-pre-wrap break-words text-[10px] text-gray-400">'+esc(logs)+'</pre></details>':'')
             +'</div>'
         +'</details>';
@@ -1592,20 +1637,33 @@ function renderRequestTasksBlock(reqKey){
             .map((entry)=>String((entry&&entry.text_delta)||''))
             .join('');
         const step=String((task&&task.step)||'');
+        const commandLine=String((task&&task.command)||task&&task.label||'').trim();
+        const execHost=String((task&&task.exec_host)||'').trim().toLowerCase();
+        const containerName=String((task&&task.container_name)||'').trim();
+        const containerId=String((task&&task.container_id)||'').trim();
+        const runtimeLabel=(containerName||containerId||execHost==='docker'||execHost==='sandbox') ? 'Docker container' : 'Subagent runtime';
+        const runtimeDetail=containerName||containerId||(execHost||'unknown');
         const detailKey='req:'+String(reqKey)+':task:subagent:'+runId;
         const openAttr=isTerminalTaskStatus(status)?'':' open';
         return '<details data-detail-key="'+esc(detailKey)+'" class="rounded border '+tone+'"'+openAttr+'>'
             +'<summary class="px-2 py-1 cursor-pointer text-xs flex items-center gap-2"><span class="inline-block px-1.5 py-0.5 rounded bg-sky-800/80 text-sky-100 text-[10px]">Subagent</span><span class="truncate">'+esc(String((task&&task.label)||runId||'request'))+'</span><span class="text-[10px] opacity-80">'+esc(status)+' '+esc(formatTaskAge(task&&task.started_ts))+'</span></summary>'
-            +'<div class="px-2 pb-2 text-[11px] text-gray-200">'
-                +'<div class="mb-1">run='+esc(runId)+' '+(step?('step='+esc(step)):'')+'</div>'
-                +'<pre class="max-h-40 overflow-auto whitespace-pre-wrap break-words bg-black/40 border border-gray-800 rounded p-2">'+esc(thinking||'No thinking yet')+'</pre>'
+            +'<div class="px-2 pb-2 text-[11px] text-gray-200 space-y-1">'
+                +'<div class="text-[10px] text-gray-300">runtime: <span class="text-gray-100">'+esc(runtimeLabel)+'</span> · target: <span class="text-gray-100">'+esc(runtimeDetail)+'</span> · run='+esc(runId)+(step?(' · step='+esc(step)):'')+'</div>'
+                +(commandLine?('<div class="rounded border border-gray-800/80 bg-black/35 px-2 py-1"><div class="text-[10px] text-gray-400 uppercase tracking-wide mb-0.5">Command</div><pre class="whitespace-pre-wrap break-words text-[11px] text-gray-100">'+esc(commandLine)+'</pre></div>'):'')
+                +'<div class="rounded border border-gray-800 bg-black/40 p-2"><div class="text-[10px] text-gray-400 uppercase tracking-wide mb-1">Live thinking / output</div><pre class="max-h-40 overflow-auto whitespace-pre-wrap break-words text-[11px] text-gray-200">'+esc(thinking||'No thinking yet')+'</pre></div>'
             +'</div>'
         +'</details>';
     }).join('');
 
+    const legendHtml='<div class="px-2 pt-1 pb-1 text-[9px] text-gray-400 flex flex-wrap gap-2 items-center border-b border-gray-800/40">'
+        +'<span class="text-gray-500">Legend:</span>'
+        +'<span class="flex items-center gap-1"><span class="inline-block px-1 py-0.5 rounded bg-amber-800/60 text-amber-100">Docker</span><span class="text-gray-500">=container</span></span>'
+        +'<span class="flex items-center gap-1"><span class="inline-block px-1 py-0.5 rounded bg-gray-700/60 text-gray-300">Local</span><span class="text-gray-500">=process</span></span>'
+        +'</div>';
+
     return '<details data-detail-key="'+esc('req:'+String(reqKey)+':tasks')+'" class="rounded-xl bg-gray-900/60 border border-gray-700 text-xs overflow-hidden"'+(hasActiveTasks?' open':'')+'>'
         +'<summary class="px-3 py-1.5 cursor-pointer text-gray-200 hover:text-gray-100 select-none">Tasks ('+String(total)+')</summary>'
-        +'<div class="px-2 pb-2 pt-1 space-y-1">'+sandboxRows+subagentRows+'</div>'
+        +'<div class="px-2 pb-2 pt-1">'+legendHtml+'<div class="space-y-1 pt-1">'+sandboxRows+subagentRows+'</div></div>'
     +'</details>';
 }
 
@@ -1666,10 +1724,8 @@ function renderTaskDetailPanel(){
 function renderTimerBar(){
   const bar=document.getElementById('timerBar');
     const visibleTimers=S.timers.filter(t=>{
-        const kind=String(t.kind||'timer').toLowerCase();
         const rem=Number(t.remaining_seconds);
         if(!Number.isFinite(rem)) return false;
-        if(kind==='timer' && rem<=0) return false;
         return true;
     });
     const inferred=(typeof inferChatRunState==='function') ? inferChatRunState() : {running:false,state:'idle',statusText:'',requestId:''};
@@ -3649,7 +3705,7 @@ function mkBubble(m){
             if(tasksBlockHtml){
                 const tasksWrap=document.createElement('div');
                 tasksWrap.innerHTML=tasksBlockHtml;
-                const tasksDetails=tasksWrap.querySelector('details[data-detail-key^="'+esc('req:'+reqKey+':tasks:')+'"]');
+                const tasksDetails=tasksWrap.querySelector('details[data-detail-key="'+esc('req:'+reqKey+':tasks')+'"]');
                 if(tasksDetails){
                     attachPlainTriangleToDetails(tasksDetails, tasksDetails.querySelector('summary'));
                     tasksDetails.querySelectorAll('details[data-detail-key]').forEach((inner)=>{

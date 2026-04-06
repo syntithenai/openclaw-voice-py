@@ -939,7 +939,6 @@ function applyTimers(t){
             const kind=String(timer.kind||'timer').toLowerCase();
             const rem=Number(timer.remaining_seconds);
             if(!Number.isFinite(rem)) return false;
-            if(kind==='timer' && rem<=0) return false;
             return true;
         })
         .map(timer=>Object.assign({},timer,{_clientAnchorTs:now, _clientAnchorRem:Number(timer.remaining_seconds)||0}));

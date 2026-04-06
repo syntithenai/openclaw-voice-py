@@ -306,6 +306,7 @@ UPSTREAM_ONLY_PATTERNS = [
     r"\bmy\s+(email|emails|inbox|mailbox|calendar|messages|notifications)\b",
     r"\b(do i have|did i get|any new|check my|look at my|what about my)\b",
     r"\b(you never told me|earlier you said|last time|before that|what about that)\b",
+    r"\b(sub\s*agent|upstream\s+(?:agent|sub agent))\b",
 ]
 
 # Time-sensitive or web-lookup intents should go upstream so model/tool routing
